@@ -55,8 +55,9 @@ The same command is available in VS Code under **Tasks: Run Task** as
 `MCP: Generate config`.
 
 The generated file is local machine configuration and is automatically added
-to `.gitignore`. Standard `PGHOST`, `PGDATABASE`, `PGUSER`, and
-`EMBEDDINGS_ENABLED` environment variables override the generated defaults.
+to `.gitignore`. Standard `PGHOST`, `PGDATABASE`, `PGUSER`, `AUTO_MANAGE_DB`,
+and `EMBEDDINGS_ENABLED` environment variables override the generated defaults.
+Automatic database management is disabled by default.
 
 To get started, paste this into your MCP config:
 
@@ -94,6 +95,11 @@ The helper always manages a database named `personal_context`. It also supports
 `drop` and `reset` (with confirmation), and honors the standard PostgreSQL
 connection environment variables. The same commands are available from VS Code
 under **Tasks: Run Task** as the `Database: ...` tasks.
+
+Set `AUTO_MANAGE_DB=true` to have the server run the helper's `status` check
+before connecting its MCP transport and run `create` when the database is
+missing. Startup fails instead of creating anything when PostgreSQL is
+unreachable or the required PostgreSQL command-line tools are unavailable.
 
 ### Optional embedding config
 

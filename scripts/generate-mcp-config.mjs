@@ -17,6 +17,7 @@ const config = {
     PGHOST: process.env.PGHOST ?? "/var/run/postgresql",
     PGDATABASE: process.env.PGDATABASE ?? "personal_context",
     PGUSER: process.env.PGUSER ?? userInfo().username,
+    AUTO_MANAGE_DB: process.env.AUTO_MANAGE_DB ?? "false",
     EMBEDDINGS_ENABLED: process.env.EMBEDDINGS_ENABLED ?? "false",
   },
   type: "stdio",
