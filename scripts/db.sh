@@ -126,6 +126,7 @@ show_status() {
 
         if [[ "$status" -eq 1 ]]; then
             printf 'Database "%s" does not exist (PostgreSQL is reachable).\n' "$DB_NAME"
+            return 1
         else
             return "$status"
         fi
