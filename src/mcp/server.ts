@@ -1,10 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
+    SEARCH_SENSITIVITY_VALUES,
     deleteContext,
     contextPurgeConfirm,
     contextPurgePreview,
     getDatabaseMetadata,
+    getUserProfile,
     listRecentContext,
     saveContext,
     searchContext,
@@ -62,14 +64,16 @@ export function createServer() {
     server.registerTool(
         "search_context",
         {
-            description: "Search saved personal context by query.",
+            description: "Search saved personal context by query. Sensitivity controls semantic filtering strictness: low is broad, medium is balanced, and high is narrow.",
             inputSchema: {
                 query: z.string().min(1).describe("The search query."),
                 limit: z.number().int().positive().optional().describe("Maximum number of context items to return."),
+                sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness. Low is broad (default), medium is balanced, and high is narrow and may return no results."),
             },
         },
-        async ({ query, limit }) => {
-            const results = await searchContext(query, limit);
+        async ({ query, limit, sensitivity }) => {
+            const selectedSensitivity = sensitivity ?? "low";
+            const results = await searchContext(query, limit, selectedSensitivity);
 
             return {
                 content: [
@@ -78,8 +82,28 @@ export function createServer() {
                         text: JSON.stringify({
                             query,
                             limit: limit ?? 20,
+                            sensitivity: selectedSensitivity,
                             results,
                         }),
+                    },
+                ],
+            };
+        }
+    );
+
+    server.registerTool(
+        "get_user_profile",
+        {
+            description: "Return the active OS username alongside a medium-sensitivity context search for \"me\".",
+        },
+        async () => {
+            const profile = await getUserProfile();
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify({ profile }),
                     },
                 ],
             };

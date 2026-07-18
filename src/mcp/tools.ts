@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { userInfo } from "node:os";
 
 import { maybeGenerateEmbedding, maybeSaveContextEmbedding } from "../embeddings/index.js";
 import { db, initializeDatabase } from "../storage/db.js";
@@ -12,6 +13,11 @@ export type ContextRecord = {
     created_at: string;
     updated_at: string;
 };
+
+export const SEARCH_SENSITIVITY_VALUES = ["low", "medium", "high"] as const;
+export type SearchSensitivity = (typeof SEARCH_SENSITIVITY_VALUES)[number];
+export const USER_PROFILE_QUERY = "me";
+export const USER_PROFILE_SENSITIVITY: SearchSensitivity = "medium";
 
 type ContextRow = {
     id: number | string;
@@ -70,6 +76,7 @@ type PendingPurge = {
 
 const DEFAULT_CONTEXT_LIMIT = 20;
 const MAX_CONTEXT_LIMIT = 100;
+const DEFAULT_SEARCH_SENSITIVITY: SearchSensitivity = "low";
 const PURGE_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 let tagsColumnType: string | undefined;
 const pendingPurges = new Map<string, PendingPurge>();
@@ -80,6 +87,31 @@ function normalizeLimit(limit?: number) {
     }
 
     return Math.min(Math.max(Math.trunc(limit), 1), MAX_CONTEXT_LIMIT);
+}
+
+export function similarityThresholdForSensitivity(sensitivity: SearchSensitivity) {
+    switch (sensitivity) {
+        case "high":
+            return 0.75;
+        case "medium":
+            return 0.5;
+        case "low":
+            return -1;
+    }
+}
+
+export function matchesSearchSensitivity(
+    similarity: number,
+    sensitivity: SearchSensitivity,
+) {
+    return similarity >= similarityThresholdForSensitivity(sensitivity);
+}
+
+export async function resolveSearchResultsWithFallback(
+    vectorResults: ContextRecord[] | null,
+    textFallback: () => Promise<ContextRecord[]>,
+) {
+    return vectorResults === null ? textFallback() : vectorResults;
 }
 
 function parseTags(tags: string | string[] | null) {
@@ -266,7 +298,11 @@ async function searchContextByText(query: string, limit: number) {
     return result.rows.map(mapContextRow);
 }
 
-async function searchContextByVector(query: string, limit: number) {
+async function searchContextByVector(
+    query: string,
+    limit: number,
+    sensitivity: SearchSensitivity,
+) {
     const embedding = await maybeGenerateEmbedding(query);
 
     if (!embedding.generated) {
@@ -307,6 +343,7 @@ async function searchContextByVector(query: string, limit: number) {
                   };
         })
         .filter((item): item is { context: ContextRecord; similarity: number } => item !== null)
+        .filter((item) => matchesSearchSensitivity(item.similarity, sensitivity))
         .sort((left, right) => {
             if (right.similarity !== left.similarity) {
                 return right.similarity - left.similarity;
@@ -321,20 +358,38 @@ async function searchContextByVector(query: string, limit: number) {
         .slice(0, limit)
         .map((item) => item.context);
 
-    return rankedResults.length > 0 ? rankedResults : null;
+    return rankedResults;
 }
 
-export async function searchContext(query: string, limit?: number) {
+export async function searchContext(
+    query: string,
+    limit?: number,
+    sensitivity: SearchSensitivity = DEFAULT_SEARCH_SENSITIVITY,
+) {
     await initializeDatabase();
 
     const resultLimit = normalizeLimit(limit);
-    const vectorResults = await searchContextByVector(query, resultLimit);
+    const vectorResults = await searchContextByVector(query, resultLimit, sensitivity);
 
-    if (vectorResults) {
-        return vectorResults;
-    }
+    return resolveSearchResultsWithFallback(
+        vectorResults,
+        () => searchContextByText(query, resultLimit),
+    );
+}
 
-    return searchContextByText(query, resultLimit);
+export async function getUserProfile() {
+    const results = await searchContext(
+        USER_PROFILE_QUERY,
+        undefined,
+        USER_PROFILE_SENSITIVITY,
+    );
+
+    return {
+        username: userInfo().username,
+        query: USER_PROFILE_QUERY,
+        sensitivity: USER_PROFILE_SENSITIVITY,
+        results,
+    };
 }
 
 export async function listRecentContext(limit?: number) {
