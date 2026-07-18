@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "personal_context": {
+      "active": true,
+      "args": [
+        "/PATH/TO/personal-context-server/dist/index.js"
+      ],
+      "command": "node",
+      "env": {
+        "PGHOST": "/var/run/postgresql",
+        "PGDATABASE": "personal_context",
+        "PGUSER": "USERNAME",
+        "AUTO_MANAGE_DB": "false",
+        "EMBEDDINGS_ENABLED": "false",
+        "EMBEDDINGS_MODEL": "nomic-embed-text",
+        "EMBEDDINGS_PROVIDER": "ollama"
+      },
+      "type": "stdio"
+    }
+  }
+}

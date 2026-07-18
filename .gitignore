@@ -1,4 +1,5 @@
 local.agent.*
+mcp.json
 
 # Logs
 logs

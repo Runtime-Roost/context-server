@@ -10,17 +10,23 @@ const configPath = join(repoRoot, "mcp.json");
 const gitignorePath = join(repoRoot, ".gitignore");
 
 const config = {
-  active: true,
-  args: [join(repoRoot, "dist", "index.js")],
-  command: "node",
-  env: {
-    PGHOST: process.env.PGHOST ?? "/var/run/postgresql",
-    PGDATABASE: process.env.PGDATABASE ?? "personal_context",
-    PGUSER: process.env.PGUSER ?? userInfo().username,
-    AUTO_MANAGE_DB: process.env.AUTO_MANAGE_DB ?? "false",
-    EMBEDDINGS_ENABLED: process.env.EMBEDDINGS_ENABLED ?? "false",
+  mcpServers: {
+    personal_context: {
+      active: true,
+      args: [join(repoRoot, "dist", "index.js")],
+      command: "node",
+      env: {
+        PGHOST: process.env.PGHOST ?? "/var/run/postgresql",
+        PGDATABASE: process.env.PGDATABASE ?? "personal_context",
+        PGUSER: process.env.PGUSER ?? userInfo().username,
+        AUTO_MANAGE_DB: process.env.AUTO_MANAGE_DB ?? "false",
+        EMBEDDINGS_ENABLED: process.env.EMBEDDINGS_ENABLED ?? "false",
+        EMBEDDINGS_MODEL: process.env.EMBEDDINGS_MODEL ?? "nomic-embed-text",
+        EMBEDDINGS_PROVIDER: process.env.EMBEDDINGS_PROVIDER ?? "ollama",
+      },
+      type: "stdio",
+    },
   },
-  type: "stdio",
 };
 
 await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");

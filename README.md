@@ -44,8 +44,9 @@ The full LLM runtime situation should look something like this:
 
 ## Configuring
 
-Generate a local `mcp.json` with an absolute path to this checkout and the
-current OS username:
+The tracked [mcp.example.json](mcp.example.json) shows the portable MCP client
+configuration. Generate the ignored, machine-specific `mcp.json` with an
+absolute path to this checkout and the current OS username:
 
 ```bash
 npm run mcp:config
@@ -59,21 +60,25 @@ to `.gitignore`. Standard `PGHOST`, `PGDATABASE`, `PGUSER`, `AUTO_MANAGE_DB`,
 and `EMBEDDINGS_ENABLED` environment variables override the generated defaults.
 Automatic database management is disabled by default.
 
-To get started, paste this into your MCP config:
+The generated file uses this shape:
 
 ```json
 {
-  "active": true,
-  "args": [
-    "/PATH/TO/THIS/REPO/src/index.ts"
-  ],
-  "command": "tsx",
-  "env": {
-    "PGHOST": "/var/run/postgresql",
-    "PGDATABASE": "DATABASE_NAME",
-    "PGUSER": "USERNAME"
-  },
-  "type": "stdio"
+  "mcpServers": {
+    "personal_context": {
+      "active": true,
+      "args": [
+        "/PATH/TO/personal-context-server/dist/index.js"
+      ],
+      "command": "node",
+      "env": {
+        "PGHOST": "/var/run/postgresql",
+        "PGDATABASE": "personal_context",
+        "PGUSER": "USERNAME"
+      },
+      "type": "stdio"
+    }
+  }
 }
 ```
 
