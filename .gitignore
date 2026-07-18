@@ -1,3 +1,5 @@
+local.agent.*
+
 # Logs
 logs
 *.log
