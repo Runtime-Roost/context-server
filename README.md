@@ -44,6 +44,20 @@ The full LLM runtime situation should look something like this:
 
 ## Configuring
 
+Generate a local `mcp.json` with an absolute path to this checkout and the
+current OS username:
+
+```bash
+npm run mcp:config
+```
+
+The same command is available in VS Code under **Tasks: Run Task** as
+`MCP: Generate config`.
+
+The generated file is local machine configuration and is automatically added
+to `.gitignore`. Standard `PGHOST`, `PGDATABASE`, `PGUSER`, and
+`EMBEDDINGS_ENABLED` environment variables override the generated defaults.
+
 To get started, paste this into your MCP config:
 
 ```json
@@ -124,11 +138,12 @@ Set `EMBEDDINGS_AUTO_PULL=false` if you prefer to manage models yourself with
   - [x] `context_purge_preview(before)`
   - [x] `context_purge_confirm(before, confirmation_token, expected_count)`
   - [x] `vacuum_database()` / maintenance helper
-- [x] Add embedding-based semantic search
+- [ ] Add embedding-based semantic search
   - [x] Add environment toggle and no-op embedding lifecycle hook
   - [x] Generate embeddings for saved contexts with Ollama
   - [x] Store vectors in `embeddings`
   - [x] Search by semantic similarity with text fallback
+  - [ ] Add more embedding providers
 
 Consider adding confidence scores, async embeddings.
 

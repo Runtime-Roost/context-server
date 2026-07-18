@@ -2,6 +2,12 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "MCP: Generate config",
+            "type": "npm",
+            "script": "mcp:config",
+            "problemMatcher": []
+        },
+        {
             "label": "Database: Create",
             "type": "process",
             "command": "${workspaceFolder}/scripts/db.sh",
