@@ -7,6 +7,7 @@ import {
     contextPurgePreview,
     getDatabaseMetadata,
     getUserProfile,
+    identifyActor,
     listRecentContext,
     saveContext,
     searchContext,
@@ -14,7 +15,24 @@ import {
     vacuumDatabase,
 } from "./tools.js";
 
+export class ActiveActorSession {
+    #actorId: number | null = null;
+
+    get actorId() {
+        return this.#actorId;
+    }
+
+    activate(actorId: number) {
+        this.#actorId = actorId;
+    }
+}
+
+export function requireActorIdentificationEnabled() {
+    return process.env.REQUIRE_ACTOR_IDENTIFICATION?.trim().toLowerCase() === "true";
+}
+
 export function createServer() {
+    const actorSession = new ActiveActorSession();
     const server = new McpServer({
         name: "personal-context-server",
         version: "0.1.0",
@@ -38,6 +56,32 @@ export function createServer() {
     );
 
     server.registerTool(
+        "identify_actor",
+        {
+            description: "Resolve or create an actor and make it active for subsequent saves in this MCP session. Durable external IDs should identify an operational actor category, such as actor:openai:codex, rather than a model version or conversation.",
+            inputSchema: {
+                external_id: z.string().min(1).optional().describe("Optional stable actor identifier. Without one, a distinct actor is always created."),
+                name: z.string().min(1).describe("Display name for a newly created actor."),
+                kind: z.string().min(1).optional().describe("Optional actor category, such as ai or human."),
+                metadata: z.record(z.string(), z.unknown()).optional().describe("Optional actor metadata retained for future use but not returned on context records."),
+            },
+        },
+        async ({ external_id, name, kind, metadata }) => {
+            const identified = await identifyActor({ external_id, name, kind, metadata });
+            actorSession.activate(identified.actor.id);
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify({ identified }),
+                    },
+                ],
+            };
+        }
+    );
+
+    server.registerTool(
         "save_context",
         {
             description: "Save a piece of personal context for later retrieval.",
@@ -48,13 +92,36 @@ export function createServer() {
             },
         },
         async ({ text, tags, source }) => {
-            const context = await saveContext(text, tags, source);
+            if (actorSession.actorId === null && requireActorIdentificationEnabled()) {
+                return {
+                    isError: true,
+                    content: [
+                        {
+                            type: "text" as const,
+                            text: JSON.stringify({
+                                error: {
+                                    code: "ACTOR_IDENTIFICATION_REQUIRED",
+                                    message: "Call identify_actor before save_context, or disable REQUIRE_ACTOR_IDENTIFICATION.",
+                                },
+                            }),
+                        },
+                    ],
+                };
+            }
+
+            const context = await saveContext(text, tags, source, actorSession.actorId);
+            const warning = actorSession.actorId === null
+                ? {
+                      code: "ACTOR_NOT_IDENTIFIED",
+                      message: "Saved without actor attribution. Call identify_actor before future saves.",
+                  }
+                : undefined;
 
             return {
                 content: [
                     {
                         type: "text",
-                        text: JSON.stringify({ saved: context }),
+                        text: JSON.stringify({ saved: context, ...(warning ? { warning } : {}) }),
                     },
                 ],
             };
@@ -69,11 +136,12 @@ export function createServer() {
                 query: z.string().min(1).describe("The search query."),
                 limit: z.number().int().positive().optional().describe("Maximum number of context items to return."),
                 sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness. Low is broad (default), medium is balanced, and high is narrow and may return no results."),
+                actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
             },
         },
-        async ({ query, limit, sensitivity }) => {
+        async ({ query, limit, sensitivity, actor_external_id }) => {
             const selectedSensitivity = sensitivity ?? "low";
-            const results = await searchContext(query, limit, selectedSensitivity);
+            const results = await searchContext(query, limit, selectedSensitivity, actor_external_id);
 
             return {
                 content: [
@@ -83,6 +151,7 @@ export function createServer() {
                             query,
                             limit: limit ?? 20,
                             sensitivity: selectedSensitivity,
+                            ...(actor_external_id ? { actor_external_id } : {}),
                             results,
                         }),
                     },
@@ -94,7 +163,7 @@ export function createServer() {
     server.registerTool(
         "get_user_profile",
         {
-            description: "Return the active OS username alongside a medium-sensitivity context search for \"me\".",
+            description: "Return the active OS username alongside contexts explicitly tagged profile.",
         },
         async () => {
             const profile = await getUserProfile();
@@ -116,10 +185,11 @@ export function createServer() {
             description: "List recently saved personal context items.",
             inputSchema: {
                 limit: z.number().int().positive().optional().describe("Maximum number of recent context items to return."),
+                actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
             },
         },
-        async ({ limit }) => {
-            const results = await listRecentContext(limit);
+        async ({ limit, actor_external_id }) => {
+            const results = await listRecentContext(limit, actor_external_id);
 
             return {
                 content: [
@@ -127,6 +197,7 @@ export function createServer() {
                         type: "text",
                         text: JSON.stringify({
                             limit: limit ?? 20,
+                            ...(actor_external_id ? { actor_external_id } : {}),
                             results,
                         }),
                     },

@@ -20,6 +20,7 @@ const config = {
         PGDATABASE: process.env.PGDATABASE ?? "personal_context",
         PGUSER: process.env.PGUSER ?? userInfo().username,
         AUTO_MANAGE_DB: process.env.AUTO_MANAGE_DB ?? "false",
+        REQUIRE_ACTOR_IDENTIFICATION: process.env.REQUIRE_ACTOR_IDENTIFICATION ?? "false",
         EMBEDDINGS_ENABLED: process.env.EMBEDDINGS_ENABLED ?? "false",
         EMBEDDINGS_MODEL: process.env.EMBEDDINGS_MODEL ?? "nomic-embed-text",
         EMBEDDINGS_PROVIDER: process.env.EMBEDDINGS_PROVIDER ?? "ollama",

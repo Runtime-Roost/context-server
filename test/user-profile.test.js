@@ -5,11 +5,9 @@ process.env.PGDATABASE ??= "personal_context";
 process.env.EMBEDDINGS_ENABLED = "false";
 
 const {
-    USER_PROFILE_QUERY,
-    USER_PROFILE_SENSITIVITY,
+    USER_PROFILE_TAG,
 } = await import("../dist/mcp/tools.js");
 
-test("user profile uses the fixed profile search contract", () => {
-    assert.equal(USER_PROFILE_QUERY, "me");
-    assert.equal(USER_PROFILE_SENSITIVITY, "medium");
+test("user profile uses the explicit profile tag contract", () => {
+    assert.equal(USER_PROFILE_TAG, "profile");
 });

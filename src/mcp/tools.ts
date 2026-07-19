@@ -10,14 +10,30 @@ export type ContextRecord = {
     content: string;
     source: string | null;
     tags: string[];
+    actor: ActorRecord | null;
     created_at: string;
     updated_at: string;
 };
 
+export type ActorRecord = {
+    id: number;
+    external_id: string | null;
+    name: string;
+    kind: string | null;
+    created_at: string;
+    last_seen_at: string;
+};
+
+export type ActorIdentity = {
+    external_id?: string;
+    name: string;
+    kind?: string;
+    metadata?: Record<string, unknown>;
+};
+
 export const SEARCH_SENSITIVITY_VALUES = ["low", "medium", "high"] as const;
 export type SearchSensitivity = (typeof SEARCH_SENSITIVITY_VALUES)[number];
-export const USER_PROFILE_QUERY = "me";
-export const USER_PROFILE_SENSITIVITY: SearchSensitivity = "medium";
+export const USER_PROFILE_TAG = "profile";
 
 type ContextRow = {
     id: number | string;
@@ -25,8 +41,24 @@ type ContextRow = {
     content: string;
     source: string | null;
     tags: string | string[] | null;
+    actor_id: number | string | null;
+    actor_external_id: string | null;
+    actor_name: string | null;
+    actor_kind: string | null;
+    actor_created_at: string | Date | null;
+    actor_last_seen_at: string | Date | null;
     created_at: string | Date;
     updated_at: string | Date;
+};
+
+type ActorRow = {
+    id: number | string;
+    external_id: string | null;
+    name: string;
+    kind: string | null;
+    metadata: Record<string, unknown> | null;
+    created_at: string | Date;
+    last_seen_at: string | Date;
 };
 
 type VectorSearchRow = ContextRow & {
@@ -36,16 +68,20 @@ type VectorSearchRow = ContextRow & {
 
 type DatabaseMetadataRow = {
     context_count: string;
+    actor_count: string;
     total_size_bytes: string;
     total_size_pretty: string;
     contexts_size_bytes: string;
     contexts_size_pretty: string;
     embeddings_size_bytes: string;
     embeddings_size_pretty: string;
+    actors_size_bytes: string;
+    actors_size_pretty: string;
 };
 
 type DatabaseMetadata = {
     context_count: number;
+    actor_count: number;
     total_size: {
         bytes: number;
         pretty: string;
@@ -56,6 +92,10 @@ type DatabaseMetadata = {
             pretty: string;
         };
         embeddings: {
+            bytes: number;
+            pretty: string;
+        };
+        actors: {
             bytes: number;
             pretty: string;
         };
@@ -164,10 +204,47 @@ function mapContextRow(row: ContextRow): ContextRecord {
         content: row.content,
         source: row.source,
         tags: parseTags(row.tags),
+        actor: row.actor_id === null
+            ? null
+            : {
+                  id: Number(row.actor_id),
+                  external_id: row.actor_external_id,
+                  name: row.actor_name ?? "Unknown actor",
+                  kind: row.actor_kind,
+                  created_at: normalizeTimestamp(row.actor_created_at!),
+                  last_seen_at: normalizeTimestamp(row.actor_last_seen_at!),
+              },
         created_at: normalizeTimestamp(row.created_at),
         updated_at: normalizeTimestamp(row.updated_at),
     };
 }
+
+function mapActorRow(row: ActorRow): ActorRecord {
+    return {
+        id: Number(row.id),
+        external_id: row.external_id,
+        name: row.name,
+        kind: row.kind,
+        created_at: normalizeTimestamp(row.created_at),
+        last_seen_at: normalizeTimestamp(row.last_seen_at),
+    };
+}
+
+const CONTEXT_PROJECTION = `
+    contexts.id,
+    contexts.kind,
+    contexts.content,
+    contexts.source,
+    contexts.tags,
+    contexts.created_at,
+    contexts.updated_at,
+    actors.id AS actor_id,
+    actors.external_id AS actor_external_id,
+    actors.name AS actor_name,
+    actors.kind AS actor_kind,
+    actors.created_at AS actor_created_at,
+    actors.last_seen_at AS actor_last_seen_at
+`;
 
 function parseEmbeddingVector(value: unknown) {
     if (!value) {
@@ -256,7 +333,65 @@ async function getTagsColumnType() {
     return tagsColumnType;
 }
 
-export async function saveContext(text: string, tags?: string[], source?: string) {
+export async function identifyActor(identity: ActorIdentity) {
+    await initializeDatabase();
+
+    const now = new Date().toISOString();
+    const externalId = identity.external_id?.trim() || null;
+    const name = identity.name.trim();
+    const kind = identity.kind?.trim() || null;
+    const metadata = identity.metadata ?? null;
+
+    if (!name) {
+        throw new Error("name must contain at least one non-whitespace character.");
+    }
+
+    if (externalId === null) {
+        const result = await db.query<ActorRow>(
+            `
+                INSERT INTO actors (external_id, name, kind, metadata, created_at, last_seen_at)
+                VALUES (NULL, $1, $2, $3, $4, $4)
+                RETURNING id, external_id, name, kind, metadata, created_at, last_seen_at
+            `,
+            [name, kind, metadata, now]
+        );
+
+        return { actor: mapActorRow(result.rows[0]), created: true };
+    }
+
+    const inserted = await db.query<ActorRow>(
+        `
+            INSERT INTO actors (external_id, name, kind, metadata, created_at, last_seen_at)
+            VALUES ($1, $2, $3, $4, $5, $5)
+            ON CONFLICT (external_id) WHERE external_id IS NOT NULL DO NOTHING
+            RETURNING id, external_id, name, kind, metadata, created_at, last_seen_at
+        `,
+        [externalId, name, kind, metadata, now]
+    );
+
+    if (inserted.rows[0]) {
+        return { actor: mapActorRow(inserted.rows[0]), created: true };
+    }
+
+    const resolved = await db.query<ActorRow>(
+        `
+            UPDATE actors
+            SET last_seen_at = $2
+            WHERE external_id = $1
+            RETURNING id, external_id, name, kind, metadata, created_at, last_seen_at
+        `,
+        [externalId, now]
+    );
+
+    return { actor: mapActorRow(resolved.rows[0]), created: false };
+}
+
+export async function saveContext(
+    text: string,
+    tags?: string[],
+    source?: string,
+    actorId?: number | null,
+) {
     await initializeDatabase();
 
     const now = new Date().toISOString();
@@ -264,11 +399,29 @@ export async function saveContext(text: string, tags?: string[], source?: string
     const tagValue = (await getTagsColumnType()) === "_text" ? tagList : JSON.stringify(tagList);
     const result = await db.query<ContextRow>(
         `
-            INSERT INTO contexts (kind, content, source, tags, created_at, updated_at)
-            VALUES ('note', $1, $2, $3, $4, $4)
-            RETURNING id, kind, content, source, tags, created_at, updated_at
+            WITH inserted AS (
+                INSERT INTO contexts (kind, content, source, tags, actor_id, created_at, updated_at)
+                VALUES ('note', $1, $2, $3, $4, $5, $5)
+                RETURNING *
+            )
+            SELECT
+                inserted.id,
+                inserted.kind,
+                inserted.content,
+                inserted.source,
+                inserted.tags,
+                inserted.created_at,
+                inserted.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM inserted
+            LEFT JOIN actors ON actors.id = inserted.actor_id
         `,
-        [text, source ?? null, tagValue, now]
+        [text, source ?? null, tagValue, actorId ?? null, now]
     );
 
     const context = mapContextRow(result.rows[0]);
@@ -278,32 +431,42 @@ export async function saveContext(text: string, tags?: string[], source?: string
     return context;
 }
 
-async function searchContextByText(query: string, limit: number) {
+async function searchContextByText(
+    query: string,
+    limit: number,
+    actorExternalId?: string,
+) {
     await initializeDatabase();
 
     const searchPattern = `%${query}%`;
     const result = await db.query<ContextRow>(
         `
-            SELECT id, kind, content, source, tags, created_at, updated_at
+            SELECT ${CONTEXT_PROJECTION}
             FROM contexts
-            WHERE content ILIKE $1
-               OR source ILIKE $1
-               OR tags::text ILIKE $1
-            ORDER BY created_at DESC, id DESC
-            LIMIT $2
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE (
+                contexts.content ILIKE $1
+                OR contexts.source ILIKE $1
+                OR contexts.tags::text ILIKE $1
+            )
+              AND ($2::text IS NULL OR actors.external_id = $2)
+            ORDER BY contexts.created_at DESC, contexts.id DESC
+            LIMIT $3
         `,
-        [searchPattern, limit]
+        [searchPattern, actorExternalId ?? null, limit]
     );
 
     return result.rows.map(mapContextRow);
 }
 
-async function searchContextByVector(
+export async function searchContextByVector(
     query: string,
     limit: number,
     sensitivity: SearchSensitivity,
+    actorExternalId?: string,
+    generateEmbedding: typeof maybeGenerateEmbedding = maybeGenerateEmbedding,
 ) {
-    const embedding = await maybeGenerateEmbedding(query);
+    const embedding = await generateEmbedding(query);
 
     if (!embedding.generated) {
         return null;
@@ -312,22 +475,18 @@ async function searchContextByVector(
     const result = await db.query<VectorSearchRow>(
         `
             SELECT
-                contexts.id,
-                contexts.kind,
-                contexts.content,
-                contexts.source,
-                contexts.tags,
-                contexts.created_at,
-                contexts.updated_at,
+                ${CONTEXT_PROJECTION},
                 embeddings.model,
                 embeddings.vector
             FROM contexts
             INNER JOIN embeddings
                 ON embeddings.context_id = contexts.id
+            LEFT JOIN actors ON actors.id = contexts.actor_id
             WHERE embeddings.model = $1
               AND embeddings.vector IS NOT NULL
+              AND ($2::text IS NULL OR actors.external_id = $2)
         `,
-        [embedding.model]
+        [embedding.model, actorExternalId ?? null]
     );
 
     const rankedResults = result.rows
@@ -365,44 +524,78 @@ export async function searchContext(
     query: string,
     limit?: number,
     sensitivity: SearchSensitivity = DEFAULT_SEARCH_SENSITIVITY,
+    actorExternalId?: string,
 ) {
     await initializeDatabase();
 
     const resultLimit = normalizeLimit(limit);
-    const vectorResults = await searchContextByVector(query, resultLimit, sensitivity);
+    const vectorResults = await searchContextByVector(
+        query,
+        resultLimit,
+        sensitivity,
+        actorExternalId,
+    );
 
     return resolveSearchResultsWithFallback(
         vectorResults,
-        () => searchContextByText(query, resultLimit),
+        () => searchContextByText(query, resultLimit, actorExternalId),
     );
 }
 
 export async function getUserProfile() {
-    const results = await searchContext(
-        USER_PROFILE_QUERY,
-        undefined,
-        USER_PROFILE_SENSITIVITY,
-    );
+    const results = await listContextByTag(USER_PROFILE_TAG);
 
     return {
         username: userInfo().username,
-        query: USER_PROFILE_QUERY,
-        sensitivity: USER_PROFILE_SENSITIVITY,
+        tag: USER_PROFILE_TAG,
         results,
     };
 }
 
-export async function listRecentContext(limit?: number) {
+export async function listContextByTag(tag: string, limit?: number) {
+    await initializeDatabase();
+
+    const resultLimit = normalizeLimit(limit);
+    const tagsType = await getTagsColumnType();
+    const result = await db.query<ContextRow>(
+        tagsType === "_text"
+            ? `
+                SELECT ${CONTEXT_PROJECTION}
+                FROM contexts
+                LEFT JOIN actors ON actors.id = contexts.actor_id
+                WHERE $1 = ANY(contexts.tags)
+                ORDER BY contexts.created_at DESC, contexts.id DESC
+                LIMIT $2
+            `
+            : `
+                SELECT ${CONTEXT_PROJECTION}
+                FROM contexts
+                LEFT JOIN actors ON actors.id = contexts.actor_id
+                ORDER BY contexts.created_at DESC, contexts.id DESC
+            `,
+        tagsType === "_text" ? [tag, resultLimit] : []
+    );
+
+    const contexts = result.rows.map(mapContextRow);
+
+    return tagsType === "_text"
+        ? contexts
+        : contexts.filter((context) => context.tags.includes(tag)).slice(0, resultLimit);
+}
+
+export async function listRecentContext(limit?: number, actorExternalId?: string) {
     await initializeDatabase();
 
     const result = await db.query<ContextRow>(
         `
-            SELECT id, kind, content, source, tags, created_at, updated_at
+            SELECT ${CONTEXT_PROJECTION}
             FROM contexts
-            ORDER BY created_at DESC, id DESC
-            LIMIT $1
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE $1::text IS NULL OR actors.external_id = $1
+            ORDER BY contexts.created_at DESC, contexts.id DESC
+            LIMIT $2
         `,
-        [normalizeLimit(limit)]
+        [actorExternalId ?? null, normalizeLimit(limit)]
     );
 
     return result.rows.map(mapContextRow);
@@ -413,9 +606,27 @@ export async function deleteContext(id: number) {
 
     const result = await db.query<ContextRow>(
         `
-            DELETE FROM contexts
-            WHERE id = $1
-            RETURNING id, kind, content, source, tags, created_at, updated_at
+            WITH deleted AS (
+                DELETE FROM contexts
+                WHERE id = $1
+                RETURNING *
+            )
+            SELECT
+                deleted.id,
+                deleted.kind,
+                deleted.content,
+                deleted.source,
+                deleted.tags,
+                deleted.created_at,
+                deleted.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM deleted
+            LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
         [id]
     );
@@ -449,14 +660,32 @@ export async function updateContext(
 
     const result = await db.query<ContextRow>(
         `
-            UPDATE contexts
-            SET
-                content = CASE WHEN $2 THEN $3 ELSE content END,
-                tags = CASE WHEN $4 THEN $5 ELSE tags END,
-                source = CASE WHEN $6 THEN $7 ELSE source END,
-                updated_at = $8
-            WHERE id = $1
-            RETURNING id, kind, content, source, tags, created_at, updated_at
+            WITH updated AS (
+                UPDATE contexts
+                SET
+                    content = CASE WHEN $2 THEN $3 ELSE content END,
+                    tags = CASE WHEN $4 THEN $5 ELSE tags END,
+                    source = CASE WHEN $6 THEN $7 ELSE source END,
+                    updated_at = $8
+                WHERE id = $1
+                RETURNING *
+            )
+            SELECT
+                updated.id,
+                updated.kind,
+                updated.content,
+                updated.source,
+                updated.tags,
+                updated.created_at,
+                updated.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM updated
+            LEFT JOIN actors ON actors.id = updated.actor_id
         `,
         [
             id,
@@ -492,18 +721,22 @@ export async function getDatabaseMetadata() {
         `
             SELECT
                 (SELECT COUNT(*) FROM contexts) AS context_count,
+                (SELECT COUNT(*) FROM actors) AS actor_count,
                 pg_database_size(current_database()) AS total_size_bytes,
                 pg_size_pretty(pg_database_size(current_database())) AS total_size_pretty,
                 pg_total_relation_size('contexts') AS contexts_size_bytes,
                 pg_size_pretty(pg_total_relation_size('contexts')) AS contexts_size_pretty,
                 pg_total_relation_size('embeddings') AS embeddings_size_bytes,
-                pg_size_pretty(pg_total_relation_size('embeddings')) AS embeddings_size_pretty
+                pg_size_pretty(pg_total_relation_size('embeddings')) AS embeddings_size_pretty,
+                pg_total_relation_size('actors') AS actors_size_bytes,
+                pg_size_pretty(pg_total_relation_size('actors')) AS actors_size_pretty
         `
     );
     const row = result.rows[0];
 
     return {
         context_count: Number(row?.context_count ?? 0),
+        actor_count: Number(row?.actor_count ?? 0),
         total_size: {
             bytes: Number(row?.total_size_bytes ?? 0),
             pretty: row?.total_size_pretty ?? "0 bytes",
@@ -517,6 +750,10 @@ export async function getDatabaseMetadata() {
                 bytes: Number(row?.embeddings_size_bytes ?? 0),
                 pretty: row?.embeddings_size_pretty ?? "0 bytes",
             },
+            actors: {
+                bytes: Number(row?.actors_size_bytes ?? 0),
+                pretty: row?.actors_size_pretty ?? "0 bytes",
+            },
         },
     } satisfies DatabaseMetadata;
 }
@@ -528,11 +765,12 @@ export async function vacuumDatabase() {
 
     await db.query("VACUUM (ANALYZE) contexts");
     await db.query("VACUUM (ANALYZE) embeddings");
+    await db.query("VACUUM (ANALYZE) actors");
 
     const after = await getDatabaseMetadata();
 
     return {
-        tables: ["contexts", "embeddings"],
+        tables: ["contexts", "embeddings", "actors"],
         before,
         after,
     };
@@ -619,9 +857,27 @@ export async function contextPurgeConfirm(
 
     const result = await db.query<ContextRow>(
         `
-            DELETE FROM contexts
-            WHERE created_at < $1
-            RETURNING id, kind, content, source, tags, created_at, updated_at
+            WITH deleted AS (
+                DELETE FROM contexts
+                WHERE created_at < $1
+                RETURNING *
+            )
+            SELECT
+                deleted.id,
+                deleted.kind,
+                deleted.content,
+                deleted.source,
+                deleted.tags,
+                deleted.created_at,
+                deleted.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM deleted
+            LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
         [normalizedBefore]
     );

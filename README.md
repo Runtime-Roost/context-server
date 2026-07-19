@@ -57,7 +57,8 @@ The same command is available in VS Code under **Tasks: Run Task** as
 
 The generated file is local machine configuration and is automatically added
 to `.gitignore`. Standard `PGHOST`, `PGDATABASE`, `PGUSER`, `AUTO_MANAGE_DB`,
-and `EMBEDDINGS_ENABLED` environment variables override the generated defaults.
+`REQUIRE_ACTOR_IDENTIFICATION`, and `EMBEDDINGS_ENABLED` environment variables
+override the generated defaults.
 Automatic database management is disabled by default.
 
 The generated file uses this shape:
@@ -106,6 +107,35 @@ before connecting its MCP transport and run `create` when the database is
 missing. Startup fails instead of creating anything when PostgreSQL is
 unreachable or the required PostgreSQL command-line tools are unavailable.
 
+### Actor attribution
+
+Actor attribution records who synthesized a memory, while `source` continues to
+describe where the information came from. Durable actor IDs represent
+operational categories rather than conversations or model versions, for
+example `actor:openai:codex`, `actor:openai:chatgpt`, and
+`actor:human:blake`.
+
+Call `identify_actor` once per MCP session before saving. The resolved actor
+becomes active for that server instance, and subsequent `save_context` calls
+automatically attach it. Calling `identify_actor` again switches actors. An
+external ID resolves or creates an actor atomically; without one, every call
+creates a distinct actor. Display names are never used to merge actors.
+
+For compatibility, an unidentified save succeeds with `actor: null` and an
+`ACTOR_NOT_IDENTIFIED` warning. Set `REQUIRE_ACTOR_IDENTIFICATION=true` to
+reject unidentified saves with an `ACTOR_IDENTIFICATION_REQUIRED` error. Strict
+mode is disabled by default.
+
+Existing databases upgrade through the transactional `schema_migrations`
+ledger. Existing contexts are not backfilled and remain `actor: null`.
+
+`get_user_profile` returns the OS username plus contexts explicitly tagged
+`profile`. It does not perform semantic search, so browsing history cannot enter
+the profile merely because it happens to mention the user. Apply the tag to
+durable identity, preference, and collaboration-style memories that belong in
+the curated profile. Actor still identifies the memory's synthesizer rather
+than its subject.
+
 ### Optional embedding config
 
 Embedding support is behind an environment toggle. Ollama is the default provider, but
@@ -136,7 +166,8 @@ Set `EMBEDDINGS_AUTO_PULL=false` if you prefer to manage models yourself with
 - [x] Build basic MCP server
 - [x] Build and expose basic tools
   - [x] `save_context(text, tags?, source?)`
-  - [x] `search_context(query, limit?, sensitivity?)`
+  - [x] `identify_actor(external_id?, name, kind?, metadata?)`
+  - [x] `search_context(query, limit?, sensitivity?, actor_external_id?)`
   - [x] `get_user_profile()`
   - [x] `list_recent_context(limit?)`
   - [x] `database_metadata()`
@@ -169,16 +200,17 @@ This project is licensed under the [MIT License](LICENSE).
 | Tool | Usage | Result |
 | --- | --- | --- |
 | `ping` | Health check for the MCP server. Takes no arguments. | Text response: `Pong!` |
-| `save_context` | Save a new personal context note. Arguments: `text` (required string), `tags` (optional string array), `source` (optional string). | JSON text containing `{ "saved": context }`, where `context` is the saved record. |
-| `search_context` | Search saved context by semantic similarity when embeddings are enabled and usable, falling back to text search only when semantic search is unavailable. Arguments: `query` (required string), `limit` (optional positive integer, defaults to `20`, capped at `100`), and `sensitivity` (optional `low`, `medium`, or `high`; defaults to `low`). Low is broad, medium is balanced, and high filters aggressively and may return no results. Text fallback searches content, source, and tags and is not filtered by sensitivity. | JSON text containing `{ "query": string, "limit": number, "sensitivity": string, "results": context[] }`. Semantic results are ordered by similarity; fallback text results are ordered newest first. |
-| `get_user_profile` | Fetch a broad profile-oriented context view. Takes no arguments and runs the query `me` with medium sensitivity. | JSON text containing `{ "profile": { "username": string, "query": "me", "sensitivity": "medium", "results": context[] } }`. The username is the active OS account. |
-| `list_recent_context` | Fetch recently saved context notes. Arguments: `limit` (optional positive integer, defaults to `20`, capped at `100`). | JSON text containing `{ "limit": number, "results": context[] }`, ordered newest first. |
-| `database_metadata` | Fetch simple database metadata. Takes no arguments. | JSON text containing row count, total database size, and table sizes for `contexts` and `embeddings`. |
+| `identify_actor` | Resolve or create the active actor for this MCP session. Arguments: `name` (required), `external_id` (optional stable ID), `kind` (optional), and `metadata` (optional object). | JSON text containing `{ "identified": { "actor": actor, "created": boolean } }`. Metadata is stored but not returned. |
+| `save_context` | Save a context note with the active actor. Its existing arguments remain `text`, `tags?`, and `source?`. | JSON text containing `{ "saved": context }`. Compatibility mode adds a warning when no actor is active; strict mode returns a structured error. |
+| `search_context` | Search saved context semantically when embeddings are usable, falling back to text only when semantic search is unavailable. Arguments: `query`, `limit?`, `sensitivity?`, and `actor_external_id?`. Actor filtering is applied inside both search paths. | JSON text containing `{ "query", "limit", "sensitivity", "actor_external_id"?, "results" }`. |
+| `get_user_profile` | Fetch the curated profile view. Takes no arguments and returns contexts explicitly tagged `profile`; no semantic or text fallback search is used. | JSON text containing `{ "profile": { "username": string, "tag": "profile", "results": context[] } }`. The username is the active OS account. |
+| `list_recent_context` | Fetch recent context notes. Arguments: `limit?` and `actor_external_id?`. | JSON text containing `{ "limit", "actor_external_id"?, "results" }`, ordered newest first. |
+| `database_metadata` | Fetch simple database metadata. Takes no arguments. | JSON text containing context and actor counts, total database size, and managed table sizes. |
 | `delete_context` | Delete a saved context note. Arguments: `id` (required positive integer). | JSON text containing `{ "id": number, "deleted": context \| null }`, where `deleted` is the removed record or `null` if no record matched. |
 | `update_context` | Update a saved context note. Arguments: `id` (required positive integer), plus at least one of `text` (optional string), `tags` (optional string array), or `source` (optional string). | JSON text containing `{ "id": number, "updated": context \| null }`, where `updated` is the updated record or `null` if no record matched. |
 | `context_purge_preview` | Preview a deletion of saved context notes before a cutoff. Arguments: `before` (required date or timestamp). | JSON text containing `{ "preview": { "before": string, "matched": number, "oldest": string \| null, "newest": string \| null, "confirmation_token": string, "expires_at": string } }`. |
 | `context_purge_confirm` | Delete saved context notes before a cutoff. Arguments: `before` (required date or timestamp), `confirmation_token` (required string from `context_purge_preview`), and `expected_count` (required nonnegative integer from `context_purge_preview`). The real purge only runs shortly after a matching preview, and only if the current match count still equals `expected_count`. | JSON text containing `{ "purge": { "before": string, "expected_count": number, "deleted_count": number, "deleted": context[] } }`. |
-| `vacuum_database` | Run PostgreSQL maintenance for the managed tables. Takes no arguments. | JSON text containing `{ "vacuum": { "tables": ["contexts", "embeddings"], "before": metadata, "after": metadata } }`. |
+| `vacuum_database` | Run PostgreSQL maintenance for the managed tables. Takes no arguments. | JSON text containing metadata before and after vacuuming `contexts`, `embeddings`, and `actors`. |
 
 `database_metadata` returns a shape like this:
 
@@ -186,6 +218,7 @@ This project is licensed under the [MIT License](LICENSE).
 {
   "metadata": {
     "context_count": 3,
+    "actor_count": 2,
     "total_size": {
       "bytes": 2147483648,
       "pretty": "2048 MB"
@@ -198,6 +231,10 @@ This project is licensed under the [MIT License](LICENSE).
       "embeddings": {
         "bytes": 8192,
         "pretty": "8192 bytes"
+      },
+      "actors": {
+        "bytes": 16384,
+        "pretty": "16 kB"
       }
     }
   }
@@ -213,6 +250,14 @@ Context records returned by the tools look like this:
   "content": "User has been building an MCP server this week.",
   "source": "chat",
   "tags": ["mcp", "project"],
+  "actor": {
+    "id": 1,
+    "external_id": "actor:openai:codex",
+    "name": "Codex",
+    "kind": "ai",
+    "created_at": "2026-07-18T15:00:00.000Z",
+    "last_seen_at": "2026-07-18T15:00:00.000Z"
+  },
   "created_at": "2026-06-12T15:00:00.000Z",
   "updated_at": "2026-06-12T15:00:00.000Z"
 }
@@ -254,8 +299,19 @@ contexts (
   content TEXT NOT NULL,
   source TEXT,
   tags TEXT[],
+  actor_id BIGINT REFERENCES actors(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
+)
+
+actors (
+  id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  external_id TEXT,
+  name TEXT NOT NULL,
+  kind TEXT,
+  metadata JSONB,
+  created_at TIMESTAMPTZ NOT NULL,
+  last_seen_at TIMESTAMPTZ NOT NULL
 )
 
 embeddings (

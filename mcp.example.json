@@ -11,6 +11,7 @@
         "PGDATABASE": "personal_context",
         "PGUSER": "USERNAME",
         "AUTO_MANAGE_DB": "false",
+        "REQUIRE_ACTOR_IDENTIFICATION": "false",
         "EMBEDDINGS_ENABLED": "false",
         "EMBEDDINGS_MODEL": "nomic-embed-text",
         "EMBEDDINGS_PROVIDER": "ollama"
