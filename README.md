@@ -137,11 +137,11 @@ every save:
 }
 ```
 
-An explicit actor takes precedence over the session-active actor and becomes
-active when the session does persist. Actor resolution and context insertion
-share one database transaction. An external ID resolves or creates an actor
-atomically; without one, every call creates a distinct actor. Display names are
-never used to merge actors.
+An explicit actor requires a stable `external_id`, takes precedence over the
+session-active actor, and becomes active when the session does persist. Actor
+resolution and context insertion share one database transaction. The standalone
+`identify_actor` tool still permits intentionally anonymous actors, but display
+names are never used to merge actors.
 
 For compatibility, an unidentified save succeeds with `actor: null` and an
 `ACTOR_NOT_IDENTIFIED` warning. Set `REQUIRE_ACTOR_IDENTIFICATION=true` for
@@ -152,6 +152,13 @@ requires attribution without choosing the actor for the model.
 
 Existing databases upgrade through the transactional `schema_migrations`
 ledger. Existing contexts are not backfilled and remain `actor: null`.
+
+Actor cleanup is deliberate rather than running after every context deletion.
+`database_metadata` reports all unreferenced actors and the purgeable subset.
+Only anonymous actors with no `external_id`, no referencing contexts, and a
+`last_seen_at` older than a chosen cutoff can be removed through
+`actor_purge_preview` and `actor_purge_confirm`. Durable actors are never
+matched by these tools.
 
 `get_user_profile` returns the OS username plus contexts explicitly tagged
 `profile`. It does not perform semantic search, so browsing history cannot enter
@@ -204,6 +211,8 @@ Set `EMBEDDINGS_AUTO_PULL=false` if you prefer to manage models yourself with
   - [x] `update_context(id, text?, tags?, source?)`
   - [x] `context_purge_preview(before)`
   - [x] `context_purge_confirm(before, confirmation_token, expected_count)`
+  - [x] `actor_purge_preview(before)`
+  - [x] `actor_purge_confirm(before, confirmation_token, expected_count)`
   - [x] `vacuum_database()` / maintenance helper
 - [ ] Add embedding-based semantic search
   - [x] Add environment toggle and no-op embedding lifecycle hook
@@ -225,7 +234,7 @@ This project is licensed under the [MIT License](LICENSE).
 | --- | --- | --- |
 | `ping` | Health check for the MCP server. Takes no arguments. | Text response: `Pong!` |
 | `identify_actor` | Resolve or create the active actor for this MCP session. Arguments: `name` (required), `external_id` (optional stable ID), `kind` (optional), and `metadata` (optional object). | JSON text containing `{ "identified": { "actor": actor, "created": boolean } }`. Metadata is stored but not returned. |
-| `save_context` | Save a context note. Existing arguments remain `text`, `tags?`, and `source?`; `actor?` may contain `external_id?`, required `name`, `kind?`, and `metadata?`. Include `actor` whenever session continuity is uncertain. Explicit actor identity takes precedence over session state. | JSON text containing `{ "saved": context, "actor_resolution"?: { "created": boolean } }`. Compatibility mode adds actionable guidance when attribution is absent; strict mode rejects before writing and tells the model to retry with `actor`. |
+| `save_context` | Save a context note. Existing arguments remain `text`, `tags?`, and `source?`; `actor?` requires `external_id` and `name`, with optional `kind` and `metadata`. Include `actor` whenever session continuity is uncertain. Explicit actor identity takes precedence over session state. | JSON text containing `{ "saved": context, "actor_resolution"?: { "created": boolean } }`. Compatibility mode adds actionable guidance when attribution is absent; strict mode rejects before writing and tells the model to retry with `actor`. |
 | `search_context` | Search saved context semantically when embeddings are usable, falling back to text only when semantic search is unavailable. Arguments: `query`, `limit?`, `sensitivity?`, and `actor_external_id?`. Actor filtering is applied inside both search paths. | JSON text containing `{ "query", "limit", "sensitivity", "actor_external_id"?, "results" }`. |
 | `get_user_profile` | Fetch the curated profile view. Takes no arguments and returns contexts explicitly tagged `profile`; no semantic or text fallback search is used. | JSON text containing `{ "profile": { "username": string, "tag": "profile", "results": context[] } }`. The username is the active OS account. |
 | `list_recent_context` | Fetch recent context notes. Arguments: `limit?` and `actor_external_id?`. | JSON text containing `{ "limit", "actor_external_id"?, "results" }`, ordered newest first. |
@@ -234,6 +243,8 @@ This project is licensed under the [MIT License](LICENSE).
 | `update_context` | Update a saved context note. Arguments: `id` (required positive integer), plus at least one of `text` (optional string), `tags` (optional string array), or `source` (optional string). | JSON text containing `{ "id": number, "updated": context \| null }`, where `updated` is the updated record or `null` if no record matched. |
 | `context_purge_preview` | Preview a deletion of saved context notes before a cutoff. Arguments: `before` (required date or timestamp). | JSON text containing `{ "preview": { "before": string, "matched": number, "oldest": string \| null, "newest": string \| null, "confirmation_token": string, "expires_at": string } }`. |
 | `context_purge_confirm` | Delete saved context notes before a cutoff. Arguments: `before` (required date or timestamp), `confirmation_token` (required string from `context_purge_preview`), and `expected_count` (required nonnegative integer from `context_purge_preview`). The real purge only runs shortly after a matching preview, and only if the current match count still equals `expected_count`. | JSON text containing `{ "purge": { "before": string, "expected_count": number, "deleted_count": number, "deleted": context[] } }`. |
+| `actor_purge_preview` | Preview old anonymous actors that have no external ID and no referencing contexts. Argument: `before` as a last-seen cutoff. Durable actors are excluded. | JSON text containing the scope, cutoff, matched count, last-seen range, confirmation token, and expiry. |
+| `actor_purge_confirm` | Delete exactly the anonymous orphan set from a recent matching preview. Arguments: `before`, `confirmation_token`, and `expected_count`. | JSON text containing `{ "purge": { "scope": "anonymous_unreferenced_actors", "deleted_count": number, "deleted": actor[] } }`. |
 | `vacuum_database` | Run PostgreSQL maintenance for the managed tables. Takes no arguments. | JSON text containing metadata before and after vacuuming `contexts`, `embeddings`, and `actors`. |
 
 `database_metadata` returns a shape like this:
@@ -243,6 +254,8 @@ This project is licensed under the [MIT License](LICENSE).
   "metadata": {
     "context_count": 3,
     "actor_count": 2,
+    "orphan_actor_count": 1,
+    "purgeable_actor_count": 1,
     "total_size": {
       "bytes": 2147483648,
       "pretty": "2048 MB"

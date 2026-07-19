@@ -2,6 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
     SEARCH_SENSITIVITY_VALUES,
+    actorPurgeConfirm,
+    actorPurgePreview,
     deleteContext,
     contextPurgeConfirm,
     contextPurgePreview,
@@ -90,7 +92,7 @@ export function createServer() {
                 tags: z.array(z.string()).optional().describe("Optional tags for grouping or filtering the context."),
                 source: z.string().optional().describe("Optional source describing where the context came from."),
                 actor: z.object({
-                    external_id: z.string().min(1).optional().describe("Recommended stable operational actor ID, such as actor:openai:codex. Omit only when intentionally creating a distinct actor."),
+                    external_id: z.string().min(1).describe("Stable operational actor ID, such as actor:openai:codex. Required for self-contained saves so reconnecting clients do not create duplicate anonymous actors."),
                     name: z.string().min(1).describe("Actor display name."),
                     kind: z.string().min(1).optional().describe("Optional actor category, such as ai or human."),
                     metadata: z.record(z.string(), z.unknown()).optional().describe("Optional actor metadata. Model version, client, and execution lineage belong here rather than in external_id."),
@@ -355,6 +357,52 @@ export function createServer() {
         },
         async ({ before, confirmation_token, expected_count }) => {
             const purge = await contextPurgeConfirm(before, confirmation_token, expected_count);
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify({ purge }),
+                    },
+                ],
+            };
+        }
+    );
+
+    server.registerTool(
+        "actor_purge_preview",
+        {
+            description: "Preview deletion of old anonymous actors that have no external ID and are not referenced by any context. Durable actors are never matched. Run this before actor_purge_confirm.",
+            inputSchema: {
+                before: z.string().min(1).describe("Last-seen cutoff. Only anonymous, unreferenced actors last seen before this date or timestamp are counted."),
+            },
+        },
+        async ({ before }) => {
+            const preview = await actorPurgePreview(before);
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify({ preview }),
+                    },
+                ],
+            };
+        }
+    );
+
+    server.registerTool(
+        "actor_purge_confirm",
+        {
+            description: "Delete old anonymous, unreferenced actors. Requires a recent matching actor_purge_preview; actors with external IDs are never deleted.",
+            inputSchema: {
+                before: z.string().min(1).describe("The exact cutoff used for actor_purge_preview."),
+                confirmation_token: z.string().min(1).describe("Confirmation token returned by actor_purge_preview."),
+                expected_count: z.number().int().nonnegative().describe("Matched count returned by actor_purge_preview."),
+            },
+        },
+        async ({ before, confirmation_token, expected_count }) => {
+            const purge = await actorPurgeConfirm(before, confirmation_token, expected_count);
 
             return {
                 content: [

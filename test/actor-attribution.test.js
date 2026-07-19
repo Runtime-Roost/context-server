@@ -14,6 +14,8 @@ const {
     runDatabaseMigrations,
 } = await import("../dist/storage/db.js");
 const {
+    actorPurgeConfirm,
+    actorPurgePreview,
     identifyActor,
     deleteContext,
     getDatabaseMetadata,
@@ -245,6 +247,30 @@ test("self-contained saves survive client reconnects and resolve actors idempote
     }
 });
 
+test("self-contained saves reject anonymous actor identities before writing", async () => {
+    const actorName = uniqueValue("anonymous-self-contained");
+    const connection = await connectTestClient();
+
+    try {
+        const result = await connection.client.callTool({
+            name: "save_context",
+            arguments: {
+                text: uniqueValue("anonymous-self-contained-context"),
+                actor: { name: actorName, kind: "ai" },
+            },
+        });
+        assert.equal(result.isError, true);
+
+        const actorCount = await db.query(
+            "SELECT COUNT(*) AS matched FROM actors WHERE name = $1",
+            [actorName],
+        );
+        assert.equal(Number(actorCount.rows[0].matched), 0);
+    } finally {
+        await connection.close();
+    }
+});
+
 test("explicit save actor overrides and replaces the session-active actor", async () => {
     const sessionExternalId = uniqueValue("actor:test:precedence-session");
     const explicitExternalId = uniqueValue("actor:test:precedence-explicit");
@@ -343,6 +369,58 @@ test("administrative context projections and metadata include actors", async () 
     }
 });
 
+test("actor purge removes only old anonymous unreferenced actors", async () => {
+    const purgeable = await identifyActor({ name: uniqueValue("purgeable-anonymous") });
+    const referenced = await identifyActor({ name: uniqueValue("referenced-anonymous") });
+    const durable = await identifyActor({
+        external_id: uniqueValue("actor:test:durable-orphan"),
+        name: "Durable Orphan",
+    });
+    const referencedContext = await saveContext(
+        uniqueValue("referenced-actor-context"),
+        [],
+        undefined,
+        referenced.actor.id,
+    );
+    const actorIds = [purgeable.actor.id, referenced.actor.id, durable.actor.id];
+
+    try {
+        await db.query(
+            "UPDATE actors SET last_seen_at = '2000-01-01T00:00:00.000Z' WHERE id = ANY($1::bigint[])",
+            [actorIds],
+        );
+
+        const metadata = await getDatabaseMetadata();
+        assert.ok(metadata.orphan_actor_count >= 2);
+        assert.ok(metadata.purgeable_actor_count >= 1);
+
+        const before = "2001-01-01T00:00:00.000Z";
+        const preview = await actorPurgePreview(before);
+        assert.equal(preview.scope, "anonymous_unreferenced_actors");
+        assert.equal(preview.matched, 1);
+
+        const purge = await actorPurgeConfirm(
+            before,
+            preview.confirmation_token,
+            preview.matched,
+        );
+        assert.equal(purge.deleted_count, 1);
+        assert.equal(purge.deleted[0].id, purgeable.actor.id);
+
+        const survivors = await db.query(
+            "SELECT id FROM actors WHERE id = ANY($1::bigint[]) ORDER BY id",
+            [actorIds],
+        );
+        assert.deepEqual(
+            survivors.rows.map((row) => Number(row.id)),
+            [referenced.actor.id, durable.actor.id].sort((left, right) => left - right),
+        );
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = $1", [referencedContext.id]);
+        await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [actorIds]);
+    }
+});
+
 test("user profile returns only explicitly tagged contexts", async () => {
     const marker = uniqueValue("profile-tag");
     const profileContext = await saveContext(`${marker} curated`, ["profile"]);
@@ -375,8 +453,10 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         assert.ok(searchSchema.properties.actor_external_id);
         assert.ok(recentSchema.properties.actor_external_id);
         assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text"]);
-        assert.deepEqual(saveSchema.properties.actor.required, ["name"]);
+        assert.deepEqual(saveSchema.properties.actor.required, ["external_id", "name"]);
         assert.ok(saveSchema.properties.actor.properties.external_id);
+        assert.ok(byName.get("actor_purge_preview"));
+        assert.ok(byName.get("actor_purge_confirm"));
     } finally {
         await connection.close();
     }

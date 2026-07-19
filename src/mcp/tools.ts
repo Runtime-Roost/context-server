@@ -77,6 +77,8 @@ type VectorSearchRow = ContextRow & {
 type DatabaseMetadataRow = {
     context_count: string;
     actor_count: string;
+    orphan_actor_count: string;
+    purgeable_actor_count: string;
     total_size_bytes: string;
     total_size_pretty: string;
     contexts_size_bytes: string;
@@ -90,6 +92,8 @@ type DatabaseMetadataRow = {
 type DatabaseMetadata = {
     context_count: number;
     actor_count: number;
+    orphan_actor_count: number;
+    purgeable_actor_count: number;
     total_size: {
         bytes: number;
         pretty: string;
@@ -127,7 +131,8 @@ const MAX_CONTEXT_LIMIT = 100;
 const DEFAULT_SEARCH_SENSITIVITY: SearchSensitivity = "low";
 const PURGE_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 let tagsColumnType: string | undefined;
-const pendingPurges = new Map<string, PendingPurge>();
+const pendingContextPurges = new Map<string, PendingPurge>();
+const pendingActorPurges = new Map<string, PendingPurge>();
 
 function normalizeLimit(limit?: number) {
     if (limit === undefined) {
@@ -313,7 +318,10 @@ function cosineSimilarity(left: number[], right: number[]) {
     return dotProduct / (Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude));
 }
 
-function cleanupExpiredPurgeConfirmations(now = new Date()) {
+function cleanupExpiredPurgeConfirmations(
+    pendingPurges: Map<string, PendingPurge>,
+    now = new Date(),
+) {
     for (const [token, pendingPurge] of pendingPurges) {
         if (pendingPurge.expiresAt <= now) {
             pendingPurges.delete(token);
@@ -795,6 +803,21 @@ export async function getDatabaseMetadata() {
             SELECT
                 (SELECT COUNT(*) FROM contexts) AS context_count,
                 (SELECT COUNT(*) FROM actors) AS actor_count,
+                (
+                    SELECT COUNT(*)
+                    FROM actors
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM contexts WHERE contexts.actor_id = actors.id
+                    )
+                ) AS orphan_actor_count,
+                (
+                    SELECT COUNT(*)
+                    FROM actors
+                    WHERE actors.external_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM contexts WHERE contexts.actor_id = actors.id
+                      )
+                ) AS purgeable_actor_count,
                 pg_database_size(current_database()) AS total_size_bytes,
                 pg_size_pretty(pg_database_size(current_database())) AS total_size_pretty,
                 pg_total_relation_size('contexts') AS contexts_size_bytes,
@@ -810,6 +833,8 @@ export async function getDatabaseMetadata() {
     return {
         context_count: Number(row?.context_count ?? 0),
         actor_count: Number(row?.actor_count ?? 0),
+        orphan_actor_count: Number(row?.orphan_actor_count ?? 0),
+        purgeable_actor_count: Number(row?.purgeable_actor_count ?? 0),
         total_size: {
             bytes: Number(row?.total_size_bytes ?? 0),
             pretty: row?.total_size_pretty ?? "0 bytes",
@@ -878,8 +903,8 @@ export async function contextPurgePreview(before: string) {
     const confirmationToken = `purge_${randomUUID()}`;
     const expiresAt = new Date(Date.now() + PURGE_CONFIRMATION_TTL_MS);
 
-    cleanupExpiredPurgeConfirmations();
-    pendingPurges.set(confirmationToken, {
+    cleanupExpiredPurgeConfirmations(pendingContextPurges);
+    pendingContextPurges.set(confirmationToken, {
         before: normalizedBefore,
         matched: preview.matched,
         expiresAt,
@@ -901,16 +926,16 @@ export async function contextPurgeConfirm(
     const normalizedBefore = normalizePurgeCutoff(before);
     const now = new Date();
 
-    cleanupExpiredPurgeConfirmations(now);
+    cleanupExpiredPurgeConfirmations(pendingContextPurges, now);
 
-    const pendingPurge = pendingPurges.get(confirmationToken);
+    const pendingPurge = pendingContextPurges.get(confirmationToken);
 
     if (!pendingPurge) {
         throw new Error("No active purge preview matched the confirmation token.");
     }
 
     if (pendingPurge.expiresAt <= now) {
-        pendingPurges.delete(confirmationToken);
+        pendingContextPurges.delete(confirmationToken);
         throw new Error("The purge confirmation token has expired. Run context_purge_preview again.");
     }
 
@@ -955,12 +980,124 @@ export async function contextPurgeConfirm(
         [normalizedBefore]
     );
 
-    pendingPurges.delete(confirmationToken);
+    pendingContextPurges.delete(confirmationToken);
 
     return {
         before: normalizedBefore,
         expected_count: expectedCount,
         deleted_count: result.rowCount ?? result.rows.length,
         deleted: result.rows.map(mapContextRow),
+    };
+}
+
+async function getActorPurgePreview(before: string) {
+    await initializeDatabase();
+
+    const result = await db.query<PurgePreviewRow>(
+        `
+            SELECT
+                COUNT(*) AS matched,
+                MIN(last_seen_at) AS oldest,
+                MAX(last_seen_at) AS newest
+            FROM actors
+            WHERE external_id IS NULL
+              AND last_seen_at < $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM contexts
+                  WHERE contexts.actor_id = actors.id
+              )
+        `,
+        [before]
+    );
+    const row = result.rows[0];
+
+    return {
+        matched: Number(row?.matched ?? 0),
+        oldest: normalizeNullableTimestamp(row?.oldest ?? null),
+        newest: normalizeNullableTimestamp(row?.newest ?? null),
+    };
+}
+
+export async function actorPurgePreview(before: string) {
+    const normalizedBefore = normalizePurgeCutoff(before);
+    const preview = await getActorPurgePreview(normalizedBefore);
+    const confirmationToken = `actor_purge_${randomUUID()}`;
+    const expiresAt = new Date(Date.now() + PURGE_CONFIRMATION_TTL_MS);
+
+    cleanupExpiredPurgeConfirmations(pendingActorPurges);
+    pendingActorPurges.set(confirmationToken, {
+        before: normalizedBefore,
+        matched: preview.matched,
+        expiresAt,
+    });
+
+    return {
+        before: normalizedBefore,
+        scope: "anonymous_unreferenced_actors",
+        ...preview,
+        confirmation_token: confirmationToken,
+        expires_at: expiresAt.toISOString(),
+    };
+}
+
+export async function actorPurgeConfirm(
+    before: string,
+    confirmationToken: string,
+    expectedCount: number,
+) {
+    const normalizedBefore = normalizePurgeCutoff(before);
+    const now = new Date();
+
+    cleanupExpiredPurgeConfirmations(pendingActorPurges, now);
+
+    const pendingPurge = pendingActorPurges.get(confirmationToken);
+
+    if (!pendingPurge) {
+        throw new Error("No active actor purge preview matched the confirmation token.");
+    }
+
+    if (pendingPurge.expiresAt <= now) {
+        pendingActorPurges.delete(confirmationToken);
+        throw new Error("The actor purge confirmation token has expired. Run actor_purge_preview again.");
+    }
+
+    if (pendingPurge.before !== normalizedBefore) {
+        throw new Error("The actor purge cutoff does not match the previewed cutoff.");
+    }
+
+    if (pendingPurge.matched !== expectedCount) {
+        throw new Error("The expected count does not match the previewed actor count.");
+    }
+
+    const currentPreview = await getActorPurgePreview(normalizedBefore);
+
+    if (currentPreview.matched !== expectedCount) {
+        throw new Error("The actor purge match count changed after preview. Run actor_purge_preview again.");
+    }
+
+    const result = await db.query<ActorRow>(
+        `
+            DELETE FROM actors
+            WHERE external_id IS NULL
+              AND last_seen_at < $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM contexts
+                  WHERE contexts.actor_id = actors.id
+              )
+            RETURNING id, external_id, name, kind, metadata, created_at, last_seen_at
+        `,
+        [normalizedBefore]
+    );
+
+    pendingActorPurges.delete(confirmationToken);
+
+    return {
+        before: normalizedBefore,
+        scope: "anonymous_unreferenced_actors",
+        expected_count: expectedCount,
+        deleted_count: result.rowCount ?? result.rows.length,
+        deleted: result.rows.map(mapActorRow),
     };
 }
