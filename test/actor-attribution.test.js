@@ -177,12 +177,106 @@ test("identified, unidentified, strict, and switched MCP saves preserve compatib
                 arguments: { text: uniqueValue("strict-rejected") },
             });
             assert.equal(strictResult.isError, true);
-            assert.equal(textResult(strictResult).error.code, "ACTOR_IDENTIFICATION_REQUIRED");
+            const strictError = textResult(strictResult).error;
+            assert.equal(strictError.code, "ACTOR_IDENTIFICATION_REQUIRED");
+            assert.equal(strictError.required_action.tool, "save_context");
+            assert.ok(strictError.required_action.include.actor.external_id);
+
+            const strictRetry = textResult(await strictConnection.client.callTool({
+                name: "save_context",
+                arguments: {
+                    text: uniqueValue("strict-retry"),
+                    actor: {
+                        external_id: uniqueValue("actor:test:strict-retry"),
+                        name: "Strict Retry Actor",
+                        kind: "ai",
+                    },
+                },
+            }));
+            savedIds.push(strictRetry.saved.id);
+            actorIds.push(strictRetry.saved.actor.id);
+            assert.equal(strictRetry.saved.actor.name, "Strict Retry Actor");
         } finally {
             await strictConnection.close();
         }
     } finally {
         delete process.env.REQUIRE_ACTOR_IDENTIFICATION;
+        await connection.close();
+        if (savedIds.length > 0) await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [savedIds]);
+        if (actorIds.length > 0) await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [actorIds]);
+    }
+});
+
+test("self-contained saves survive client reconnects and resolve actors idempotently", async () => {
+    const externalId = uniqueValue("actor:test:reconnect");
+    const firstConnection = await connectTestClient();
+    const secondConnection = await connectTestClient();
+    const savedIds = [];
+    let actorId;
+
+    try {
+        const firstSave = textResult(await firstConnection.client.callTool({
+            name: "save_context",
+            arguments: {
+                text: uniqueValue("reconnect-first"),
+                actor: { external_id: externalId, name: "Reconnect Actor", kind: "ai" },
+            },
+        }));
+        savedIds.push(firstSave.saved.id);
+        actorId = firstSave.saved.actor.id;
+        assert.equal(firstSave.saved.actor.external_id, externalId);
+        assert.equal(firstSave.actor_resolution.created, true);
+
+        const secondSave = textResult(await secondConnection.client.callTool({
+            name: "save_context",
+            arguments: {
+                text: uniqueValue("reconnect-second"),
+                actor: { external_id: externalId, name: "Reconnect Actor", kind: "ai" },
+            },
+        }));
+        savedIds.push(secondSave.saved.id);
+        assert.equal(secondSave.saved.actor.id, actorId);
+        assert.equal(secondSave.actor_resolution.created, false);
+    } finally {
+        await firstConnection.close();
+        await secondConnection.close();
+        if (savedIds.length > 0) await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [savedIds]);
+        if (actorId) await db.query("DELETE FROM actors WHERE id = $1", [actorId]);
+    }
+});
+
+test("explicit save actor overrides and replaces the session-active actor", async () => {
+    const sessionExternalId = uniqueValue("actor:test:precedence-session");
+    const explicitExternalId = uniqueValue("actor:test:precedence-explicit");
+    const connection = await connectTestClient();
+    const savedIds = [];
+    const actorIds = [];
+
+    try {
+        const sessionIdentity = textResult(await connection.client.callTool({
+            name: "identify_actor",
+            arguments: { external_id: sessionExternalId, name: "Session Actor", kind: "ai" },
+        }));
+        actorIds.push(sessionIdentity.identified.actor.id);
+
+        const explicitSave = textResult(await connection.client.callTool({
+            name: "save_context",
+            arguments: {
+                text: uniqueValue("precedence-explicit"),
+                actor: { external_id: explicitExternalId, name: "Explicit Actor", kind: "ai" },
+            },
+        }));
+        savedIds.push(explicitSave.saved.id);
+        actorIds.push(explicitSave.saved.actor.id);
+        assert.equal(explicitSave.saved.actor.external_id, explicitExternalId);
+
+        const followingSave = textResult(await connection.client.callTool({
+            name: "save_context",
+            arguments: { text: uniqueValue("precedence-following") },
+        }));
+        savedIds.push(followingSave.saved.id);
+        assert.equal(followingSave.saved.actor.external_id, explicitExternalId);
+    } finally {
         await connection.close();
         if (savedIds.length > 0) await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [savedIds]);
         if (actorIds.length > 0) await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [actorIds]);
@@ -280,7 +374,9 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         assert.ok(identifySchema.properties.external_id);
         assert.ok(searchSchema.properties.actor_external_id);
         assert.ok(recentSchema.properties.actor_external_id);
-        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["source", "tags", "text"]);
+        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text"]);
+        assert.deepEqual(saveSchema.properties.actor.required, ["name"]);
+        assert.ok(saveSchema.properties.actor.properties.external_id);
     } finally {
         await connection.close();
     }

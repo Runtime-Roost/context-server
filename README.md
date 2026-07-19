@@ -115,16 +115,40 @@ operational categories rather than conversations or model versions, for
 example `actor:openai:codex`, `actor:openai:chatgpt`, and
 `actor:human:blake`.
 
-Call `identify_actor` once per MCP session before saving. The resolved actor
-becomes active for that server instance, and subsequent `save_context` calls
-automatically attach it. Calling `identify_actor` again switches actors. An
-external ID resolves or creates an actor atomically; without one, every call
-creates a distinct actor. Display names are never used to merge actors.
+For clients with persistent MCP sessions, call `identify_actor` once before
+saving. The resolved actor becomes active for that server instance, and
+subsequent `save_context` calls automatically attach it. Calling
+`identify_actor` again switches actors.
+
+Clients that may reconnect or launch a fresh stdio process between calls, such
+as some LM Studio configurations, should include actor identity directly in
+every save:
+
+```json
+{
+  "text": "Tested actor attribution successfully.",
+  "tags": ["tool_testing"],
+  "source": "LM Studio actor-attribution test, 2026-07-19",
+  "actor": {
+    "external_id": "actor:eden",
+    "name": "Eden",
+    "kind": "ai"
+  }
+}
+```
+
+An explicit actor takes precedence over the session-active actor and becomes
+active when the session does persist. Actor resolution and context insertion
+share one database transaction. An external ID resolves or creates an actor
+atomically; without one, every call creates a distinct actor. Display names are
+never used to merge actors.
 
 For compatibility, an unidentified save succeeds with `actor: null` and an
-`ACTOR_NOT_IDENTIFIED` warning. Set `REQUIRE_ACTOR_IDENTIFICATION=true` to
-reject unidentified saves with an `ACTOR_IDENTIFICATION_REQUIRED` error. Strict
-mode is disabled by default.
+`ACTOR_NOT_IDENTIFIED` warning. Set `REQUIRE_ACTOR_IDENTIFICATION=true` for
+clients such as LM Studio to reject the write before it happens. The structured
+`ACTOR_IDENTIFICATION_REQUIRED` error tells the model to retry the same
+`save_context` call with an actor object. Strict mode is disabled by default and
+requires attribution without choosing the actor for the model.
 
 Existing databases upgrade through the transactional `schema_migrations`
 ledger. Existing contexts are not backfilled and remain `actor: null`.
@@ -165,7 +189,7 @@ Set `EMBEDDINGS_AUTO_PULL=false` if you prefer to manage models yourself with
 
 - [x] Build basic MCP server
 - [x] Build and expose basic tools
-  - [x] `save_context(text, tags?, source?)`
+  - [x] `save_context(text, tags?, source?, actor?)`
   - [x] `identify_actor(external_id?, name, kind?, metadata?)`
   - [x] `search_context(query, limit?, sensitivity?, actor_external_id?)`
   - [x] `get_user_profile()`
@@ -201,7 +225,7 @@ This project is licensed under the [MIT License](LICENSE).
 | --- | --- | --- |
 | `ping` | Health check for the MCP server. Takes no arguments. | Text response: `Pong!` |
 | `identify_actor` | Resolve or create the active actor for this MCP session. Arguments: `name` (required), `external_id` (optional stable ID), `kind` (optional), and `metadata` (optional object). | JSON text containing `{ "identified": { "actor": actor, "created": boolean } }`. Metadata is stored but not returned. |
-| `save_context` | Save a context note with the active actor. Its existing arguments remain `text`, `tags?`, and `source?`. | JSON text containing `{ "saved": context }`. Compatibility mode adds a warning when no actor is active; strict mode returns a structured error. |
+| `save_context` | Save a context note. Existing arguments remain `text`, `tags?`, and `source?`; `actor?` may contain `external_id?`, required `name`, `kind?`, and `metadata?`. Include `actor` whenever session continuity is uncertain. Explicit actor identity takes precedence over session state. | JSON text containing `{ "saved": context, "actor_resolution"?: { "created": boolean } }`. Compatibility mode adds actionable guidance when attribution is absent; strict mode rejects before writing and tells the model to retry with `actor`. |
 | `search_context` | Search saved context semantically when embeddings are usable, falling back to text only when semantic search is unavailable. Arguments: `query`, `limit?`, `sensitivity?`, and `actor_external_id?`. Actor filtering is applied inside both search paths. | JSON text containing `{ "query", "limit", "sensitivity", "actor_external_id"?, "results" }`. |
 | `get_user_profile` | Fetch the curated profile view. Takes no arguments and returns contexts explicitly tagged `profile`; no semantic or text fallback search is used. | JSON text containing `{ "profile": { "username": string, "tag": "profile", "results": context[] } }`. The username is the active OS account. |
 | `list_recent_context` | Fetch recent context notes. Arguments: `limit?` and `actor_external_id?`. | JSON text containing `{ "limit", "actor_external_id"?, "results" }`, ordered newest first. |

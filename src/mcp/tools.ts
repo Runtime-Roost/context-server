@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { userInfo } from "node:os";
+import type { PoolClient } from "pg";
 
 import { maybeGenerateEmbedding, maybeSaveContextEmbedding } from "../embeddings/index.js";
 import { db, initializeDatabase } from "../storage/db.js";
@@ -29,6 +30,13 @@ export type ActorIdentity = {
     name: string;
     kind?: string;
     metadata?: Record<string, unknown>;
+};
+
+export type SaveContextResult = {
+    context: ContextRecord;
+    actor_resolution?: {
+        created: boolean;
+    };
 };
 
 export const SEARCH_SENSITIVITY_VALUES = ["low", "medium", "high"] as const;
@@ -333,9 +341,7 @@ async function getTagsColumnType() {
     return tagsColumnType;
 }
 
-export async function identifyActor(identity: ActorIdentity) {
-    await initializeDatabase();
-
+async function resolveActor(identity: ActorIdentity, client: PoolClient) {
     const now = new Date().toISOString();
     const externalId = identity.external_id?.trim() || null;
     const name = identity.name.trim();
@@ -347,7 +353,7 @@ export async function identifyActor(identity: ActorIdentity) {
     }
 
     if (externalId === null) {
-        const result = await db.query<ActorRow>(
+        const result = await client.query<ActorRow>(
             `
                 INSERT INTO actors (external_id, name, kind, metadata, created_at, last_seen_at)
                 VALUES (NULL, $1, $2, $3, $4, $4)
@@ -359,7 +365,7 @@ export async function identifyActor(identity: ActorIdentity) {
         return { actor: mapActorRow(result.rows[0]), created: true };
     }
 
-    const inserted = await db.query<ActorRow>(
+    const inserted = await client.query<ActorRow>(
         `
             INSERT INTO actors (external_id, name, kind, metadata, created_at, last_seen_at)
             VALUES ($1, $2, $3, $4, $5, $5)
@@ -373,7 +379,7 @@ export async function identifyActor(identity: ActorIdentity) {
         return { actor: mapActorRow(inserted.rows[0]), created: true };
     }
 
-    const resolved = await db.query<ActorRow>(
+    const resolved = await client.query<ActorRow>(
         `
             UPDATE actors
             SET last_seen_at = $2
@@ -386,18 +392,28 @@ export async function identifyActor(identity: ActorIdentity) {
     return { actor: mapActorRow(resolved.rows[0]), created: false };
 }
 
-export async function saveContext(
-    text: string,
-    tags?: string[],
-    source?: string,
-    actorId?: number | null,
-) {
+export async function identifyActor(identity: ActorIdentity) {
     await initializeDatabase();
+    const client = await db.connect();
 
+    try {
+        return await resolveActor(identity, client);
+    } finally {
+        client.release();
+    }
+}
+
+async function insertContext(
+    client: PoolClient,
+    text: string,
+    tags: string[] | undefined,
+    source: string | undefined,
+    actorId: number | null,
+) {
     const now = new Date().toISOString();
     const tagList = tags ?? [];
     const tagValue = (await getTagsColumnType()) === "_text" ? tagList : JSON.stringify(tagList);
-    const result = await db.query<ContextRow>(
+    const result = await client.query<ContextRow>(
         `
             WITH inserted AS (
                 INSERT INTO contexts (kind, content, source, tags, actor_id, created_at, updated_at)
@@ -421,14 +437,71 @@ export async function saveContext(
             FROM inserted
             LEFT JOIN actors ON actors.id = inserted.actor_id
         `,
-        [text, source ?? null, tagValue, actorId ?? null, now]
+        [text, source ?? null, tagValue, actorId, now]
     );
 
-    const context = mapContextRow(result.rows[0]);
+    return mapContextRow(result.rows[0]);
+}
+
+export async function saveContext(
+    text: string,
+    tags?: string[],
+    source?: string,
+    actorId?: number | null,
+) {
+    await initializeDatabase();
+    const client = await db.connect();
+    let context: ContextRecord;
+
+    try {
+        context = await insertContext(client, text, tags, source, actorId ?? null);
+    } finally {
+        client.release();
+    }
 
     await maybeSaveContextEmbedding(context);
 
     return context;
+}
+
+export async function saveContextWithActor(
+    text: string,
+    tags?: string[],
+    source?: string,
+    actor?: ActorIdentity,
+    activeActorId?: number | null,
+): Promise<SaveContextResult> {
+    if (!actor) {
+        return {
+            context: await saveContext(text, tags, source, activeActorId),
+        };
+    }
+
+    await initializeDatabase();
+    const client = await db.connect();
+    let context: ContextRecord;
+    let identified: Awaited<ReturnType<typeof resolveActor>>;
+
+    try {
+        await client.query("BEGIN");
+        identified = await resolveActor(actor, client);
+        context = await insertContext(client, text, tags, source, identified.actor.id);
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+
+    await maybeSaveContextEmbedding(context);
+
+    return {
+        context,
+        actor_resolution: {
+            created: identified.created,
+        },
+    };
 }
 
 async function searchContextByText(

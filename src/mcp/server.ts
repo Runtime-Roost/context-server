@@ -9,7 +9,7 @@ import {
     getUserProfile,
     identifyActor,
     listRecentContext,
-    saveContext,
+    saveContextWithActor,
     searchContext,
     updateContext,
     vacuumDatabase,
@@ -84,15 +84,21 @@ export function createServer() {
     server.registerTool(
         "save_context",
         {
-            description: "Save a piece of personal context for later retrieval.",
+            description: "Save personal context for later retrieval. Include actor on every save unless identify_actor succeeded in this same persistent MCP session. If session continuity is uncertain, always include actor. Actor identifies who synthesized the memory; source identifies where the information came from.",
             inputSchema: {
                 text: z.string().min(1).describe("The context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags for grouping or filtering the context."),
                 source: z.string().optional().describe("Optional source describing where the context came from."),
+                actor: z.object({
+                    external_id: z.string().min(1).optional().describe("Recommended stable operational actor ID, such as actor:openai:codex. Omit only when intentionally creating a distinct actor."),
+                    name: z.string().min(1).describe("Actor display name."),
+                    kind: z.string().min(1).optional().describe("Optional actor category, such as ai or human."),
+                    metadata: z.record(z.string(), z.unknown()).optional().describe("Optional actor metadata. Model version, client, and execution lineage belong here rather than in external_id."),
+                }).optional().describe("Explicit actor identity for this save. Takes precedence over the session-active actor and survives clients that reconnect between tool calls."),
             },
         },
-        async ({ text, tags, source }) => {
-            if (actorSession.actorId === null && requireActorIdentificationEnabled()) {
+        async ({ text, tags, source, actor }) => {
+            if (!actor && actorSession.actorId === null && requireActorIdentificationEnabled()) {
                 return {
                     isError: true,
                     content: [
@@ -101,7 +107,17 @@ export function createServer() {
                             text: JSON.stringify({
                                 error: {
                                     code: "ACTOR_IDENTIFICATION_REQUIRED",
-                                    message: "Call identify_actor before save_context, or disable REQUIRE_ACTOR_IDENTIFICATION.",
+                                    message: "Retry save_context with an actor object. Clients that preserve MCP session continuity may instead call identify_actor first.",
+                                    required_action: {
+                                        tool: "save_context",
+                                        include: {
+                                            actor: {
+                                                external_id: "actor:<provider>:<name>",
+                                                name: "<display name>",
+                                                kind: "ai",
+                                            },
+                                        },
+                                    },
                                 },
                             }),
                         },
@@ -109,11 +125,32 @@ export function createServer() {
                 };
             }
 
-            const context = await saveContext(text, tags, source, actorSession.actorId);
-            const warning = actorSession.actorId === null
+            const saved = await saveContextWithActor(
+                text,
+                tags,
+                source,
+                actor,
+                actorSession.actorId,
+            );
+
+            if (saved.context.actor) {
+                actorSession.activate(saved.context.actor.id);
+            }
+
+            const warning = saved.context.actor === null
                 ? {
                       code: "ACTOR_NOT_IDENTIFIED",
-                      message: "Saved without actor attribution. Call identify_actor before future saves.",
+                      message: "Saved without actor attribution. On future saves, include an actor object. Clients with persistent MCP sessions may call identify_actor first.",
+                      recommended_action: {
+                          tool: "save_context",
+                          include: {
+                              actor: {
+                                  external_id: "actor:<provider>:<name>",
+                                  name: "<display name>",
+                                  kind: "ai",
+                              },
+                          },
+                      },
                   }
                 : undefined;
 
@@ -121,7 +158,13 @@ export function createServer() {
                 content: [
                     {
                         type: "text",
-                        text: JSON.stringify({ saved: context, ...(warning ? { warning } : {}) }),
+                        text: JSON.stringify({
+                            saved: saved.context,
+                            ...(saved.actor_resolution
+                                ? { actor_resolution: saved.actor_resolution }
+                                : {}),
+                            ...(warning ? { warning } : {}),
+                        }),
                     },
                 ],
             };
