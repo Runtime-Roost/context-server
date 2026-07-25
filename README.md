@@ -153,6 +153,27 @@ requires attribution without choosing the actor for the model.
 Existing databases upgrade through the transactional `schema_migrations`
 ledger. Existing contexts are not backfilled and remain `actor: null`.
 
+### Whiteboard visibility
+
+Every context now has a first-class `visibility` classification. Existing rows
+are migrated to `whiteboard`, and new saves default to `whiteboard`. Whiteboard
+records are shared context discoverable through `search_context`,
+`list_recent_context`, `get_context`, and `get_user_profile`.
+
+The database vocabulary reserves `channel`, `direct`, `personal`, and `system`
+for the authenticated messaging design, but the MCP write schemas intentionally
+accept only `whiteboard` today. Non-whiteboard rows fail closed: current
+conversational reads, updates, deletes, and context purges do not expose or
+mutate them. This avoids presenting self-asserted actor identity as real access
+control.
+
+Future authenticated visibility will bind actor/device public keys through an
+explicit enrollment process, verify signed request proofs and replay
+protection, and authorize channel membership before database search, ranking,
+pagination, counts, or serialization. Channel encryption and key epochs remain
+a later layer; private keys must never be stored in the context database or
+accepted through ordinary MCP arguments.
+
 Actor cleanup is deliberate rather than running after every context deletion.
 `database_metadata` reports all unreferenced actors and the purgeable subset.
 Only anonymous actors with no `external_id`, no referencing contexts, and a
@@ -196,7 +217,7 @@ Set `EMBEDDINGS_AUTO_PULL=false` if you prefer to manage models yourself with
 
 - [x] Build basic MCP server
 - [x] Build and expose basic tools
-  - [x] `save_context(text, tags?, source?, actor?)`
+  - [x] `save_context(text, tags?, source?, visibility?, actor?)`
   - [x] `identify_actor(external_id?, name, kind?, metadata?)`
   - [x] `search_context(query, limit?, sensitivity?, actor_external_id?)`
   - [x] `get_user_profile()`
@@ -235,14 +256,14 @@ This project is licensed under the [MIT License](LICENSE).
 | --- | --- | --- |
 | `ping` | Health check for the MCP server. Takes no arguments. | Text response: `Pong!` |
 | `identify_actor` | Resolve or create the active actor for this MCP session. Arguments: `name` (required), `external_id` (optional stable ID), `kind` (optional), and `metadata` (optional object). | JSON text containing `{ "identified": { "actor": actor, "created": boolean } }`. Metadata is stored but not returned. |
-| `save_context` | Save a context note. Existing arguments remain `text`, `tags?`, and `source?`; `actor?` requires `external_id` and `name`, with optional `kind` and `metadata`. Include `actor` whenever session continuity is uncertain. Explicit actor identity takes precedence over session state. | JSON text containing `{ "saved": context, "actor_resolution"?: { "created": boolean } }`. Compatibility mode adds actionable guidance when attribution is absent; strict mode rejects before writing and tells the model to retry with `actor`. |
+| `save_context` | Save a context note. Arguments are `text`, `tags?`, `source?`, `visibility?`, and `actor?`; visibility currently accepts only `whiteboard` and defaults to it. `actor?` requires `external_id` and `name`, with optional `kind` and `metadata`. Include `actor` whenever session continuity is uncertain. Explicit actor identity takes precedence over session state. | JSON text containing `{ "saved": context, "actor_resolution"?: { "created": boolean } }`. The returned context includes `visibility`. Compatibility mode adds actionable guidance when attribution is absent; strict mode rejects before writing and tells the model to retry with `actor`. |
 | `search_context` | Search saved context semantically when embeddings are usable, falling back to text only when semantic search is unavailable. Arguments: `query`, `limit?`, `sensitivity?`, and `actor_external_id?`. Actor filtering is applied inside both search paths. | JSON text containing `{ "query", "limit", "sensitivity", "actor_external_id"?, "results" }`. |
 | `get_user_profile` | Fetch the curated profile view. Takes no arguments and returns contexts explicitly tagged `profile`; no semantic or text fallback search is used. | JSON text containing `{ "profile": { "username": string, "tag": "profile", "results": context[] } }`. The username is the active OS account. |
 | `list_recent_context` | Fetch recent context notes. Arguments: `limit?` and `actor_external_id?`. | JSON text containing `{ "limit", "actor_external_id"?, "results" }`, ordered newest first. |
 | `get_context` | Fetch one context note by exact ID. Argument: `id` (required positive integer). | JSON text containing `{ "id": number, "context": context \| null }`, where `context` is the exact stored record or `null` if no record matched. |
 | `database_metadata` | Fetch simple database metadata. Takes no arguments. | JSON text containing context and actor counts, total database size, and managed table sizes. |
 | `delete_context` | Delete a saved context note. Arguments: `id` (required positive integer). | JSON text containing `{ "id": number, "deleted": context \| null }`, where `deleted` is the removed record or `null` if no record matched. |
-| `update_context` | Update a saved context note. Arguments: `id` (required positive integer), plus at least one of `text` (optional string), `tags` (optional string array), or `source` (optional string). | JSON text containing `{ "id": number, "updated": context \| null }`, where `updated` is the updated record or `null` if no record matched. |
+| `update_context` | Update a saved whiteboard context note. Arguments: `id` (required positive integer), plus at least one of `text` (optional string), `tags` (optional string array), `source` (optional string), or `visibility` (currently only `whiteboard`). | JSON text containing `{ "id": number, "updated": context \| null }`, where `updated` is the updated record or `null` if no visible record matched. |
 | `context_purge_preview` | Preview a deletion of saved context notes before a cutoff. Arguments: `before` (required date or timestamp). | JSON text containing `{ "preview": { "before": string, "matched": number, "oldest": string \| null, "newest": string \| null, "confirmation_token": string, "expires_at": string } }`. |
 | `context_purge_confirm` | Delete saved context notes before a cutoff. Arguments: `before` (required date or timestamp), `confirmation_token` (required string from `context_purge_preview`), and `expected_count` (required nonnegative integer from `context_purge_preview`). The real purge only runs shortly after a matching preview, and only if the current match count still equals `expected_count`. | JSON text containing `{ "purge": { "before": string, "expected_count": number, "deleted_count": number, "deleted": context[] } }`. |
 | `actor_purge_preview` | Preview old anonymous actors that have no external ID and no referencing contexts. Argument: `before` as a last-seen cutoff. Durable actors are excluded. | JSON text containing the scope, cutoff, matched count, last-seen range, confirmation token, and expiry. |

@@ -85,10 +85,11 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
 
         await runDatabaseMigrations(isolatedPool);
 
-        const legacy = await isolatedPool.query("SELECT actor_id FROM contexts");
+        const legacy = await isolatedPool.query("SELECT actor_id, visibility FROM contexts");
         const applied = await isolatedPool.query("SELECT version FROM schema_migrations ORDER BY version");
         assert.equal(legacy.rows[0].actor_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2]);
+        assert.equal(legacy.rows[0].visibility, "whiteboard");
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3]);
     } finally {
         await isolatedPool.end();
         await adminPool.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -389,6 +390,7 @@ test("get_context returns an exact record or null", async () => {
         assert.equal(found.id, saved.id);
         assert.equal(found.context.id, saved.id);
         assert.equal(found.context.content, marker);
+        assert.equal(found.context.visibility, "whiteboard");
 
         const missing = textResult(await connection.client.callTool({
             name: "get_context",
@@ -399,6 +401,57 @@ test("get_context returns an exact record or null", async () => {
     } finally {
         await connection.close();
         await db.query("DELETE FROM contexts WHERE id = $1", [saved.id]);
+    }
+});
+
+test("whiteboard is the only currently discoverable and writable visibility", async () => {
+    const marker = uniqueValue("whiteboard-policy");
+    const whiteboard = await saveContext(
+        `${marker} shared`,
+        ["profile", marker],
+        "whiteboard policy test",
+        null,
+        "whiteboard",
+    );
+    const hidden = await db.query(
+        `
+            INSERT INTO contexts (
+                kind,
+                visibility,
+                content,
+                source,
+                tags,
+                created_at,
+                updated_at
+            )
+            VALUES ('note', 'direct', $1, 'whiteboard policy test', $2, NOW(), NOW())
+            RETURNING id
+        `,
+        [`${marker} hidden`, ["profile", marker]],
+    );
+    const hiddenId = Number(hidden.rows[0].id);
+
+    try {
+        assert.equal(whiteboard.visibility, "whiteboard");
+        assert.equal((await getContext(whiteboard.id))?.id, whiteboard.id);
+        assert.equal(await getContext(hiddenId), null);
+
+        const searchResults = await searchContext(marker, 20, "low");
+        assert.ok(searchResults.some((context) => context.id === whiteboard.id));
+        assert.ok(searchResults.every((context) => context.id !== hiddenId));
+
+        const recentResults = await listRecentContext(100);
+        assert.ok(recentResults.some((context) => context.id === whiteboard.id));
+        assert.ok(recentResults.every((context) => context.id !== hiddenId));
+
+        const profile = await getUserProfile();
+        assert.ok(profile.results.some((context) => context.id === whiteboard.id));
+        assert.ok(profile.results.every((context) => context.id !== hiddenId));
+
+        assert.equal(await updateContext(hiddenId, "must remain hidden"), null);
+        assert.equal(await deleteContext(hiddenId), null);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[whiteboard.id, hiddenId]]);
     }
 });
 
@@ -481,6 +534,7 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         const recentSchema = byName.get("list_recent_context")?.inputSchema;
         const getContextSchema = byName.get("get_context")?.inputSchema;
         const saveSchema = byName.get("save_context")?.inputSchema;
+        const updateSchema = byName.get("update_context")?.inputSchema;
 
         assert.deepEqual(identifySchema.required, ["name"]);
         assert.ok(identifySchema.properties.external_id);
@@ -488,9 +542,11 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         assert.ok(recentSchema.properties.actor_external_id);
         assert.deepEqual(getContextSchema.required, ["id"]);
         assert.ok(getContextSchema.properties.id);
-        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text"]);
+        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text", "visibility"]);
+        assert.deepEqual(saveSchema.properties.visibility.enum, ["whiteboard"]);
         assert.deepEqual(saveSchema.properties.actor.required, ["external_id", "name"]);
         assert.ok(saveSchema.properties.actor.properties.external_id);
+        assert.deepEqual(updateSchema.properties.visibility.enum, ["whiteboard"]);
         assert.ok(byName.get("actor_purge_preview"));
         assert.ok(byName.get("actor_purge_confirm"));
     } finally {

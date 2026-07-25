@@ -188,6 +188,24 @@ const migrations: Migration[] = [
                 ON contexts(actor_id, created_at DESC, id DESC);
         `,
     },
+    {
+        version: 3,
+        name: "context_visibility",
+        sql: `
+            ALTER TABLE contexts
+                ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'whiteboard';
+
+            ALTER TABLE contexts
+                DROP CONSTRAINT IF EXISTS contexts_visibility_check;
+
+            ALTER TABLE contexts
+                ADD CONSTRAINT contexts_visibility_check
+                CHECK (visibility IN ('whiteboard', 'channel', 'direct', 'personal', 'system'));
+
+            CREATE INDEX IF NOT EXISTS contexts_visibility_created_at_idx
+                ON contexts(visibility, created_at DESC, id DESC);
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;

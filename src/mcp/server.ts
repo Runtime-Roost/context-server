@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
     SEARCH_SENSITIVITY_VALUES,
+    WRITABLE_CONTEXT_VISIBILITY_VALUES,
     actorPurgeConfirm,
     actorPurgePreview,
     deleteContext,
@@ -92,6 +93,7 @@ export function createServer() {
                 text: z.string().min(1).describe("The context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags for grouping or filtering the context."),
                 source: z.string().optional().describe("Optional source describing where the context came from."),
+                visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Visibility classification. Only whiteboard is currently writable; authenticated channel, direct, personal, and system records are staged for a later release."),
                 actor: z.object({
                     external_id: z.string().min(1).describe("Stable operational actor ID, such as actor:openai:codex. Required for self-contained saves so reconnecting clients do not create duplicate anonymous actors."),
                     name: z.string().min(1).describe("Actor display name."),
@@ -100,7 +102,7 @@ export function createServer() {
                 }).optional().describe("Explicit actor identity for this save. Takes precedence over the session-active actor and survives clients that reconnect between tool calls."),
             },
         },
-        async ({ text, tags, source, actor }) => {
+        async ({ text, tags, source, visibility, actor }) => {
             if (!actor && actorSession.actorId === null && requireActorIdentificationEnabled()) {
                 return {
                     isError: true,
@@ -134,6 +136,7 @@ export function createServer() {
                 source,
                 actor,
                 actorSession.actorId,
+                visibility,
             );
 
             if (saved.context.actor) {
@@ -330,10 +333,11 @@ export function createServer() {
                 text: z.string().min(1).optional().describe("Optional replacement context text."),
                 tags: z.array(z.string()).optional().describe("Optional replacement tags."),
                 source: z.string().optional().describe("Optional replacement source."),
+                visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Optional replacement visibility. Only whiteboard is currently writable."),
             },
         },
-        async ({ id, text, tags, source }) => {
-            const updated = await updateContext(id, text, tags, source);
+        async ({ id, text, tags, source, visibility }) => {
+            const updated = await updateContext(id, text, tags, source, visibility);
 
             return {
                 content: [

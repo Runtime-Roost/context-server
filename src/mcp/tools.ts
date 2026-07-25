@@ -8,6 +8,7 @@ import { db, initializeDatabase } from "../storage/db.js";
 export type ContextRecord = {
     id: number;
     kind: string;
+    visibility: ContextVisibility;
     content: string;
     source: string | null;
     tags: string[];
@@ -41,11 +42,22 @@ export type SaveContextResult = {
 
 export const SEARCH_SENSITIVITY_VALUES = ["low", "medium", "high"] as const;
 export type SearchSensitivity = (typeof SEARCH_SENSITIVITY_VALUES)[number];
+export const CONTEXT_VISIBILITY_VALUES = [
+    "whiteboard",
+    "channel",
+    "direct",
+    "personal",
+    "system",
+] as const;
+export type ContextVisibility = (typeof CONTEXT_VISIBILITY_VALUES)[number];
+export const WRITABLE_CONTEXT_VISIBILITY_VALUES = ["whiteboard"] as const;
+export type WritableContextVisibility = (typeof WRITABLE_CONTEXT_VISIBILITY_VALUES)[number];
 export const USER_PROFILE_TAG = "profile";
 
 type ContextRow = {
     id: number | string;
     kind: string;
+    visibility: ContextVisibility;
     content: string;
     source: string | null;
     tags: string | string[] | null;
@@ -129,6 +141,8 @@ type PendingPurge = {
 const DEFAULT_CONTEXT_LIMIT = 20;
 const MAX_CONTEXT_LIMIT = 100;
 const DEFAULT_SEARCH_SENSITIVITY: SearchSensitivity = "low";
+const DEFAULT_CONTEXT_VISIBILITY: WritableContextVisibility = "whiteboard";
+const WHITEBOARD_READ_PREDICATE = "contexts.visibility = 'whiteboard'";
 const PURGE_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 let tagsColumnType: string | undefined;
 const pendingContextPurges = new Map<string, PendingPurge>();
@@ -214,6 +228,7 @@ function mapContextRow(row: ContextRow): ContextRecord {
     return {
         id: Number(row.id),
         kind: row.kind,
+        visibility: row.visibility,
         content: row.content,
         source: row.source,
         tags: parseTags(row.tags),
@@ -246,6 +261,7 @@ function mapActorRow(row: ActorRow): ActorRecord {
 const CONTEXT_PROJECTION = `
     contexts.id,
     contexts.kind,
+    contexts.visibility,
     contexts.content,
     contexts.source,
     contexts.tags,
@@ -258,6 +274,12 @@ const CONTEXT_PROJECTION = `
     actors.created_at AS actor_created_at,
     actors.last_seen_at AS actor_last_seen_at
 `;
+
+function normalizeWritableVisibility(
+    visibility: WritableContextVisibility | undefined,
+): WritableContextVisibility {
+    return visibility ?? DEFAULT_CONTEXT_VISIBILITY;
+}
 
 function parseEmbeddingVector(value: unknown) {
     if (!value) {
@@ -417,6 +439,7 @@ async function insertContext(
     tags: string[] | undefined,
     source: string | undefined,
     actorId: number | null,
+    visibility: WritableContextVisibility | undefined,
 ) {
     const now = new Date().toISOString();
     const tagList = tags ?? [];
@@ -424,13 +447,23 @@ async function insertContext(
     const result = await client.query<ContextRow>(
         `
             WITH inserted AS (
-                INSERT INTO contexts (kind, content, source, tags, actor_id, created_at, updated_at)
-                VALUES ('note', $1, $2, $3, $4, $5, $5)
+                INSERT INTO contexts (
+                    kind,
+                    visibility,
+                    content,
+                    source,
+                    tags,
+                    actor_id,
+                    created_at,
+                    updated_at
+                )
+                VALUES ('note', $1, $2, $3, $4, $5, $6, $6)
                 RETURNING *
             )
             SELECT
                 inserted.id,
                 inserted.kind,
+                inserted.visibility,
                 inserted.content,
                 inserted.source,
                 inserted.tags,
@@ -445,7 +478,7 @@ async function insertContext(
             FROM inserted
             LEFT JOIN actors ON actors.id = inserted.actor_id
         `,
-        [text, source ?? null, tagValue, actorId, now]
+        [normalizeWritableVisibility(visibility), text, source ?? null, tagValue, actorId, now]
     );
 
     return mapContextRow(result.rows[0]);
@@ -456,13 +489,21 @@ export async function saveContext(
     tags?: string[],
     source?: string,
     actorId?: number | null,
+    visibility?: WritableContextVisibility,
 ) {
     await initializeDatabase();
     const client = await db.connect();
     let context: ContextRecord;
 
     try {
-        context = await insertContext(client, text, tags, source, actorId ?? null);
+        context = await insertContext(
+            client,
+            text,
+            tags,
+            source,
+            actorId ?? null,
+            visibility,
+        );
     } finally {
         client.release();
     }
@@ -478,10 +519,11 @@ export async function saveContextWithActor(
     source?: string,
     actor?: ActorIdentity,
     activeActorId?: number | null,
+    visibility?: WritableContextVisibility,
 ): Promise<SaveContextResult> {
     if (!actor) {
         return {
-            context: await saveContext(text, tags, source, activeActorId),
+            context: await saveContext(text, tags, source, activeActorId, visibility),
         };
     }
 
@@ -493,7 +535,14 @@ export async function saveContextWithActor(
     try {
         await client.query("BEGIN");
         identified = await resolveActor(actor, client);
-        context = await insertContext(client, text, tags, source, identified.actor.id);
+        context = await insertContext(
+            client,
+            text,
+            tags,
+            source,
+            identified.actor.id,
+            visibility,
+        );
         await client.query("COMMIT");
     } catch (error) {
         await client.query("ROLLBACK");
@@ -530,6 +579,7 @@ async function searchContextByText(
                 OR contexts.source ILIKE $1
                 OR contexts.tags::text ILIKE $1
             )
+              AND ${WHITEBOARD_READ_PREDICATE}
               AND ($2::text IS NULL OR actors.external_id = $2)
             ORDER BY contexts.created_at DESC, contexts.id DESC
             LIMIT $3
@@ -565,6 +615,7 @@ export async function searchContextByVector(
             LEFT JOIN actors ON actors.id = contexts.actor_id
             WHERE embeddings.model = $1
               AND embeddings.vector IS NOT NULL
+              AND ${WHITEBOARD_READ_PREDICATE}
               AND ($2::text IS NULL OR actors.external_id = $2)
         `,
         [embedding.model, actorExternalId ?? null]
@@ -645,6 +696,7 @@ export async function listContextByTag(tag: string, limit?: number) {
                 FROM contexts
                 LEFT JOIN actors ON actors.id = contexts.actor_id
                 WHERE $1 = ANY(contexts.tags)
+                  AND ${WHITEBOARD_READ_PREDICATE}
                 ORDER BY contexts.created_at DESC, contexts.id DESC
                 LIMIT $2
             `
@@ -652,6 +704,7 @@ export async function listContextByTag(tag: string, limit?: number) {
                 SELECT ${CONTEXT_PROJECTION}
                 FROM contexts
                 LEFT JOIN actors ON actors.id = contexts.actor_id
+                WHERE ${WHITEBOARD_READ_PREDICATE}
                 ORDER BY contexts.created_at DESC, contexts.id DESC
             `,
         tagsType === "_text" ? [tag, resultLimit] : []
@@ -672,7 +725,8 @@ export async function listRecentContext(limit?: number, actorExternalId?: string
             SELECT ${CONTEXT_PROJECTION}
             FROM contexts
             LEFT JOIN actors ON actors.id = contexts.actor_id
-            WHERE $1::text IS NULL OR actors.external_id = $1
+            WHERE ${WHITEBOARD_READ_PREDICATE}
+              AND ($1::text IS NULL OR actors.external_id = $1)
             ORDER BY contexts.created_at DESC, contexts.id DESC
             LIMIT $2
         `,
@@ -691,6 +745,7 @@ export async function getContext(id: number) {
             FROM contexts
             LEFT JOIN actors ON actors.id = contexts.actor_id
             WHERE contexts.id = $1
+              AND ${WHITEBOARD_READ_PREDICATE}
         `,
         [id]
     );
@@ -708,11 +763,13 @@ export async function deleteContext(id: number) {
             WITH deleted AS (
                 DELETE FROM contexts
                 WHERE id = $1
+                  AND visibility = 'whiteboard'
                 RETURNING *
             )
             SELECT
                 deleted.id,
                 deleted.kind,
+                deleted.visibility,
                 deleted.content,
                 deleted.source,
                 deleted.tags,
@@ -739,16 +796,18 @@ export async function updateContext(
     id: number,
     text?: string,
     tags?: string[],
-    source?: string
+    source?: string,
+    visibility?: WritableContextVisibility,
 ) {
     await initializeDatabase();
 
     const hasText = text !== undefined;
     const hasTags = tags !== undefined;
     const hasSource = source !== undefined;
+    const hasVisibility = visibility !== undefined;
 
-    if (!hasText && !hasTags && !hasSource) {
-        throw new Error("At least one of text, tags, or source must be provided.");
+    if (!hasText && !hasTags && !hasSource && !hasVisibility) {
+        throw new Error("At least one of text, tags, source, or visibility must be provided.");
     }
 
     const tagValue = hasTags
@@ -765,13 +824,16 @@ export async function updateContext(
                     content = CASE WHEN $2 THEN $3 ELSE content END,
                     tags = CASE WHEN $4 THEN $5 ELSE tags END,
                     source = CASE WHEN $6 THEN $7 ELSE source END,
-                    updated_at = $8
+                    visibility = CASE WHEN $8 THEN $9 ELSE visibility END,
+                    updated_at = $10
                 WHERE id = $1
+                  AND visibility = 'whiteboard'
                 RETURNING *
             )
             SELECT
                 updated.id,
                 updated.kind,
+                updated.visibility,
                 updated.content,
                 updated.source,
                 updated.tags,
@@ -794,6 +856,8 @@ export async function updateContext(
             tagValue,
             hasSource,
             source ?? null,
+            hasVisibility,
+            visibility ?? null,
             new Date().toISOString(),
         ]
     );
@@ -903,6 +967,7 @@ async function getPurgePreview(before: string) {
                 MAX(created_at) AS newest
             FROM contexts
             WHERE created_at < $1
+              AND visibility = 'whiteboard'
         `,
         [before]
     );
@@ -976,11 +1041,13 @@ export async function contextPurgeConfirm(
             WITH deleted AS (
                 DELETE FROM contexts
                 WHERE created_at < $1
+                  AND visibility = 'whiteboard'
                 RETURNING *
             )
             SELECT
                 deleted.id,
                 deleted.kind,
+                deleted.visibility,
                 deleted.content,
                 deleted.source,
                 deleted.tags,
