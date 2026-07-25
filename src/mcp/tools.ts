@@ -682,6 +682,24 @@ export async function listRecentContext(limit?: number, actorExternalId?: string
     return result.rows.map(mapContextRow);
 }
 
+export async function getContext(id: number) {
+    await initializeDatabase();
+
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.id = $1
+        `,
+        [id]
+    );
+
+    const context = result.rows[0];
+
+    return context ? mapContextRow(context) : null;
+}
+
 export async function deleteContext(id: number) {
     await initializeDatabase();
 

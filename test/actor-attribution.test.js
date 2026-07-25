@@ -18,6 +18,7 @@ const {
     actorPurgePreview,
     identifyActor,
     deleteContext,
+    getContext,
     getDatabaseMetadata,
     getUserProfile,
     listRecentContext,
@@ -354,6 +355,12 @@ test("administrative context projections and metadata include actors", async () 
     const saved = await saveContext(uniqueValue("admin-projection"), [], undefined, identified.actor.id);
 
     try {
+        const fetched = await getContext(saved.id);
+        assert.equal(fetched.id, saved.id);
+        assert.equal(fetched.content, saved.content);
+        assert.equal(fetched.actor.external_id, externalId);
+        assert.equal(await getContext(2_147_483_647), null);
+
         const updated = await updateContext(saved.id, "updated actor projection");
         assert.equal(updated.actor.external_id, externalId);
 
@@ -366,6 +373,32 @@ test("administrative context projections and metadata include actors", async () 
     } finally {
         await db.query("DELETE FROM contexts WHERE id = $1", [saved.id]);
         await db.query("DELETE FROM actors WHERE id = $1", [identified.actor.id]);
+    }
+});
+
+test("get_context returns an exact record or null", async () => {
+    const marker = uniqueValue("get-context");
+    const saved = await saveContext(marker, ["exact-id"], "get_context test");
+    const connection = await connectTestClient();
+
+    try {
+        const found = textResult(await connection.client.callTool({
+            name: "get_context",
+            arguments: { id: saved.id },
+        }));
+        assert.equal(found.id, saved.id);
+        assert.equal(found.context.id, saved.id);
+        assert.equal(found.context.content, marker);
+
+        const missing = textResult(await connection.client.callTool({
+            name: "get_context",
+            arguments: { id: 2_147_483_647 },
+        }));
+        assert.equal(missing.id, 2_147_483_647);
+        assert.equal(missing.context, null);
+    } finally {
+        await connection.close();
+        await db.query("DELETE FROM contexts WHERE id = $1", [saved.id]);
     }
 });
 
@@ -446,12 +479,15 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         const identifySchema = byName.get("identify_actor")?.inputSchema;
         const searchSchema = byName.get("search_context")?.inputSchema;
         const recentSchema = byName.get("list_recent_context")?.inputSchema;
+        const getContextSchema = byName.get("get_context")?.inputSchema;
         const saveSchema = byName.get("save_context")?.inputSchema;
 
         assert.deepEqual(identifySchema.required, ["name"]);
         assert.ok(identifySchema.properties.external_id);
         assert.ok(searchSchema.properties.actor_external_id);
         assert.ok(recentSchema.properties.actor_external_id);
+        assert.deepEqual(getContextSchema.required, ["id"]);
+        assert.ok(getContextSchema.properties.id);
         assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text"]);
         assert.deepEqual(saveSchema.properties.actor.required, ["external_id", "name"]);
         assert.ok(saveSchema.properties.actor.properties.external_id);

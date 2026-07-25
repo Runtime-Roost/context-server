@@ -7,6 +7,7 @@ import {
     deleteContext,
     contextPurgeConfirm,
     contextPurgePreview,
+    getContext,
     getDatabaseMetadata,
     getUserProfile,
     identifyActor,
@@ -264,6 +265,31 @@ export function createServer() {
                     {
                         type: "text",
                         text: JSON.stringify({ metadata }),
+                    },
+                ],
+            };
+        }
+    );
+
+    server.registerTool(
+        "get_context",
+        {
+            description: "Get a saved personal context item by its exact id.",
+            inputSchema: {
+                id: z.number().int().positive().describe("The id of the context item to retrieve."),
+            },
+        },
+        async ({ id }) => {
+            const context = await getContext(id);
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: JSON.stringify({
+                            id,
+                            context,
+                        }),
                     },
                 ],
             };
