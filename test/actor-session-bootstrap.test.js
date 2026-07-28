@@ -455,6 +455,10 @@ test("local approval binds the exact requesting OpenAI conversation", async () =
         })).request;
         requestIds.push(requested.request_id);
         assert.equal(requested.claim_code, undefined);
+        assert.equal(
+            requested.next_action,
+            "Ask the local operator to approve this request_id. Approval activates this exact OpenAI conversation; no second authentication call is needed.",
+        );
         const approved = await approveActorSessionRequest(
             requested.request_id,
             actorExternalId,

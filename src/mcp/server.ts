@@ -243,7 +243,9 @@ export function createServer() {
     server.registerTool(
         "request_actor_session",
         {
-            description: "Request an operator-approved expiring actor session for a remote client that cannot hold an Ed25519 signing key. This does not authenticate the caller or grant access until a local operator approves it.",
+            description: process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() === "true"
+                ? "Request local approval for this exact OpenAI conversation. Approval activates the trusted tunnel identity automatically; do not call claim_actor_session or provide an auth object afterward."
+                : "Request an operator-approved expiring actor session for a native client that cannot hold an Ed25519 signing key. Keep the returned claim code private, then use it after local approval with claim_actor_session.",
             inputSchema: {
                 actor_external_id: z.string().min(1).describe("Durable actor identity the client asks the local operator to approve."),
                 client_label: z.string().min(1).max(200).optional().describe("Human-readable client or conversation label shown to the operator."),
@@ -274,7 +276,7 @@ export function createServer() {
     server.registerTool(
         "get_actor_session_request_status",
         {
-            description: "Check whether an actor-session request is pending, approved, denied, expired, or claimed. The one-time claim code is required.",
+            description: "Native-client flow only: check whether an actor-session request is pending, approved, denied, expired, or claimed using its one-time claim code. Trusted OpenAI tunnel conversations activate during local approval and must not call this tool.",
             inputSchema: {
                 request_id: z.string().min(1).describe("Request identifier returned by request_actor_session."),
                 claim_code: z.string().min(32).describe("Secret claim code returned with the request."),
@@ -298,7 +300,7 @@ export function createServer() {
     server.registerTool(
         "claim_actor_session",
         {
-            description: "Claim a locally approved actor-session request exactly once. Returns an expiring opaque session capability; store it securely and use it in private-channel auth.",
+            description: "Native-client flow only: claim a locally approved actor-session request exactly once and receive an expiring capability for explicit auth. Trusted OpenAI tunnel conversations activate during local approval and must not call this tool or receive the capability.",
             inputSchema: {
                 request_id: z.string().min(1).describe("Approved request identifier."),
                 claim_code: z.string().min(32).describe("Secret claim code returned by request_actor_session."),
