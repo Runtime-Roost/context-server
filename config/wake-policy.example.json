@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "mode": "dry-run",
+  "target_actor_external_id": "actor:openai:codex",
+  "allowed_requester_actors": [
+    "actor:human:blake"
+  ],
+  "allowed_trigger_types": [
+    "explicit_user_request"
+  ],
+  "allowed_sources": [
+    "personal-context-server"
+  ],
+  "allowed_channels": [
+    "mamagpt-codex-private"
+  ],
+  "cooldown_seconds": 300,
+  "max_event_age_seconds": 900,
+  "rate_limit": {
+    "max_wakes": 3,
+    "window_seconds": 3600
+  },
+  "invocation_timeout_seconds": 900,
+  "payload": {
+    "max_summary_chars": 4000,
+    "max_context_ids": 20,
+    "allowed_metadata_keys": [
+      "correlation_id",
+      "priority"
+    ]
+  }
+}
