@@ -9,6 +9,7 @@ export type ContextRecord = {
     id: number;
     kind: string;
     visibility: ContextVisibility;
+    channel_id: number | null;
     content: string;
     source: string | null;
     tags: string[];
@@ -58,6 +59,7 @@ type ContextRow = {
     id: number | string;
     kind: string;
     visibility: ContextVisibility;
+    channel_id: number | string | null;
     content: string;
     source: string | null;
     tags: string | string[] | null;
@@ -229,6 +231,7 @@ function mapContextRow(row: ContextRow): ContextRecord {
         id: Number(row.id),
         kind: row.kind,
         visibility: row.visibility,
+        channel_id: row.channel_id === null ? null : Number(row.channel_id),
         content: row.content,
         source: row.source,
         tags: parseTags(row.tags),
@@ -262,6 +265,7 @@ const CONTEXT_PROJECTION = `
     contexts.id,
     contexts.kind,
     contexts.visibility,
+    contexts.channel_id,
     contexts.content,
     contexts.source,
     contexts.tags,
@@ -274,12 +278,6 @@ const CONTEXT_PROJECTION = `
     actors.created_at AS actor_created_at,
     actors.last_seen_at AS actor_last_seen_at
 `;
-
-function normalizeWritableVisibility(
-    visibility: WritableContextVisibility | undefined,
-): WritableContextVisibility {
-    return visibility ?? DEFAULT_CONTEXT_VISIBILITY;
-}
 
 function parseEmbeddingVector(value: unknown) {
     if (!value) {
@@ -439,7 +437,8 @@ async function insertContext(
     tags: string[] | undefined,
     source: string | undefined,
     actorId: number | null,
-    visibility: WritableContextVisibility | undefined,
+    visibility: ContextVisibility | undefined,
+    channelId: number | null = null,
 ) {
     const now = new Date().toISOString();
     const tagList = tags ?? [];
@@ -454,16 +453,18 @@ async function insertContext(
                     source,
                     tags,
                     actor_id,
+                    channel_id,
                     created_at,
                     updated_at
                 )
-                VALUES ('note', $1, $2, $3, $4, $5, $6, $6)
+                VALUES ('note', $1, $2, $3, $4, $5, $6, $7, $7)
                 RETURNING *
             )
             SELECT
                 inserted.id,
                 inserted.kind,
                 inserted.visibility,
+                inserted.channel_id,
                 inserted.content,
                 inserted.source,
                 inserted.tags,
@@ -478,7 +479,15 @@ async function insertContext(
             FROM inserted
             LEFT JOIN actors ON actors.id = inserted.actor_id
         `,
-        [normalizeWritableVisibility(visibility), text, source ?? null, tagValue, actorId, now]
+        [
+            visibility ?? DEFAULT_CONTEXT_VISIBILITY,
+            text,
+            source ?? null,
+            tagValue,
+            actorId,
+            channelId,
+            now,
+        ]
     );
 
     return mapContextRow(result.rows[0]);
@@ -770,6 +779,7 @@ export async function deleteContext(id: number) {
                 deleted.id,
                 deleted.kind,
                 deleted.visibility,
+                deleted.channel_id,
                 deleted.content,
                 deleted.source,
                 deleted.tags,
@@ -834,6 +844,7 @@ export async function updateContext(
                 updated.id,
                 updated.kind,
                 updated.visibility,
+                updated.channel_id,
                 updated.content,
                 updated.source,
                 updated.tags,
@@ -875,6 +886,624 @@ export async function updateContext(
     }
 
     return context;
+}
+
+export const CHANNEL_ROLE_VALUES = ["owner", "admin", "member"] as const;
+export type ChannelRole = (typeof CHANNEL_ROLE_VALUES)[number];
+
+export type ChannelRecord = {
+    id: number;
+    slug: string;
+    name: string;
+    description: string | null;
+    role: ChannelRole;
+    can_read: boolean;
+    can_write: boolean;
+    created_at: string;
+    updated_at: string;
+};
+
+type ChannelMembershipRow = {
+    id: number | string;
+    slug: string;
+    name: string;
+    description: string | null;
+    role: ChannelRole;
+    can_read: boolean;
+    can_write: boolean;
+    created_at: string | Date;
+    updated_at: string | Date;
+};
+
+function normalizeChannelSlug(slug: string) {
+    const normalized = slug.trim().toLowerCase();
+
+    if (!/^[a-z0-9][a-z0-9_-]{1,62}[a-z0-9]$/.test(normalized)) {
+        throw new Error(
+            "channel slug must be 3-64 lowercase letters, numbers, underscores, or hyphens.",
+        );
+    }
+
+    return normalized;
+}
+
+function mapChannelRow(row: ChannelMembershipRow): ChannelRecord {
+    return {
+        id: Number(row.id),
+        slug: row.slug,
+        name: row.name,
+        description: row.description,
+        role: row.role,
+        can_read: row.can_read,
+        can_write: row.can_write,
+        created_at: normalizeTimestamp(row.created_at),
+        updated_at: normalizeTimestamp(row.updated_at),
+    };
+}
+
+async function requireChannelMembership(
+    actorId: number,
+    slug: string,
+    capability: "read" | "write" | "admin",
+) {
+    const result = await db.query<ChannelMembershipRow>(
+        `
+            SELECT
+                channels.id,
+                channels.slug,
+                channels.name,
+                channels.description,
+                channel_memberships.role,
+                channel_memberships.can_read,
+                channel_memberships.can_write,
+                channels.created_at,
+                channels.updated_at
+            FROM channels
+            INNER JOIN channel_memberships
+                ON channel_memberships.channel_id = channels.id
+            WHERE channels.slug = $1
+              AND channel_memberships.actor_id = $2
+              AND channel_memberships.removed_at IS NULL
+              AND (
+                    ($3 = 'read' AND channel_memberships.can_read)
+                 OR ($3 = 'write' AND channel_memberships.can_write)
+                 OR (
+                        $3 = 'admin'
+                    AND channel_memberships.role IN ('owner', 'admin')
+                 )
+              )
+        `,
+        [normalizeChannelSlug(slug), actorId, capability],
+    );
+    const membership = result.rows[0];
+
+    if (!membership) {
+        throw new Error("CHANNEL_NOT_FOUND_OR_NOT_AUTHORIZED");
+    }
+
+    return mapChannelRow(membership);
+}
+
+export async function createChannel(
+    actorId: number,
+    slug: string,
+    name: string,
+    description?: string,
+) {
+    await initializeDatabase();
+    const normalizedSlug = normalizeChannelSlug(slug);
+    const normalizedName = name.trim();
+
+    if (!normalizedName) {
+        throw new Error("channel name must contain at least one non-whitespace character.");
+    }
+
+    const client = await db.connect();
+
+    try {
+        await client.query("BEGIN");
+        const channelResult = await client.query<{
+            id: number | string;
+            slug: string;
+            name: string;
+            description: string | null;
+            created_at: string | Date;
+            updated_at: string | Date;
+        }>(
+            `
+                INSERT INTO channels (
+                    slug,
+                    name,
+                    description,
+                    created_by_actor_id
+                )
+                VALUES ($1, $2, $3, $4)
+                RETURNING id, slug, name, description, created_at, updated_at
+            `,
+            [normalizedSlug, normalizedName, description?.trim() || null, actorId],
+        );
+        const channel = channelResult.rows[0];
+
+        await client.query(
+            `
+                INSERT INTO channel_memberships (
+                    channel_id,
+                    actor_id,
+                    role,
+                    can_read,
+                    can_write
+                )
+                VALUES ($1, $2, 'owner', TRUE, TRUE)
+            `,
+            [channel.id, actorId],
+        );
+        await client.query("COMMIT");
+
+        return {
+            id: Number(channel.id),
+            slug: channel.slug,
+            name: channel.name,
+            description: channel.description,
+            role: "owner" as const,
+            can_read: true,
+            can_write: true,
+            created_at: normalizeTimestamp(channel.created_at),
+            updated_at: normalizeTimestamp(channel.updated_at),
+        };
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function addChannelMember(
+    requesterActorId: number,
+    slug: string,
+    actorExternalId: string,
+    role: ChannelRole = "member",
+    canRead = true,
+    canWrite = true,
+) {
+    await initializeDatabase();
+    const channel = await requireChannelMembership(requesterActorId, slug, "admin");
+
+    if (role === "owner" && channel.role !== "owner") {
+        throw new Error("CHANNEL_NOT_FOUND_OR_NOT_AUTHORIZED");
+    }
+
+    const currentTarget = await db.query<{ role: ChannelRole }>(
+        `
+            SELECT channel_memberships.role
+            FROM channel_memberships
+            INNER JOIN actors ON actors.id = channel_memberships.actor_id
+            WHERE channel_memberships.channel_id = $1
+              AND actors.external_id = $2
+              AND channel_memberships.removed_at IS NULL
+        `,
+        [channel.id, actorExternalId],
+    );
+    const currentTargetRole = currentTarget.rows[0]?.role;
+
+    if (currentTargetRole === "owner" && role !== "owner") {
+        throw new Error("CHANNEL_OWNER_CANNOT_BE_REMOVED");
+    }
+
+    if (
+        channel.role !== "owner"
+        && (role !== "member" || currentTargetRole === "admin")
+    ) {
+        throw new Error("CHANNEL_NOT_FOUND_OR_NOT_AUTHORIZED");
+    }
+
+    const result = await db.query<{
+        actor_id: number | string;
+        actor_external_id: string;
+        role: ChannelRole;
+        can_read: boolean;
+        can_write: boolean;
+        joined_at: string | Date;
+    }>(
+        `
+            INSERT INTO channel_memberships (
+                channel_id,
+                actor_id,
+                role,
+                can_read,
+                can_write,
+                joined_at,
+                removed_at
+            )
+            SELECT $1, actors.id, $3, $4, $5, NOW(), NULL
+            FROM actors
+            WHERE actors.external_id = $2
+            ON CONFLICT (channel_id, actor_id) DO UPDATE
+            SET
+                role = EXCLUDED.role,
+                can_read = EXCLUDED.can_read,
+                can_write = EXCLUDED.can_write,
+                joined_at = NOW(),
+                removed_at = NULL
+            RETURNING
+                actor_id,
+                $2::text AS actor_external_id,
+                role,
+                can_read,
+                can_write,
+                joined_at
+        `,
+        [channel.id, actorExternalId, role, canRead, canWrite],
+    );
+    const member = result.rows[0];
+
+    if (!member) {
+        throw new Error("ACTOR_NOT_FOUND");
+    }
+
+    return {
+        channel: channel.slug,
+        actor_id: Number(member.actor_id),
+        actor_external_id: member.actor_external_id,
+        role: member.role,
+        can_read: member.can_read,
+        can_write: member.can_write,
+        joined_at: normalizeTimestamp(member.joined_at),
+    };
+}
+
+export async function removeChannelMember(
+    requesterActorId: number,
+    slug: string,
+    actorExternalId: string,
+) {
+    await initializeDatabase();
+    const channel = await requireChannelMembership(requesterActorId, slug, "admin");
+    const target = await db.query<{ role: ChannelRole }>(
+        `
+            SELECT channel_memberships.role
+            FROM channel_memberships
+            INNER JOIN actors ON actors.id = channel_memberships.actor_id
+            WHERE channel_memberships.channel_id = $1
+              AND actors.external_id = $2
+              AND channel_memberships.removed_at IS NULL
+        `,
+        [channel.id, actorExternalId],
+    );
+
+    if (target.rows[0]?.role === "owner") {
+        throw new Error("CHANNEL_OWNER_CANNOT_BE_REMOVED");
+    }
+
+    if (target.rows[0]?.role === "admin" && channel.role !== "owner") {
+        throw new Error("CHANNEL_NOT_FOUND_OR_NOT_AUTHORIZED");
+    }
+
+    const removed = await db.query(
+        `
+            UPDATE channel_memberships
+            SET removed_at = NOW(), can_read = FALSE, can_write = FALSE
+            WHERE channel_id = $1
+              AND actor_id = (
+                  SELECT id FROM actors WHERE external_id = $2
+              )
+              AND removed_at IS NULL
+            RETURNING actor_id, removed_at
+        `,
+        [channel.id, actorExternalId],
+    );
+
+    return {
+        channel: channel.slug,
+        actor_external_id: actorExternalId,
+        removed: removed.rowCount === 1,
+    };
+}
+
+export async function listActorChannels(actorId: number) {
+    await initializeDatabase();
+    const result = await db.query<ChannelMembershipRow>(
+        `
+            SELECT
+                channels.id,
+                channels.slug,
+                channels.name,
+                channels.description,
+                channel_memberships.role,
+                channel_memberships.can_read,
+                channel_memberships.can_write,
+                channels.created_at,
+                channels.updated_at
+            FROM channels
+            INNER JOIN channel_memberships
+                ON channel_memberships.channel_id = channels.id
+            WHERE channel_memberships.actor_id = $1
+              AND channel_memberships.removed_at IS NULL
+            ORDER BY channels.slug
+        `,
+        [actorId],
+    );
+
+    return result.rows.map(mapChannelRow);
+}
+
+export async function saveChannelContext(
+    actorId: number,
+    slug: string,
+    text: string,
+    tags?: string[],
+    source?: string,
+) {
+    await initializeDatabase();
+    const channel = await requireChannelMembership(actorId, slug, "write");
+    const client = await db.connect();
+    let context: ContextRecord;
+
+    try {
+        context = await insertContext(
+            client,
+            text,
+            tags,
+            source,
+            actorId,
+            "channel",
+            channel.id,
+        );
+    } finally {
+        client.release();
+    }
+
+    await maybeSaveContextEmbedding(context);
+    return context;
+}
+
+async function searchChannelContextByText(
+    actorId: number,
+    slug: string,
+    query: string,
+    limit: number,
+) {
+    const channel = await requireChannelMembership(actorId, slug, "read");
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.visibility = 'channel'
+              AND contexts.channel_id = $1
+              AND (
+                    contexts.content ILIKE $2
+                 OR contexts.source ILIKE $2
+                 OR contexts.tags::text ILIKE $2
+              )
+            ORDER BY contexts.created_at DESC, contexts.id DESC
+            LIMIT $3
+        `,
+        [channel.id, `%${query}%`, limit],
+    );
+
+    return result.rows.map(mapContextRow);
+}
+
+export async function searchChannelContext(
+    actorId: number,
+    slug: string,
+    query: string,
+    limit?: number,
+    sensitivity: SearchSensitivity = DEFAULT_SEARCH_SENSITIVITY,
+    generateEmbedding: typeof maybeGenerateEmbedding = maybeGenerateEmbedding,
+) {
+    await initializeDatabase();
+    const resultLimit = normalizeLimit(limit);
+    const channel = await requireChannelMembership(actorId, slug, "read");
+    const embedding = await generateEmbedding(query);
+
+    if (!embedding.generated) {
+        return searchChannelContextByText(actorId, slug, query, resultLimit);
+    }
+
+    const result = await db.query<VectorSearchRow>(
+        `
+            SELECT
+                ${CONTEXT_PROJECTION},
+                embeddings.model,
+                embeddings.vector
+            FROM contexts
+            INNER JOIN embeddings ON embeddings.context_id = contexts.id
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.visibility = 'channel'
+              AND contexts.channel_id = $1
+              AND embeddings.model = $2
+              AND embeddings.vector IS NOT NULL
+        `,
+        [channel.id, embedding.model],
+    );
+
+    return result.rows
+        .map((row) => {
+            const vector = parseEmbeddingVector(row.vector);
+            const similarity = vector ? cosineSimilarity(embedding.vector, vector) : null;
+            return similarity === null ? null : { context: mapContextRow(row), similarity };
+        })
+        .filter((item): item is { context: ContextRecord; similarity: number } => item !== null)
+        .filter((item) => matchesSearchSensitivity(item.similarity, sensitivity))
+        .sort((left, right) => right.similarity - left.similarity)
+        .slice(0, resultLimit)
+        .map((item) => item.context);
+}
+
+export async function listChannelContext(
+    actorId: number,
+    slug: string,
+    limit?: number,
+) {
+    await initializeDatabase();
+    const channel = await requireChannelMembership(actorId, slug, "read");
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.visibility = 'channel'
+              AND contexts.channel_id = $1
+            ORDER BY contexts.created_at DESC, contexts.id DESC
+            LIMIT $2
+        `,
+        [channel.id, normalizeLimit(limit)],
+    );
+
+    return result.rows.map(mapContextRow);
+}
+
+export async function getChannelContext(
+    actorId: number,
+    id: number,
+) {
+    await initializeDatabase();
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            INNER JOIN channel_memberships
+                ON channel_memberships.channel_id = contexts.channel_id
+            WHERE contexts.id = $1
+              AND contexts.visibility = 'channel'
+              AND channel_memberships.actor_id = $2
+              AND channel_memberships.removed_at IS NULL
+              AND channel_memberships.can_read
+        `,
+        [id, actorId],
+    );
+
+    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+}
+
+export async function updateChannelContext(
+    actorId: number,
+    id: number,
+    text?: string,
+    tags?: string[],
+    source?: string,
+) {
+    await initializeDatabase();
+    const hasText = text !== undefined;
+    const hasTags = tags !== undefined;
+    const hasSource = source !== undefined;
+
+    if (!hasText && !hasTags && !hasSource) {
+        throw new Error("At least one of text, tags, or source must be provided.");
+    }
+
+    const tagValue = hasTags
+        ? (await getTagsColumnType()) === "_text"
+            ? tags
+            : JSON.stringify(tags)
+        : null;
+    const result = await db.query<ContextRow>(
+        `
+            WITH updated AS (
+                UPDATE contexts
+                SET
+                    content = CASE WHEN $3 THEN $4 ELSE content END,
+                    tags = CASE WHEN $5 THEN $6 ELSE tags END,
+                    source = CASE WHEN $7 THEN $8 ELSE source END,
+                    updated_at = $9
+                FROM channel_memberships
+                WHERE contexts.id = $1
+                  AND contexts.visibility = 'channel'
+                  AND channel_memberships.channel_id = contexts.channel_id
+                  AND channel_memberships.actor_id = $2
+                  AND channel_memberships.removed_at IS NULL
+                  AND channel_memberships.can_write
+                  AND (
+                        contexts.actor_id = $2
+                     OR channel_memberships.role IN ('owner', 'admin')
+                  )
+                RETURNING contexts.*
+            )
+            SELECT
+                updated.id,
+                updated.kind,
+                updated.visibility,
+                updated.channel_id,
+                updated.content,
+                updated.source,
+                updated.tags,
+                updated.created_at,
+                updated.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM updated
+            LEFT JOIN actors ON actors.id = updated.actor_id
+        `,
+        [
+            id,
+            actorId,
+            hasText,
+            text ?? null,
+            hasTags,
+            tagValue,
+            hasSource,
+            source ?? null,
+            new Date().toISOString(),
+        ],
+    );
+    const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
+
+    if (context && hasText) {
+        await maybeSaveContextEmbedding(context);
+    }
+
+    return context;
+}
+
+export async function deleteChannelContext(actorId: number, id: number) {
+    await initializeDatabase();
+    const result = await db.query<ContextRow>(
+        `
+            WITH deleted AS (
+                DELETE FROM contexts
+                USING channel_memberships
+                WHERE contexts.id = $1
+                  AND contexts.visibility = 'channel'
+                  AND channel_memberships.channel_id = contexts.channel_id
+                  AND channel_memberships.actor_id = $2
+                  AND channel_memberships.removed_at IS NULL
+                  AND channel_memberships.can_write
+                  AND (
+                        contexts.actor_id = $2
+                     OR channel_memberships.role IN ('owner', 'admin')
+                  )
+                RETURNING contexts.*
+            )
+            SELECT
+                deleted.id,
+                deleted.kind,
+                deleted.visibility,
+                deleted.channel_id,
+                deleted.content,
+                deleted.source,
+                deleted.tags,
+                deleted.created_at,
+                deleted.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM deleted
+            LEFT JOIN actors ON actors.id = deleted.actor_id
+        `,
+        [id, actorId],
+    );
+
+    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
 }
 
 export async function getDatabaseMetadata() {
@@ -1048,6 +1677,7 @@ export async function contextPurgeConfirm(
                 deleted.id,
                 deleted.kind,
                 deleted.visibility,
+                deleted.channel_id,
                 deleted.content,
                 deleted.source,
                 deleted.tags,

@@ -147,3 +147,6 @@ vite.config.ts.timestamp-*
 
 # Local MCP client config
 mcp.json
+
+# Actor authentication private keys
+*.private.pem

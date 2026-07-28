@@ -85,11 +85,12 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
 
         await runDatabaseMigrations(isolatedPool);
 
-        const legacy = await isolatedPool.query("SELECT actor_id, visibility FROM contexts");
+        const legacy = await isolatedPool.query("SELECT actor_id, visibility, channel_id FROM contexts");
         const applied = await isolatedPool.query("SELECT version FROM schema_migrations ORDER BY version");
         assert.equal(legacy.rows[0].actor_id, null);
         assert.equal(legacy.rows[0].visibility, "whiteboard");
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3]);
+        assert.equal(legacy.rows[0].channel_id, null);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8]);
     } finally {
         await isolatedPool.end();
         await adminPool.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -547,6 +548,49 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         assert.deepEqual(saveSchema.properties.actor.required, ["external_id", "name"]);
         assert.ok(saveSchema.properties.actor.properties.external_id);
         assert.deepEqual(updateSchema.properties.visibility.enum, ["whiteboard"]);
+        for (const toolName of [
+            "create_channel",
+            "add_channel_member",
+            "remove_channel_member",
+            "list_channels",
+            "save_channel_context",
+            "search_channel_context",
+            "list_channel_context",
+            "get_channel_context",
+            "update_channel_context",
+            "delete_channel_context",
+        ]) {
+            const schema = byName.get(toolName)?.inputSchema;
+            assert.ok(schema, `${toolName} must be registered`);
+            assert.ok(schema.properties.auth, `${toolName} must expose explicit cryptographic auth`);
+            assert.ok(!schema.required?.includes("auth"), `${toolName} must allow trusted tunnel-bound auth`);
+        }
+        for (const toolName of [
+            "list_channels",
+            "search_channel_context",
+            "list_channel_context",
+            "get_channel_context",
+        ]) {
+            assert.deepEqual(
+                byName.get(toolName)?.annotations,
+                {
+                    title: byName.get(toolName)?.annotations?.title,
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false,
+                },
+                `${toolName} must advertise truthful closed-world read-only semantics`,
+            );
+            assert.ok(byName.get(toolName)?.annotations?.title);
+        }
+        for (const toolName of [
+            "request_actor_session",
+            "get_actor_session_request_status",
+            "claim_actor_session",
+        ]) {
+            assert.ok(byName.get(toolName), `${toolName} must be registered`);
+        }
         assert.ok(byName.get("actor_purge_preview"));
         assert.ok(byName.get("actor_purge_confirm"));
     } finally {

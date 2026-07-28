@@ -57,7 +57,8 @@ The same command is available in VS Code under **Tasks: Run Task** as
 
 The generated file is local machine configuration and is automatically added
 to `.gitignore`. Standard `PGHOST`, `PGDATABASE`, `PGUSER`, `AUTO_MANAGE_DB`,
-`REQUIRE_ACTOR_IDENTIFICATION`, and `EMBEDDINGS_ENABLED` environment variables
+`REQUIRE_ACTOR_IDENTIFICATION`, `TRUST_OPENAI_TUNNEL_IDENTITY`, and
+`EMBEDDINGS_ENABLED` environment variables
 override the generated defaults.
 Automatic database management is disabled by default.
 
@@ -160,19 +161,141 @@ are migrated to `whiteboard`, and new saves default to `whiteboard`. Whiteboard
 records are shared context discoverable through `search_context`,
 `list_recent_context`, `get_context`, and `get_user_profile`.
 
-The database vocabulary reserves `channel`, `direct`, `personal`, and `system`
-for the authenticated messaging design, but the MCP write schemas intentionally
-accept only `whiteboard` today. Non-whiteboard rows fail closed: current
-conversational reads, updates, deletes, and context purges do not expose or
-mutate them. This avoids presenting self-asserted actor identity as real access
-control.
+The general context tools intentionally accept only `whiteboard`.
+Non-whiteboard rows fail closed: current whiteboard reads, updates, deletes,
+and context purges do not expose or mutate them. This avoids presenting
+self-asserted actor identity as real access control.
 
-Future authenticated visibility will bind actor/device public keys through an
-explicit enrollment process, verify signed request proofs and replay
-protection, and authorize channel membership before database search, ranking,
-pagination, counts, or serialization. Channel encryption and key epochs remain
-a later layer; private keys must never be stored in the context database or
-accepted through ordinary MCP arguments.
+### Authenticated channels
+
+Channel history uses enrolled Ed25519 actor/device keys rather than
+`identify_actor` or caller-supplied actor IDs. The server stores public keys
+only. Generate a device keypair, then enroll its public key through the local
+administrative workflow:
+
+```bash
+npm run actor-key:generate -- --output-prefix /secure/path/codex-desktop
+npm run actor-key:enroll -- \
+  --actor actor:openai:codex \
+  --public-key /secure/path/codex-desktop.public.pem \
+  --label codex-desktop
+npm run actor-key:revoke -- --key-id ak_<fingerprint-prefix>
+```
+
+The actor must already exist with a durable `external_id`. Enrollment is a
+trusted local administrative action; there is deliberately no self-service MCP
+tool that can claim another actor's identity. Generated `*.private.pem` files
+are ignored by Git and must remain readable only by their owning runtime.
+
+Every authenticated tool request includes:
+
+```json
+{
+  "key_id": "ak_<fingerprint-prefix>",
+  "timestamp": "2026-07-25T02:30:00.000Z",
+  "nonce": "a-unique-value-at-least-16-characters",
+  "signature": "<base64url Ed25519 signature>"
+}
+```
+
+The signed UTF-8 message is five newline-separated fields:
+
+```text
+personal-context-server:v1
+<tool-name>
+<timestamp>
+<nonce>
+<canonical-json-of-all-tool-arguments-except-auth>
+```
+
+Canonical JSON recursively sorts object keys, preserves array order, omits
+properties whose value is undefined, and otherwise uses ordinary JSON scalar
+encoding. The implementation exports `buildRequestSigningMessage` so trusted
+local clients can construct exactly the same bytes.
+
+Timestamps must be within five minutes of server time. A valid nonce is accepted
+only once per key, preventing replay. Revoked keys fail authentication. After
+authentication, channel membership separately controls read, write, and
+administrative access. Owners and admins manage membership; authors may modify
+their own messages, while owners/admins may moderate any channel record.
+Missing and unauthorized exact-ID channel records both return `null`.
+
+Remote connector clients that cannot hold or use an Ed25519 key can request an
+expiring operator-approved actor session:
+
+For ChatGPT clients routed exclusively through the trusted OpenAI tunnel, set
+`TRUST_OPENAI_TUNNEL_IDENTITY=true`. The recommended flow then keeps all bearer
+tokens and cryptographic proofs out of the model conversation:
+
+1. Call `request_actor_session(actor_external_id, client_label?)`.
+2. Ask the local operator to approve the exact request and expected actor:
+
+   ```bash
+   npm run actor-session:approve -- \
+     --request-id asr_<id> \
+     --actor actor:openai:chatgpt \
+     --ttl-seconds 86400
+   ```
+
+3. Approval atomically activates the exact OpenAI conversation that created the
+   request. No second model-side authentication call is required.
+4. Use private channel tools without an `auth` argument. The server recognizes
+   the opaque `openai/subject` and `openai/session` values captured from trusted
+   MCP request metadata.
+
+The pending request expires after 15 minutes. Its OpenAI identity values are
+stored only as domain-separated hashes. Successful local approval performs the
+same atomic one-actor/one-timeline handoff as bearer-session claims.
+
+Only enable `TRUST_OPENAI_TUNNEL_IDENTITY` when the server's MCP input is
+exclusively controlled by the trusted tunnel process. Direct MCP clients can
+construct `_meta` themselves, so this mode is unsafe on an independently
+reachable or shared untrusted transport.
+
+Native and non-ChatGPT clients may continue using the lower-level bearer flow:
+keep the returned `claim_code` private, call
+`claim_actor_session(request_id, claim_code)`, and use the returned capability
+in authenticated channel calls:
+
+   ```json
+   {
+     "session_id": "as_<id>",
+     "session_token": "<opaque secret>",
+     "timestamp": "2026-07-25T02:30:00.000Z",
+     "nonce": "a-new-value-at-least-16-characters"
+   }
+   ```
+
+Operators may deny or revoke the capability without handling its secret:
+
+```bash
+npm run actor-session:deny -- --request-id asr_<id>
+npm run actor-session:revoke -- --session-id as_<id>
+```
+
+Requesting a session does not authenticate the requester and grants nothing.
+Approval is a deliberate local trust decision that checks both request ID and
+expected actor ID. The high-entropy claim code prevents another caller that
+only learns the request ID from claiming the approved capability. Requests
+expire after 15 minutes; approval starts a fresh 15-minute claim window.
+Claiming is one-time, and only token hashes are stored. Actor sessions are
+bearer capabilities protected by the MCP tunnel transport, limited expiry,
+revocation, timestamp checks, and one-use nonces. Ed25519 remains the stronger
+choice for runtimes that can sign locally.
+
+Each durable actor has exactly one current actor-session timeline. Creating a
+replacement request does not disturb the current session. For trusted OpenAI
+requests, local approval completes the handoff; for native bearer requests,
+successful claim completes it. The server atomically revokes every prior
+session for that `actor_external_id`, records the handoff, and activates the new
+session. Older clients then receive `SESSION_REVOKED` instead of silently
+continuing on a divergent writable timeline.
+
+Channel records are excluded from all whiteboard tools before search ranking,
+pagination, and serialization. They remain plaintext in PostgreSQL and are
+protected by the trusted server's authenticated ACLs. End-to-end channel
+encryption, MLS epochs, recovery, and secure historical-key distribution remain
+explicit later work.
 
 Actor cleanup is deliberate rather than running after every context deletion.
 `database_metadata` reports all unreferenced actors and the purgeable subset.
@@ -261,6 +384,19 @@ This project is licensed under the [MIT License](LICENSE).
 | `get_user_profile` | Fetch the curated profile view. Takes no arguments and returns contexts explicitly tagged `profile`; no semantic or text fallback search is used. | JSON text containing `{ "profile": { "username": string, "tag": "profile", "results": context[] } }`. The username is the active OS account. |
 | `list_recent_context` | Fetch recent context notes. Arguments: `limit?` and `actor_external_id?`. | JSON text containing `{ "limit", "actor_external_id"?, "results" }`, ordered newest first. |
 | `get_context` | Fetch one context note by exact ID. Argument: `id` (required positive integer). | JSON text containing `{ "id": number, "context": context \| null }`, where `context` is the exact stored record or `null` if no record matched. |
+| `request_actor_session` | Request a pending remote actor session for explicit local approval. Trusted OpenAI requests capture the current opaque conversation binding and omit the native claim code. | `{ "request": { "request_id", "status", ... } }` for OpenAI, or `{ "request": { "request_id", "claim_code", "status", ... } }` for native clients |
+| `get_actor_session_request_status` | Check a request using its request ID and secret claim code. | `{ "request": { "status", ... } }` |
+| `claim_actor_session` | Claim an approved request once and receive an expiring bearer capability. | `{ "session": { "session_id", "session_token", "expires_at", ... } }` |
+| `create_channel` | Create a private channel using an authenticated request. The signing actor becomes owner. | `{ "channel": channel }` |
+| `add_channel_member` | Add or restore a durable actor. Requires an authenticated channel owner/admin. | `{ "membership": membership }` |
+| `remove_channel_member` | Remove a non-owner actor. Requires an authenticated channel owner/admin. | `{ "membership": { "removed": boolean, ... } }` |
+| `list_channels` | List current memberships for the authenticated actor. | `{ "channels": channel[] }` |
+| `save_channel_context` | Save channel history using the authenticated actor as attribution. | `{ "saved": context }` |
+| `search_channel_context` | Search an authenticated channel membership using the normal sensitivity contract. | `{ "channel", "query", "limit", "sensitivity", "results" }` |
+| `list_channel_context` | List recent history from an authenticated channel membership. | `{ "channel", "limit", "results" }` |
+| `get_channel_context` | Fetch an exact channel record for an authenticated current member. | `{ "id", "context": context \| null }` |
+| `update_channel_context` | Update a channel record as its authenticated author or a channel owner/admin. | `{ "id", "updated": context \| null }` |
+| `delete_channel_context` | Delete a channel record as its authenticated author or a channel owner/admin. | `{ "id", "deleted": context \| null }` |
 | `database_metadata` | Fetch simple database metadata. Takes no arguments. | JSON text containing context and actor counts, total database size, and managed table sizes. |
 | `delete_context` | Delete a saved context note. Arguments: `id` (required positive integer). | JSON text containing `{ "id": number, "deleted": context \| null }`, where `deleted` is the removed record or `null` if no record matched. |
 | `update_context` | Update a saved whiteboard context note. Arguments: `id` (required positive integer), plus at least one of `text` (optional string), `tags` (optional string array), `source` (optional string), or `visibility` (currently only `whiteboard`). | JSON text containing `{ "id": number, "updated": context \| null }`, where `updated` is the updated record or `null` if no visible record matched. |

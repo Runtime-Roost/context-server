@@ -21,6 +21,7 @@ const config = {
         PGUSER: process.env.PGUSER ?? userInfo().username,
         AUTO_MANAGE_DB: process.env.AUTO_MANAGE_DB ?? "false",
         REQUIRE_ACTOR_IDENTIFICATION: process.env.REQUIRE_ACTOR_IDENTIFICATION ?? "false",
+        TRUST_OPENAI_TUNNEL_IDENTITY: process.env.TRUST_OPENAI_TUNNEL_IDENTITY ?? "false",
         EMBEDDINGS_ENABLED: process.env.EMBEDDINGS_ENABLED ?? "false",
         EMBEDDINGS_MODEL: process.env.EMBEDDINGS_MODEL ?? "nomic-embed-text",
         EMBEDDINGS_PROVIDER: process.env.EMBEDDINGS_PROVIDER ?? "ollama",
