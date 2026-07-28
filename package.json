@@ -13,6 +13,7 @@
     "actor-session:approve": "npm run build && node scripts/manage-actor-session.mjs approve",
     "actor-session:deny": "npm run build && node scripts/manage-actor-session.mjs deny",
     "actor-session:revoke": "npm run build && node scripts/manage-actor-session.mjs revoke",
+    "wake-policy:dry-run": "npm run build && node dist/wake/cli.js",
     "mcp:config": "node scripts/generate-mcp-config.mjs",
     "test": "npm run build && node --test test/*.test.js",
     "start": "node dist/index.js"

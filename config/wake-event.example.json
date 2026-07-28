@@ -1,0 +1,17 @@
+{
+  "event_id": "00000000-0000-4000-8000-000000000001",
+  "trigger_type": "explicit_user_request",
+  "source": "personal-context-server",
+  "requested_by_actor": "actor:human:blake",
+  "occurred_at": "2026-07-28T14:00:00.000Z",
+  "channel": "mamagpt-codex-private",
+  "summary": "Blake explicitly requested a Codex wake-up for bounded project work.",
+  "context_ids": [
+    1266
+  ],
+  "metadata": {
+    "correlation_id": "example-wake-1",
+    "priority": "normal",
+    "untrusted_extra": "dropped from the invocation payload"
+  }
+}

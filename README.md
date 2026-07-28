@@ -236,6 +236,38 @@ ranges. `list_context_attachments` reads those links through the same attachment
 authorization boundary. Original filenames are metadata only; generated UUIDs
 and SHA-256 keys determine every filesystem path.
 
+### Wake-policy groundwork
+
+The repository includes a deliberately non-executing wake-policy evaluator for
+future local-agent orchestration. It turns a typed event plus a versioned policy
+into either a denied decision or a bounded **dry-run** invocation envelope. It
+does not spawn Codex, a shell, or any other process.
+
+The v1 policy requires explicit allowlists for requesting actors, trigger types,
+sources, and optionally channels. It also applies event-age limits, replay
+protection, per-target cooldowns, rolling-window rate limits, invocation timeout
+metadata, summary/context-ID bounds, and a scalar metadata allowlist. Policy and
+event files reject unknown fields. Every decision is appended to a mode-0600
+JSONL audit file under an exclusive lock; malformed history fails closed.
+
+Start from [config/wake-policy.example.json](config/wake-policy.example.json)
+and [config/wake-event.example.json](config/wake-event.example.json), then run:
+
+```bash
+npm run wake-policy:dry-run -- \
+  --policy config/wake-policy.example.json \
+  --event config/wake-event.example.json \
+  --audit data/wake/audit.jsonl \
+  --pretty
+```
+
+An allowed decision still includes `"dry_run": true`. Automatic launches remain
+intentionally unavailable. A future execution layer must be a separate,
+explicitly enabled component with a fixed executable, no shell interpolation,
+bounded stdin payload, timeout/termination handling, durable idempotency, and
+operator-controlled enablement. The JSONL log provides operational
+accountability but is not a cryptographically tamper-evident audit ledger.
+
 ### Authenticated channels
 
 Channel history uses enrolled Ed25519 actor/device keys rather than
