@@ -1,12 +1,13 @@
 import pg from "pg";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import type { PoolConfig } from "pg";
 
 const { Pool } = pg;
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
-function loadDotEnv(envPath = resolve(process.cwd(), ".env")) {
+function loadDotEnv(envPath = resolve(repositoryRoot, ".env")) {
     if (!existsSync(envPath)) {
         return;
     }
