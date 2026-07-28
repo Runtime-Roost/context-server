@@ -20,23 +20,29 @@ import {
     createChannel,
     deleteContext,
     deleteChannelContext,
+    deletePersonalContext,
     contextPurgeConfirm,
     contextPurgePreview,
     getContext,
     getChannelContext,
+    getPersonalContext,
     getDatabaseMetadata,
     getUserProfile,
     identifyActor,
     listRecentContext,
     listActorChannels,
     listChannelContext,
+    listPersonalContext,
     removeChannelMember,
     saveContextWithActor,
     saveChannelContext,
+    savePersonalContext,
     searchContext,
     searchChannelContext,
+    searchPersonalContext,
     updateContext,
     updateChannelContext,
+    updatePersonalContext,
     vacuumDatabase,
 } from "./tools.js";
 
@@ -286,7 +292,7 @@ export function createServer() {
                 text: z.string().min(1).describe("The context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags for grouping or filtering the context."),
                 source: z.string().optional().describe("Optional source describing where the context came from."),
-                visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Visibility classification. Only whiteboard is currently writable; authenticated channel, direct, personal, and system records are staged for a later release."),
+                visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Visibility classification. Only whiteboard is writable through this general tool; authenticated channel and personal records use their dedicated tools, while direct and system records remain staged."),
                 actor: z.object({
                     external_id: z.string().min(1).describe("Stable operational actor ID, such as actor:openai:codex. Required for self-contained saves so reconnecting clients do not create duplicate anonymous actors."),
                     name: z.string().min(1).describe("Actor display name."),
@@ -793,6 +799,218 @@ export function createServer() {
             try {
                 const authenticated = await authenticateTool("delete_channel_context", payload, auth, extra);
                 const deleted = await deleteChannelContext(authenticated.actor_id, id);
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({ id, deleted }),
+                    }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "save_personal_context",
+        {
+            description: "Save a private notebook record owned by the authenticated actor. Personal records are never exposed through whiteboard or channel tools.",
+            inputSchema: {
+                text: z.string().min(1).describe("Context text to save."),
+                tags: z.array(z.string()).optional().describe("Optional tags."),
+                source: z.string().optional().describe("Optional provenance source."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ text, tags, source, auth }, extra) => {
+            const payload = { text, tags, source };
+
+            try {
+                const authenticated = await authenticateTool("save_personal_context", payload, auth, extra);
+                const saved = await savePersonalContext(
+                    authenticated.actor_id,
+                    text,
+                    tags,
+                    source,
+                );
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({ saved }),
+                    }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "search_personal_context",
+        {
+            description: "Search only the authenticated actor's private notebook. Actor ownership is enforced before semantic ranking.",
+            annotations: {
+                title: "Search Private Notebook",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                query: z.string().min(1).describe("Search query."),
+                limit: z.number().int().positive().optional().describe("Maximum result count."),
+                sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ query, limit, sensitivity, auth }, extra) => {
+            const payload = { query, limit, sensitivity };
+
+            try {
+                const authenticated = await authenticateTool("search_personal_context", payload, auth, extra);
+                const selectedSensitivity = sensitivity ?? "low";
+                const results = await searchPersonalContext(
+                    authenticated.actor_id,
+                    query,
+                    limit,
+                    selectedSensitivity,
+                );
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            query,
+                            limit: limit ?? 20,
+                            sensitivity: selectedSensitivity,
+                            results,
+                        }),
+                    }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "list_personal_context",
+        {
+            description: "List recent private notebook records owned by the authenticated actor.",
+            annotations: {
+                title: "List Private Notebook",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                limit: z.number().int().positive().optional().describe("Maximum result count."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ limit, auth }, extra) => {
+            const payload = { limit };
+
+            try {
+                const authenticated = await authenticateTool("list_personal_context", payload, auth, extra);
+                const results = await listPersonalContext(authenticated.actor_id, limit);
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({ limit: limit ?? 20, results }),
+                    }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "get_personal_context",
+        {
+            description: "Get one exact private notebook record owned by the authenticated actor. Missing and unauthorized records both return null.",
+            annotations: {
+                title: "Get Private Notebook Record",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                id: z.number().int().positive().describe("Exact context ID."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ id, auth }, extra) => {
+            const payload = { id };
+
+            try {
+                const authenticated = await authenticateTool("get_personal_context", payload, auth, extra);
+                const context = await getPersonalContext(authenticated.actor_id, id);
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({ id, context }),
+                    }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "update_personal_context",
+        {
+            description: "Update a private notebook record owned by the authenticated actor.",
+            inputSchema: {
+                id: z.number().int().positive().describe("Exact context ID."),
+                text: z.string().min(1).optional().describe("Optional replacement text."),
+                tags: z.array(z.string()).optional().describe("Optional replacement tags."),
+                source: z.string().optional().describe("Optional replacement source."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ id, text, tags, source, auth }, extra) => {
+            const payload = { id, text, tags, source };
+
+            try {
+                const authenticated = await authenticateTool("update_personal_context", payload, auth, extra);
+                const updated = await updatePersonalContext(
+                    authenticated.actor_id,
+                    id,
+                    text,
+                    tags,
+                    source,
+                );
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({ id, updated }),
+                    }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "delete_personal_context",
+        {
+            description: "Delete a private notebook record owned by the authenticated actor.",
+            inputSchema: {
+                id: z.number().int().positive().describe("Exact context ID."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ id, auth }, extra) => {
+            const payload = { id };
+
+            try {
+                const authenticated = await authenticateTool("delete_personal_context", payload, auth, extra);
+                const deleted = await deletePersonalContext(authenticated.actor_id, id);
                 return {
                     content: [{
                         type: "text",

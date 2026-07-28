@@ -166,6 +166,22 @@ Non-whiteboard rows fail closed: current whiteboard reads, updates, deletes,
 and context purges do not expose or mutate them. This avoids presenting
 self-asserted actor identity as real access control.
 
+### Private notebook
+
+Authenticated actors can keep Tier 2 private notebook records with the
+`*_personal_context` tools. A personal record is always attributed to and owned
+by the authenticated actor. The server applies that ownership predicate before
+text search, semantic ranking, limiting, serialization, exact-ID lookup,
+updates, and deletion.
+
+Personal records are invisible to Whiteboard tools, channel tools, and other
+authenticated actors. Missing and unauthorized exact IDs both return `null`.
+The same enrolled-key and operator-approved actor-session authentication
+supported by channels is supported here. Personal records are never retrieved
+automatically through the general `search_context` or `list_recent_context`
+surfaces; clients must deliberately call the authenticated private-notebook
+tools.
+
 ### Authenticated channels
 
 Channel history uses enrolled Ed25519 actor/device keys rather than
@@ -397,6 +413,12 @@ This project is licensed under the [MIT License](LICENSE).
 | `get_channel_context` | Fetch an exact channel record for an authenticated current member. | `{ "id", "context": context \| null }` |
 | `update_channel_context` | Update a channel record as its authenticated author or a channel owner/admin. | `{ "id", "updated": context \| null }` |
 | `delete_channel_context` | Delete a channel record as its authenticated author or a channel owner/admin. | `{ "id", "deleted": context \| null }` |
+| `save_personal_context` | Save a private notebook record owned by the authenticated actor. | `{ "saved": context }` |
+| `search_personal_context` | Search only the authenticated actor's private notebook using the normal sensitivity contract. | `{ "query", "limit", "sensitivity", "results" }` |
+| `list_personal_context` | List recent private notebook records owned by the authenticated actor. | `{ "limit", "results" }` |
+| `get_personal_context` | Fetch an exact private notebook record owned by the authenticated actor. Missing and unauthorized records both return `null`. | `{ "id", "context": context \| null }` |
+| `update_personal_context` | Update a private notebook record owned by the authenticated actor. | `{ "id", "updated": context \| null }` |
+| `delete_personal_context` | Delete a private notebook record owned by the authenticated actor. | `{ "id", "deleted": context \| null }` |
 | `database_metadata` | Fetch simple database metadata. Takes no arguments. | JSON text containing context and actor counts, total database size, and managed table sizes. |
 | `delete_context` | Delete a saved context note. Arguments: `id` (required positive integer). | JSON text containing `{ "id": number, "deleted": context \| null }`, where `deleted` is the removed record or `null` if no record matched. |
 | `update_context` | Update a saved whiteboard context note. Arguments: `id` (required positive integer), plus at least one of `text` (optional string), `tags` (optional string array), `source` (optional string), or `visibility` (currently only `whiteboard`). | JSON text containing `{ "id": number, "updated": context \| null }`, where `updated` is the updated record or `null` if no visible record matched. |

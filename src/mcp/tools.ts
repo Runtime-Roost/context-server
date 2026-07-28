@@ -1506,6 +1506,250 @@ export async function deleteChannelContext(actorId: number, id: number) {
     return result.rows[0] ? mapContextRow(result.rows[0]) : null;
 }
 
+export async function savePersonalContext(
+    actorId: number,
+    text: string,
+    tags?: string[],
+    source?: string,
+) {
+    await initializeDatabase();
+    const client = await db.connect();
+    let context: ContextRecord;
+
+    try {
+        context = await insertContext(
+            client,
+            text,
+            tags,
+            source,
+            actorId,
+            "personal",
+        );
+    } finally {
+        client.release();
+    }
+
+    await maybeSaveContextEmbedding(context);
+    return context;
+}
+
+async function searchPersonalContextByText(
+    actorId: number,
+    query: string,
+    limit: number,
+) {
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.visibility = 'personal'
+              AND contexts.actor_id = $1
+              AND (
+                    contexts.content ILIKE $2
+                 OR contexts.source ILIKE $2
+                 OR contexts.tags::text ILIKE $2
+              )
+            ORDER BY contexts.created_at DESC, contexts.id DESC
+            LIMIT $3
+        `,
+        [actorId, `%${query}%`, limit],
+    );
+
+    return result.rows.map(mapContextRow);
+}
+
+export async function searchPersonalContext(
+    actorId: number,
+    query: string,
+    limit?: number,
+    sensitivity: SearchSensitivity = DEFAULT_SEARCH_SENSITIVITY,
+    generateEmbedding: typeof maybeGenerateEmbedding = maybeGenerateEmbedding,
+) {
+    await initializeDatabase();
+    const resultLimit = normalizeLimit(limit);
+    const embedding = await generateEmbedding(query);
+
+    if (!embedding.generated) {
+        return searchPersonalContextByText(actorId, query, resultLimit);
+    }
+
+    const result = await db.query<VectorSearchRow>(
+        `
+            SELECT
+                ${CONTEXT_PROJECTION},
+                embeddings.model,
+                embeddings.vector
+            FROM contexts
+            INNER JOIN embeddings ON embeddings.context_id = contexts.id
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.visibility = 'personal'
+              AND contexts.actor_id = $1
+              AND embeddings.model = $2
+              AND embeddings.vector IS NOT NULL
+        `,
+        [actorId, embedding.model],
+    );
+
+    return result.rows
+        .map((row) => {
+            const vector = parseEmbeddingVector(row.vector);
+            const similarity = vector ? cosineSimilarity(embedding.vector, vector) : null;
+            return similarity === null ? null : { context: mapContextRow(row), similarity };
+        })
+        .filter((item): item is { context: ContextRecord; similarity: number } => item !== null)
+        .filter((item) => matchesSearchSensitivity(item.similarity, sensitivity))
+        .sort((left, right) => right.similarity - left.similarity)
+        .slice(0, resultLimit)
+        .map((item) => item.context);
+}
+
+export async function listPersonalContext(actorId: number, limit?: number) {
+    await initializeDatabase();
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.visibility = 'personal'
+              AND contexts.actor_id = $1
+            ORDER BY contexts.created_at DESC, contexts.id DESC
+            LIMIT $2
+        `,
+        [actorId, normalizeLimit(limit)],
+    );
+
+    return result.rows.map(mapContextRow);
+}
+
+export async function getPersonalContext(actorId: number, id: number) {
+    await initializeDatabase();
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.id = $1
+              AND contexts.visibility = 'personal'
+              AND contexts.actor_id = $2
+        `,
+        [id, actorId],
+    );
+
+    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+}
+
+export async function updatePersonalContext(
+    actorId: number,
+    id: number,
+    text?: string,
+    tags?: string[],
+    source?: string,
+) {
+    await initializeDatabase();
+    const hasText = text !== undefined;
+    const hasTags = tags !== undefined;
+    const hasSource = source !== undefined;
+
+    if (!hasText && !hasTags && !hasSource) {
+        throw new Error("At least one of text, tags, or source must be provided.");
+    }
+
+    const tagValue = hasTags
+        ? (await getTagsColumnType()) === "_text"
+            ? tags
+            : JSON.stringify(tags)
+        : null;
+    const result = await db.query<ContextRow>(
+        `
+            WITH updated AS (
+                UPDATE contexts
+                SET
+                    content = CASE WHEN $3 THEN $4 ELSE content END,
+                    tags = CASE WHEN $5 THEN $6 ELSE tags END,
+                    source = CASE WHEN $7 THEN $8 ELSE source END,
+                    updated_at = $9
+                WHERE contexts.id = $1
+                  AND contexts.visibility = 'personal'
+                  AND contexts.actor_id = $2
+                RETURNING contexts.*
+            )
+            SELECT
+                updated.id,
+                updated.kind,
+                updated.visibility,
+                updated.channel_id,
+                updated.content,
+                updated.source,
+                updated.tags,
+                updated.created_at,
+                updated.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM updated
+            LEFT JOIN actors ON actors.id = updated.actor_id
+        `,
+        [
+            id,
+            actorId,
+            hasText,
+            text ?? null,
+            hasTags,
+            tagValue,
+            hasSource,
+            source ?? null,
+            new Date().toISOString(),
+        ],
+    );
+    const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
+
+    if (context && hasText) {
+        await maybeSaveContextEmbedding(context);
+    }
+
+    return context;
+}
+
+export async function deletePersonalContext(actorId: number, id: number) {
+    await initializeDatabase();
+    const result = await db.query<ContextRow>(
+        `
+            WITH deleted AS (
+                DELETE FROM contexts
+                WHERE contexts.id = $1
+                  AND contexts.visibility = 'personal'
+                  AND contexts.actor_id = $2
+                RETURNING contexts.*
+            )
+            SELECT
+                deleted.id,
+                deleted.kind,
+                deleted.visibility,
+                deleted.channel_id,
+                deleted.content,
+                deleted.source,
+                deleted.tags,
+                deleted.created_at,
+                deleted.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM deleted
+            LEFT JOIN actors ON actors.id = deleted.actor_id
+        `,
+        [id, actorId],
+    );
+
+    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+}
+
 export async function getDatabaseMetadata() {
     await initializeDatabase();
 
