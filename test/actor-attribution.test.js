@@ -91,7 +91,7 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
         assert.equal(legacy.rows[0].visibility, "whiteboard");
         assert.equal(legacy.rows[0].channel_id, null);
         assert.equal(legacy.rows[0].group_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     } finally {
         await isolatedPool.end();
         await adminPool.query(`DROP SCHEMA ${schema} CASCADE`);

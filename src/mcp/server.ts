@@ -56,6 +56,20 @@ import {
     updateGroupContext,
     vacuumDatabase,
 } from "./tools.js";
+import {
+    ATTACHMENT_RELATIONSHIP_VALUES,
+    ATTACHMENT_SCOPE_VALUES,
+    appendAttachmentChunk,
+    beginAttachmentUpload,
+    cancelAttachmentUpload,
+    deleteAttachment,
+    finalizeAttachmentUpload,
+    getAttachment,
+    linkAttachmentToContext,
+    listAttachments,
+    listContextAttachments,
+    readAttachmentChunk,
+} from "../storage/attachments.js";
 
 const signedRequestAuthSchema = z.object({
     key_id: z.string().min(1).describe("Enrolled actor key identifier."),
@@ -87,6 +101,12 @@ function authenticationError(error: unknown) {
         "ACTOR_SESSION_REQUEST_REJECTED",
         "SESSION_REVOKED",
         "AUTHENTICATION_REQUIRED",
+        "ATTACHMENT_UPLOAD_NOT_FOUND_OR_NOT_AUTHORIZED",
+        "ATTACHMENT_UPLOAD_INCOMPLETE",
+        "ATTACHMENT_INTEGRITY_MISMATCH",
+        "ATTACHMENT_OFFSET_INVALID",
+        "ATTACHMENT_CHUNK_INVALID",
+        "ATTACHMENT_SCOPE_INVALID",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -1552,6 +1572,204 @@ export function createServer() {
                 ],
             };
         }
+    );
+
+    server.registerTool(
+        "begin_attachment_upload",
+        {
+            description: "Begin an immutable, integrity-checked attachment upload owned by the authenticated actor or an access group.",
+            inputSchema: {
+                scope: z.enum(ATTACHMENT_SCOPE_VALUES),
+                group: z.string().min(3).max(64).optional().describe("Required only for group ownership."),
+                filename: z.string().min(1).max(500),
+                media_type: z.string().min(3).max(200),
+                expected_size_bytes: z.number().int().nonnegative().max(100 * 1024 * 1024),
+                expected_sha256: z.string().regex(/^[0-9a-fA-F]{64}$/),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ scope, group, filename, media_type, expected_size_bytes, expected_sha256, auth }, extra) => {
+            const payload = { scope, group, filename, media_type, expected_size_bytes, expected_sha256 };
+            try {
+                const authenticated = await authenticateTool("begin_attachment_upload", payload, auth, extra);
+                const upload = await beginAttachmentUpload(authenticated.actor_id, scope, filename, media_type, expected_size_bytes, expected_sha256, group);
+                return { content: [{ type: "text", text: JSON.stringify({ upload }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "append_attachment_chunk",
+        {
+            description: "Append one base64 chunk at the exact current upload offset. Chunks are limited to 512 KiB decoded.",
+            inputSchema: {
+                upload_id: z.string().uuid(),
+                offset: z.number().int().nonnegative(),
+                data_base64: z.string(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ upload_id, offset, data_base64, auth }, extra) => {
+            const payload = { upload_id, offset, data_base64 };
+            try {
+                const authenticated = await authenticateTool("append_attachment_chunk", payload, auth, extra);
+                const upload = await appendAttachmentChunk(authenticated.actor_id, upload_id, offset, data_base64);
+                return { content: [{ type: "text", text: JSON.stringify({ upload }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "cancel_attachment_upload",
+        {
+            description: "Cancel an unfinished authorized upload and remove its temporary bytes.",
+            inputSchema: { upload_id: z.string().uuid(), auth: requestAuthSchema.optional() },
+        },
+        async ({ upload_id, auth }, extra) => {
+            const payload = { upload_id };
+            try {
+                const authenticated = await authenticateTool("cancel_attachment_upload", payload, auth, extra);
+                const upload = await cancelAttachmentUpload(authenticated.actor_id, upload_id);
+                return { content: [{ type: "text", text: JSON.stringify({ upload }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "finalize_attachment_upload",
+        {
+            description: "Verify the completed upload's declared byte length and SHA-256, then publish it atomically.",
+            inputSchema: {
+                upload_id: z.string().uuid(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ upload_id, auth }, extra) => {
+            const payload = { upload_id };
+            try {
+                const authenticated = await authenticateTool("finalize_attachment_upload", payload, auth, extra);
+                const attachment = await finalizeAttachmentUpload(authenticated.actor_id, upload_id);
+                return { content: [{ type: "text", text: JSON.stringify({ attachment }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "get_attachment",
+        {
+            description: "Get attachment metadata after current ownership or group-read authorization. Missing and unauthorized IDs both return null.",
+            annotations: { title: "Get Attachment", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: { id: z.string().uuid(), auth: requestAuthSchema.optional() },
+        },
+        async ({ id, auth }, extra) => {
+            const payload = { id };
+            try {
+                const authenticated = await authenticateTool("get_attachment", payload, auth, extra);
+                const attachment = await getAttachment(authenticated.actor_id, id);
+                return { content: [{ type: "text", text: JSON.stringify({ id, attachment }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "list_attachments",
+        {
+            description: "List personal or group-owned attachment metadata after current authorization.",
+            annotations: { title: "List Attachments", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: {
+                scope: z.enum(ATTACHMENT_SCOPE_VALUES),
+                group: z.string().min(3).max(64).optional(),
+                limit: z.number().int().positive().max(100).optional(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ scope, group, limit, auth }, extra) => {
+            const payload = { scope, group, limit };
+            try {
+                const authenticated = await authenticateTool("list_attachments", payload, auth, extra);
+                const attachments = await listAttachments(authenticated.actor_id, scope, group, limit);
+                return { content: [{ type: "text", text: JSON.stringify({ attachments }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "read_attachment_chunk",
+        {
+            description: "Read up to 512 KiB of an authorized attachment as base64.",
+            annotations: { title: "Read Attachment Chunk", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: {
+                id: z.string().uuid(),
+                offset: z.number().int().nonnegative().optional(),
+                length: z.number().int().positive().max(512 * 1024).optional(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ id, offset, length, auth }, extra) => {
+            const payload = { id, offset, length };
+            try {
+                const authenticated = await authenticateTool("read_attachment_chunk", payload, auth, extra);
+                const chunk = await readAttachmentChunk(authenticated.actor_id, id, offset, length);
+                return { content: [{ type: "text", text: JSON.stringify({ id, chunk }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "link_attachment_to_context",
+        {
+            description: "Link an attachment to a personal or group context only when both have the exact same ownership scope.",
+            inputSchema: {
+                attachment_id: z.string().uuid(),
+                context_id: z.number().int().positive(),
+                relationship: z.enum(ATTACHMENT_RELATIONSHIP_VALUES).optional(),
+                sort_order: z.number().int().nonnegative().optional(),
+                page_start: z.number().int().positive().optional(),
+                page_end: z.number().int().positive().optional(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ attachment_id, context_id, relationship, sort_order, page_start, page_end, auth }, extra) => {
+            const payload = { attachment_id, context_id, relationship, sort_order, page_start, page_end };
+            try {
+                const authenticated = await authenticateTool("link_attachment_to_context", payload, auth, extra);
+                const link = await linkAttachmentToContext(authenticated.actor_id, attachment_id, context_id, relationship, sort_order, page_start, page_end);
+                return { content: [{ type: "text", text: JSON.stringify({ link }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "list_context_attachments",
+        {
+            description: "List authorized attachment metadata and relationship information for an exact context.",
+            annotations: { title: "List Context Attachments", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: { context_id: z.number().int().positive(), auth: requestAuthSchema.optional() },
+        },
+        async ({ context_id, auth }, extra) => {
+            const payload = { context_id };
+            try {
+                const authenticated = await authenticateTool("list_context_attachments", payload, auth, extra);
+                const attachments = await listContextAttachments(authenticated.actor_id, context_id);
+                return { content: [{ type: "text", text: JSON.stringify({ context_id, attachments }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "delete_attachment",
+        {
+            description: "Delete attachment metadata and links with current write authorization; remove unreferenced content bytes.",
+            inputSchema: { id: z.string().uuid(), auth: requestAuthSchema.optional() },
+        },
+        async ({ id, auth }, extra) => {
+            const payload = { id };
+            try {
+                const authenticated = await authenticateTool("delete_attachment", payload, auth, extra);
+                const deleted = await deleteAttachment(authenticated.actor_id, id);
+                return { content: [{ type: "text", text: JSON.stringify({ id, deleted }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
     );
 
     server.registerTool(

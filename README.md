@@ -58,7 +58,7 @@ The same command is available in VS Code under **Tasks: Run Task** as
 The generated file is local machine configuration and is automatically added
 to `.gitignore`. Standard `PGHOST`, `PGDATABASE`, `PGUSER`, `AUTO_MANAGE_DB`,
 `REQUIRE_ACTOR_IDENTIFICATION`, `TRUST_OPENAI_TUNNEL_IDENTITY`, and
-`EMBEDDINGS_ENABLED` environment variables
+`EMBEDDINGS_ENABLED`, and `ATTACHMENT_STORAGE_DIR` environment variables
 override the generated defaults.
 Automatic database management is disabled by default.
 
@@ -200,6 +200,41 @@ exact IDs both return `null`.
 Group ownership is distinct from channels and actor-private notes: channels are
 conversation/history scopes, personal contexts belong to one actor, and group
 contexts belong to an access group shared by its current members.
+
+### Attachments
+
+Attachments are immutable binary source artifacts stored outside context text.
+PostgreSQL keeps ownership, integrity, provenance, and context-link metadata;
+the bytes live in a content-addressed filesystem store under
+`ATTACHMENT_STORAGE_DIR` (default: `./data/attachments`). Never place that
+directory inside a publicly served tree. Back it up together with PostgreSQL:
+neither half is a complete archive by itself.
+
+Uploads are bounded at 100 MiB and use an integrity-checked sequence:
+
+1. `begin_attachment_upload` declares personal or group ownership, filename,
+   media type, exact byte length, and SHA-256.
+2. `append_attachment_chunk` sends base64 chunks of at most 512 KiB at the
+   exact next byte offset.
+3. `finalize_attachment_upload` verifies length and SHA-256 before atomically
+   publishing immutable bytes.
+
+Unfinished uploads expire after 24 hours and are pruned when a new upload
+begins. `cancel_attachment_upload` removes one immediately.
+
+`get_attachment`, `list_attachments`, and `read_attachment_chunk` enforce the
+current personal owner or group membership before returning metadata or bytes.
+`delete_attachment` requires write access, cascades its context links, and
+removes content-addressed bytes only when no other attachment metadata uses
+them. Missing and unauthorized attachment IDs both return `null`.
+
+`link_attachment_to_context` deliberately permits only exact scope matches:
+personal attachment to the same actor's personal context, or group attachment
+to a context owned by the same group. Links record `source`, `derived`, or
+`reference` relationships, stable sort order, and optional inclusive page
+ranges. `list_context_attachments` reads those links through the same attachment
+authorization boundary. Original filenames are metadata only; generated UUIDs
+and SHA-256 keys determine every filesystem path.
 
 ### Authenticated channels
 

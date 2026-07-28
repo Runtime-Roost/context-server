@@ -477,6 +477,75 @@ const migrations: Migration[] = [
                 WHERE visibility = 'group';
         `,
     },
+    {
+        version: 10,
+        name: "durable_attachments",
+        sql: `
+            CREATE TABLE IF NOT EXISTS attachments (
+                id UUID PRIMARY KEY,
+                original_filename TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+                sha256 TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+                storage_key TEXT NOT NULL,
+                owner_actor_id BIGINT REFERENCES actors(id) ON DELETE RESTRICT,
+                group_id BIGINT REFERENCES access_groups(id) ON DELETE RESTRICT,
+                created_by_actor_id BIGINT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CHECK (
+                    (owner_actor_id IS NOT NULL AND group_id IS NULL)
+                    OR (owner_actor_id IS NULL AND group_id IS NOT NULL)
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS attachments_actor_created_at_idx
+                ON attachments(owner_actor_id, created_at DESC)
+                WHERE owner_actor_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS attachments_group_created_at_idx
+                ON attachments(group_id, created_at DESC)
+                WHERE group_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS attachments_storage_key_idx
+                ON attachments(storage_key);
+
+            CREATE TABLE IF NOT EXISTS attachment_uploads (
+                id UUID PRIMARY KEY,
+                original_filename TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                expected_size_bytes BIGINT NOT NULL CHECK (expected_size_bytes >= 0),
+                expected_sha256 TEXT NOT NULL CHECK (expected_sha256 ~ '^[0-9a-f]{64}$'),
+                received_size_bytes BIGINT NOT NULL DEFAULT 0 CHECK (received_size_bytes >= 0),
+                owner_actor_id BIGINT REFERENCES actors(id) ON DELETE CASCADE,
+                group_id BIGINT REFERENCES access_groups(id) ON DELETE CASCADE,
+                created_by_actor_id BIGINT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                CHECK (
+                    (owner_actor_id IS NOT NULL AND group_id IS NULL)
+                    OR (owner_actor_id IS NULL AND group_id IS NOT NULL)
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS attachment_uploads_expires_at_idx
+                ON attachment_uploads(expires_at);
+
+            CREATE TABLE IF NOT EXISTS context_attachments (
+                context_id BIGINT NOT NULL REFERENCES contexts(id) ON DELETE CASCADE,
+                attachment_id UUID NOT NULL REFERENCES attachments(id) ON DELETE CASCADE,
+                relationship TEXT NOT NULL DEFAULT 'source'
+                    CHECK (relationship IN ('source', 'derived', 'reference')),
+                sort_order INTEGER NOT NULL DEFAULT 0 CHECK (sort_order >= 0),
+                page_start INTEGER CHECK (page_start > 0),
+                page_end INTEGER CHECK (page_end > 0),
+                created_by_actor_id BIGINT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (context_id, attachment_id, relationship),
+                CHECK (page_start IS NULL OR page_end IS NULL OR page_end >= page_start)
+            );
+
+            CREATE INDEX IF NOT EXISTS context_attachments_attachment_idx
+                ON context_attachments(attachment_id, sort_order, context_id);
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;
