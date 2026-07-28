@@ -11,21 +11,26 @@ import {
     requestActorSession,
 } from "../auth/actor-sessions.js";
 import {
+    ACCESS_GROUP_ROLE_VALUES,
     CHANNEL_ROLE_VALUES,
     SEARCH_SENSITIVITY_VALUES,
     WRITABLE_CONTEXT_VISIBILITY_VALUES,
     actorPurgeConfirm,
     actorPurgePreview,
+    addAccessGroupMember,
     addChannelMember,
     createChannel,
+    createAccessGroup,
     deleteContext,
     deleteChannelContext,
     deletePersonalContext,
+    deleteGroupContext,
     contextPurgeConfirm,
     contextPurgePreview,
     getContext,
     getChannelContext,
     getPersonalContext,
+    getGroupContext,
     getDatabaseMetadata,
     getUserProfile,
     identifyActor,
@@ -33,16 +38,22 @@ import {
     listActorChannels,
     listChannelContext,
     listPersonalContext,
+    listActorAccessGroups,
+    listGroupContext,
+    removeAccessGroupMember,
     removeChannelMember,
     saveContextWithActor,
     saveChannelContext,
     savePersonalContext,
+    saveGroupContext,
     searchContext,
     searchChannelContext,
     searchPersonalContext,
+    searchGroupContext,
     updateContext,
     updateChannelContext,
     updatePersonalContext,
+    updateGroupContext,
     vacuumDatabase,
 } from "./tools.js";
 
@@ -69,6 +80,8 @@ function authenticationError(error: unknown) {
         "AUTHENTICATION_FAILED",
         "CHANNEL_NOT_FOUND_OR_NOT_AUTHORIZED",
         "CHANNEL_OWNER_CANNOT_BE_REMOVED",
+        "ACCESS_GROUP_NOT_FOUND_OR_NOT_AUTHORIZED",
+        "ACCESS_GROUP_OWNER_CANNOT_BE_REMOVED",
         "ACTOR_NOT_FOUND",
         "ACTOR_SESSION_REQUEST_NOT_FOUND",
         "ACTOR_SESSION_REQUEST_REJECTED",
@@ -93,6 +106,8 @@ function authenticationError(error: unknown) {
                                 ? "This actor session was revoked because a newer session became the actor's current timeline."
                             : code === "CHANNEL_NOT_FOUND_OR_NOT_AUTHORIZED"
                                 ? "The channel was not found or the authenticated actor is not authorized."
+                                : code === "ACCESS_GROUP_NOT_FOUND_OR_NOT_AUTHORIZED"
+                                    ? "The access group was not found or the authenticated actor is not authorized."
                                 : code === "REQUEST_REJECTED"
                                     ? "The request was rejected."
                                     : code === "ACTOR_SESSION_REQUEST_NOT_FOUND"
@@ -292,7 +307,7 @@ export function createServer() {
                 text: z.string().min(1).describe("The context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags for grouping or filtering the context."),
                 source: z.string().optional().describe("Optional source describing where the context came from."),
-                visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Visibility classification. Only whiteboard is writable through this general tool; authenticated channel and personal records use their dedicated tools, while direct and system records remain staged."),
+                visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Visibility classification. Only whiteboard is writable through this general tool; authenticated channel, personal, and access-group records use dedicated tools, while direct and system records remain staged."),
                 actor: z.object({
                     external_id: z.string().min(1).describe("Stable operational actor ID, such as actor:openai:codex. Required for self-contained saves so reconnecting clients do not create duplicate anonymous actors."),
                     name: z.string().min(1).describe("Actor display name."),
@@ -804,6 +819,332 @@ export function createServer() {
                         type: "text",
                         text: JSON.stringify({ id, deleted }),
                     }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "create_access_group",
+        {
+            description: "Create an authenticated Unix-like access group. The authenticated actor becomes its owner.",
+            inputSchema: {
+                slug: z.string().min(3).max(64).describe("Stable lowercase access-group slug."),
+                name: z.string().min(1).describe("Human-readable access-group name."),
+                description: z.string().optional().describe("Optional access-group description."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ slug, name, description, auth }, extra) => {
+            const payload = { slug, name, description };
+
+            try {
+                const authenticated = await authenticateTool("create_access_group", payload, auth, extra);
+                const group = await createAccessGroup(
+                    authenticated.actor_id,
+                    slug,
+                    name,
+                    description,
+                );
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ group }) }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "add_access_group_member",
+        {
+            description: "Add or restore a durable actor's access-group membership. Requires an authenticated owner or admin.",
+            inputSchema: {
+                group: z.string().min(3).max(64).describe("Access-group slug."),
+                actor_external_id: z.string().min(1).describe("Durable actor external ID to add."),
+                role: z.enum(ACCESS_GROUP_ROLE_VALUES).optional().describe("Membership role. Defaults to member."),
+                can_read: z.boolean().optional().describe("Whether the member may read group-owned records. Defaults to true."),
+                can_write: z.boolean().optional().describe("Whether the member may write group-owned records. Defaults to true."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ group, actor_external_id, role, can_read, can_write, auth }, extra) => {
+            const payload = { group, actor_external_id, role, can_read, can_write };
+
+            try {
+                const authenticated = await authenticateTool("add_access_group_member", payload, auth, extra);
+                const membership = await addAccessGroupMember(
+                    authenticated.actor_id,
+                    group,
+                    actor_external_id,
+                    role,
+                    can_read,
+                    can_write,
+                );
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ membership }) }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "remove_access_group_member",
+        {
+            description: "Remove an actor from an access group. Requires an authenticated owner or admin; owners cannot be removed.",
+            inputSchema: {
+                group: z.string().min(3).max(64).describe("Access-group slug."),
+                actor_external_id: z.string().min(1).describe("Durable actor external ID to remove."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ group, actor_external_id, auth }, extra) => {
+            const payload = { group, actor_external_id };
+
+            try {
+                const authenticated = await authenticateTool("remove_access_group_member", payload, auth, extra);
+                const membership = await removeAccessGroupMember(
+                    authenticated.actor_id,
+                    group,
+                    actor_external_id,
+                );
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ membership }) }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "list_access_groups",
+        {
+            description: "List access groups available to the authenticated actor.",
+            annotations: {
+                title: "List My Access Groups",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ auth }, extra) => {
+            try {
+                const authenticated = await authenticateTool("list_access_groups", {}, auth, extra);
+                const groups = await listActorAccessGroups(authenticated.actor_id);
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ groups }) }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "save_group_context",
+        {
+            description: "Save a record owned by an access group while preserving the authenticated actor as its author.",
+            inputSchema: {
+                group: z.string().min(3).max(64).describe("Owning access-group slug."),
+                text: z.string().min(1).describe("Context text to save."),
+                tags: z.array(z.string()).optional().describe("Optional tags."),
+                source: z.string().optional().describe("Optional provenance source."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ group, text, tags, source, auth }, extra) => {
+            const payload = { group, text, tags, source };
+
+            try {
+                const authenticated = await authenticateTool("save_group_context", payload, auth, extra);
+                const saved = await saveGroupContext(
+                    authenticated.actor_id,
+                    group,
+                    text,
+                    tags,
+                    source,
+                );
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ saved }) }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "search_group_context",
+        {
+            description: "Search one access group's records after authenticating current read membership.",
+            annotations: {
+                title: "Search Group Context",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                group: z.string().min(3).max(64).describe("Access-group slug."),
+                query: z.string().min(1).describe("Search query."),
+                limit: z.number().int().positive().optional().describe("Maximum result count."),
+                sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ group, query, limit, sensitivity, auth }, extra) => {
+            const payload = { group, query, limit, sensitivity };
+
+            try {
+                const authenticated = await authenticateTool("search_group_context", payload, auth, extra);
+                const selectedSensitivity = sensitivity ?? "low";
+                const results = await searchGroupContext(
+                    authenticated.actor_id,
+                    group,
+                    query,
+                    limit,
+                    selectedSensitivity,
+                );
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            group,
+                            query,
+                            limit: limit ?? 20,
+                            sensitivity: selectedSensitivity,
+                            results,
+                        }),
+                    }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "list_group_context",
+        {
+            description: "List recent records owned by one access group after authenticating current read membership.",
+            annotations: {
+                title: "List Group Context",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                group: z.string().min(3).max(64).describe("Access-group slug."),
+                limit: z.number().int().positive().optional().describe("Maximum result count."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ group, limit, auth }, extra) => {
+            const payload = { group, limit };
+
+            try {
+                const authenticated = await authenticateTool("list_group_context", payload, auth, extra);
+                const results = await listGroupContext(authenticated.actor_id, group, limit);
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ group, limit: limit ?? 20, results }) }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "get_group_context",
+        {
+            description: "Get one exact group-owned record after authenticating current read membership. Missing and unauthorized records both return null.",
+            annotations: {
+                title: "Get Group Context",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                id: z.number().int().positive().describe("Exact context ID."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ id, auth }, extra) => {
+            const payload = { id };
+
+            try {
+                const authenticated = await authenticateTool("get_group_context", payload, auth, extra);
+                const context = await getGroupContext(authenticated.actor_id, id);
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ id, context }) }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "update_group_context",
+        {
+            description: "Update a group-owned record as any current member with write permission.",
+            inputSchema: {
+                id: z.number().int().positive().describe("Exact context ID."),
+                text: z.string().min(1).optional().describe("Optional replacement text."),
+                tags: z.array(z.string()).optional().describe("Optional replacement tags."),
+                source: z.string().optional().describe("Optional replacement source."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ id, text, tags, source, auth }, extra) => {
+            const payload = { id, text, tags, source };
+
+            try {
+                const authenticated = await authenticateTool("update_group_context", payload, auth, extra);
+                const updated = await updateGroupContext(
+                    authenticated.actor_id,
+                    id,
+                    text,
+                    tags,
+                    source,
+                );
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ id, updated }) }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "delete_group_context",
+        {
+            description: "Delete a group-owned record as any current member with write permission.",
+            inputSchema: {
+                id: z.number().int().positive().describe("Exact context ID."),
+                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+            },
+        },
+        async ({ id, auth }, extra) => {
+            const payload = { id };
+
+            try {
+                const authenticated = await authenticateTool("delete_group_context", payload, auth, extra);
+                const deleted = await deleteGroupContext(authenticated.actor_id, id);
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ id, deleted }) }],
                 };
             } catch (error) {
                 return authenticationError(error);

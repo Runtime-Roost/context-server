@@ -85,12 +85,13 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
 
         await runDatabaseMigrations(isolatedPool);
 
-        const legacy = await isolatedPool.query("SELECT actor_id, visibility, channel_id FROM contexts");
+        const legacy = await isolatedPool.query("SELECT actor_id, visibility, channel_id, group_id FROM contexts");
         const applied = await isolatedPool.query("SELECT version FROM schema_migrations ORDER BY version");
         assert.equal(legacy.rows[0].actor_id, null);
         assert.equal(legacy.rows[0].visibility, "whiteboard");
         assert.equal(legacy.rows[0].channel_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert.equal(legacy.rows[0].group_id, null);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     } finally {
         await isolatedPool.end();
         await adminPool.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -559,6 +560,16 @@ test("built MCP schemas expose actor identification and stable actor filters", a
             "get_channel_context",
             "update_channel_context",
             "delete_channel_context",
+            "create_access_group",
+            "add_access_group_member",
+            "remove_access_group_member",
+            "list_access_groups",
+            "save_group_context",
+            "search_group_context",
+            "list_group_context",
+            "get_group_context",
+            "update_group_context",
+            "delete_group_context",
         ]) {
             const schema = byName.get(toolName)?.inputSchema;
             assert.ok(schema, `${toolName} must be registered`);
@@ -570,6 +581,10 @@ test("built MCP schemas expose actor identification and stable actor filters", a
             "search_channel_context",
             "list_channel_context",
             "get_channel_context",
+            "list_access_groups",
+            "search_group_context",
+            "list_group_context",
+            "get_group_context",
         ]) {
             assert.deepEqual(
                 byName.get(toolName)?.annotations,

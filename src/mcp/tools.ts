@@ -10,6 +10,7 @@ export type ContextRecord = {
     kind: string;
     visibility: ContextVisibility;
     channel_id: number | null;
+    group_id: number | null;
     content: string;
     source: string | null;
     tags: string[];
@@ -49,6 +50,7 @@ export const CONTEXT_VISIBILITY_VALUES = [
     "direct",
     "personal",
     "system",
+    "group",
 ] as const;
 export type ContextVisibility = (typeof CONTEXT_VISIBILITY_VALUES)[number];
 export const WRITABLE_CONTEXT_VISIBILITY_VALUES = ["whiteboard"] as const;
@@ -60,6 +62,7 @@ type ContextRow = {
     kind: string;
     visibility: ContextVisibility;
     channel_id: number | string | null;
+    group_id: number | string | null;
     content: string;
     source: string | null;
     tags: string | string[] | null;
@@ -232,6 +235,7 @@ function mapContextRow(row: ContextRow): ContextRecord {
         kind: row.kind,
         visibility: row.visibility,
         channel_id: row.channel_id === null ? null : Number(row.channel_id),
+        group_id: row.group_id === null ? null : Number(row.group_id),
         content: row.content,
         source: row.source,
         tags: parseTags(row.tags),
@@ -266,6 +270,7 @@ const CONTEXT_PROJECTION = `
     contexts.kind,
     contexts.visibility,
     contexts.channel_id,
+    contexts.group_id,
     contexts.content,
     contexts.source,
     contexts.tags,
@@ -439,6 +444,7 @@ async function insertContext(
     actorId: number | null,
     visibility: ContextVisibility | undefined,
     channelId: number | null = null,
+    groupId: number | null = null,
 ) {
     const now = new Date().toISOString();
     const tagList = tags ?? [];
@@ -454,10 +460,11 @@ async function insertContext(
                     tags,
                     actor_id,
                     channel_id,
+                    group_id,
                     created_at,
                     updated_at
                 )
-                VALUES ('note', $1, $2, $3, $4, $5, $6, $7, $7)
+                VALUES ('note', $1, $2, $3, $4, $5, $6, $7, $8, $8)
                 RETURNING *
             )
             SELECT
@@ -465,6 +472,7 @@ async function insertContext(
                 inserted.kind,
                 inserted.visibility,
                 inserted.channel_id,
+                inserted.group_id,
                 inserted.content,
                 inserted.source,
                 inserted.tags,
@@ -486,6 +494,7 @@ async function insertContext(
             tagValue,
             actorId,
             channelId,
+            groupId,
             now,
         ]
     );
@@ -780,6 +789,7 @@ export async function deleteContext(id: number) {
                 deleted.kind,
                 deleted.visibility,
                 deleted.channel_id,
+                deleted.group_id,
                 deleted.content,
                 deleted.source,
                 deleted.tags,
@@ -845,6 +855,7 @@ export async function updateContext(
                 updated.kind,
                 updated.visibility,
                 updated.channel_id,
+                updated.group_id,
                 updated.content,
                 updated.source,
                 updated.tags,
@@ -890,6 +901,32 @@ export async function updateContext(
 
 export const CHANNEL_ROLE_VALUES = ["owner", "admin", "member"] as const;
 export type ChannelRole = (typeof CHANNEL_ROLE_VALUES)[number];
+export const ACCESS_GROUP_ROLE_VALUES = CHANNEL_ROLE_VALUES;
+export type AccessGroupRole = ChannelRole;
+
+export type AccessGroupRecord = {
+    id: number;
+    slug: string;
+    name: string;
+    description: string | null;
+    role: AccessGroupRole;
+    can_read: boolean;
+    can_write: boolean;
+    created_at: string;
+    updated_at: string;
+};
+
+type AccessGroupMembershipRow = {
+    id: number | string;
+    slug: string;
+    name: string;
+    description: string | null;
+    role: AccessGroupRole;
+    can_read: boolean;
+    can_write: boolean;
+    created_at: string | Date;
+    updated_at: string | Date;
+};
 
 export type ChannelRecord = {
     id: number;
@@ -1427,6 +1464,7 @@ export async function updateChannelContext(
                 updated.kind,
                 updated.visibility,
                 updated.channel_id,
+                updated.group_id,
                 updated.content,
                 updated.source,
                 updated.tags,
@@ -1486,6 +1524,581 @@ export async function deleteChannelContext(actorId: number, id: number) {
                 deleted.kind,
                 deleted.visibility,
                 deleted.channel_id,
+                deleted.group_id,
+                deleted.content,
+                deleted.source,
+                deleted.tags,
+                deleted.created_at,
+                deleted.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM deleted
+            LEFT JOIN actors ON actors.id = deleted.actor_id
+        `,
+        [id, actorId],
+    );
+
+    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+}
+
+function normalizeAccessGroupSlug(slug: string) {
+    const normalized = slug.trim().toLowerCase();
+
+    if (!/^[a-z0-9][a-z0-9_-]{1,62}[a-z0-9]$/.test(normalized)) {
+        throw new Error(
+            "access group slug must be 3-64 lowercase letters, numbers, underscores, or hyphens.",
+        );
+    }
+
+    return normalized;
+}
+
+function mapAccessGroupRow(row: AccessGroupMembershipRow): AccessGroupRecord {
+    return {
+        id: Number(row.id),
+        slug: row.slug,
+        name: row.name,
+        description: row.description,
+        role: row.role,
+        can_read: row.can_read,
+        can_write: row.can_write,
+        created_at: normalizeTimestamp(row.created_at),
+        updated_at: normalizeTimestamp(row.updated_at),
+    };
+}
+
+async function requireAccessGroupMembership(
+    actorId: number,
+    slug: string,
+    capability: "read" | "write" | "admin",
+) {
+    const result = await db.query<AccessGroupMembershipRow>(
+        `
+            SELECT
+                access_groups.id,
+                access_groups.slug,
+                access_groups.name,
+                access_groups.description,
+                access_group_memberships.role,
+                access_group_memberships.can_read,
+                access_group_memberships.can_write,
+                access_groups.created_at,
+                access_groups.updated_at
+            FROM access_groups
+            INNER JOIN access_group_memberships
+                ON access_group_memberships.group_id = access_groups.id
+            WHERE access_groups.slug = $1
+              AND access_group_memberships.actor_id = $2
+              AND access_group_memberships.removed_at IS NULL
+              AND (
+                    ($3 = 'read' AND access_group_memberships.can_read)
+                 OR ($3 = 'write' AND access_group_memberships.can_write)
+                 OR (
+                        $3 = 'admin'
+                    AND access_group_memberships.role IN ('owner', 'admin')
+                 )
+              )
+        `,
+        [normalizeAccessGroupSlug(slug), actorId, capability],
+    );
+    const membership = result.rows[0];
+
+    if (!membership) {
+        throw new Error("ACCESS_GROUP_NOT_FOUND_OR_NOT_AUTHORIZED");
+    }
+
+    return mapAccessGroupRow(membership);
+}
+
+export async function createAccessGroup(
+    actorId: number,
+    slug: string,
+    name: string,
+    description?: string,
+) {
+    await initializeDatabase();
+    const normalizedSlug = normalizeAccessGroupSlug(slug);
+    const normalizedName = name.trim();
+
+    if (!normalizedName) {
+        throw new Error("access group name must contain at least one non-whitespace character.");
+    }
+
+    const client = await db.connect();
+
+    try {
+        await client.query("BEGIN");
+        const result = await client.query<{
+            id: number | string;
+            slug: string;
+            name: string;
+            description: string | null;
+            created_at: string | Date;
+            updated_at: string | Date;
+        }>(
+            `
+                INSERT INTO access_groups (slug, name, description, created_by_actor_id)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id, slug, name, description, created_at, updated_at
+            `,
+            [normalizedSlug, normalizedName, description?.trim() || null, actorId],
+        );
+        const group = result.rows[0];
+
+        await client.query(
+            `
+                INSERT INTO access_group_memberships (
+                    group_id,
+                    actor_id,
+                    role,
+                    can_read,
+                    can_write
+                )
+                VALUES ($1, $2, 'owner', TRUE, TRUE)
+            `,
+            [group.id, actorId],
+        );
+        await client.query("COMMIT");
+
+        return {
+            id: Number(group.id),
+            slug: group.slug,
+            name: group.name,
+            description: group.description,
+            role: "owner" as const,
+            can_read: true,
+            can_write: true,
+            created_at: normalizeTimestamp(group.created_at),
+            updated_at: normalizeTimestamp(group.updated_at),
+        };
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function addAccessGroupMember(
+    requesterActorId: number,
+    slug: string,
+    actorExternalId: string,
+    role: AccessGroupRole = "member",
+    canRead = true,
+    canWrite = true,
+) {
+    await initializeDatabase();
+    const group = await requireAccessGroupMembership(requesterActorId, slug, "admin");
+
+    if (role === "owner" && group.role !== "owner") {
+        throw new Error("ACCESS_GROUP_NOT_FOUND_OR_NOT_AUTHORIZED");
+    }
+
+    const currentTarget = await db.query<{ role: AccessGroupRole }>(
+        `
+            SELECT access_group_memberships.role
+            FROM access_group_memberships
+            INNER JOIN actors ON actors.id = access_group_memberships.actor_id
+            WHERE access_group_memberships.group_id = $1
+              AND actors.external_id = $2
+              AND access_group_memberships.removed_at IS NULL
+        `,
+        [group.id, actorExternalId],
+    );
+    const currentTargetRole = currentTarget.rows[0]?.role;
+
+    if (currentTargetRole === "owner" && role !== "owner") {
+        throw new Error("ACCESS_GROUP_OWNER_CANNOT_BE_REMOVED");
+    }
+
+    if (
+        group.role !== "owner"
+        && (role !== "member" || currentTargetRole === "admin")
+    ) {
+        throw new Error("ACCESS_GROUP_NOT_FOUND_OR_NOT_AUTHORIZED");
+    }
+
+    const result = await db.query<{
+        actor_id: number | string;
+        actor_external_id: string;
+        role: AccessGroupRole;
+        can_read: boolean;
+        can_write: boolean;
+        joined_at: string | Date;
+    }>(
+        `
+            INSERT INTO access_group_memberships (
+                group_id,
+                actor_id,
+                role,
+                can_read,
+                can_write,
+                joined_at,
+                removed_at
+            )
+            SELECT $1, actors.id, $3, $4, $5, NOW(), NULL
+            FROM actors
+            WHERE actors.external_id = $2
+            ON CONFLICT (group_id, actor_id) DO UPDATE
+            SET
+                role = EXCLUDED.role,
+                can_read = EXCLUDED.can_read,
+                can_write = EXCLUDED.can_write,
+                joined_at = NOW(),
+                removed_at = NULL
+            RETURNING
+                actor_id,
+                $2::text AS actor_external_id,
+                role,
+                can_read,
+                can_write,
+                joined_at
+        `,
+        [group.id, actorExternalId, role, canRead, canWrite],
+    );
+    const member = result.rows[0];
+
+    if (!member) {
+        throw new Error("ACTOR_NOT_FOUND");
+    }
+
+    return {
+        group: group.slug,
+        actor_id: Number(member.actor_id),
+        actor_external_id: member.actor_external_id,
+        role: member.role,
+        can_read: member.can_read,
+        can_write: member.can_write,
+        joined_at: normalizeTimestamp(member.joined_at),
+    };
+}
+
+export async function removeAccessGroupMember(
+    requesterActorId: number,
+    slug: string,
+    actorExternalId: string,
+) {
+    await initializeDatabase();
+    const group = await requireAccessGroupMembership(requesterActorId, slug, "admin");
+    const target = await db.query<{ role: AccessGroupRole }>(
+        `
+            SELECT access_group_memberships.role
+            FROM access_group_memberships
+            INNER JOIN actors ON actors.id = access_group_memberships.actor_id
+            WHERE access_group_memberships.group_id = $1
+              AND actors.external_id = $2
+              AND access_group_memberships.removed_at IS NULL
+        `,
+        [group.id, actorExternalId],
+    );
+
+    if (target.rows[0]?.role === "owner") {
+        throw new Error("ACCESS_GROUP_OWNER_CANNOT_BE_REMOVED");
+    }
+
+    if (target.rows[0]?.role === "admin" && group.role !== "owner") {
+        throw new Error("ACCESS_GROUP_NOT_FOUND_OR_NOT_AUTHORIZED");
+    }
+
+    const removed = await db.query(
+        `
+            UPDATE access_group_memberships
+            SET removed_at = NOW(), can_read = FALSE, can_write = FALSE
+            WHERE group_id = $1
+              AND actor_id = (
+                  SELECT id FROM actors WHERE external_id = $2
+              )
+              AND removed_at IS NULL
+            RETURNING actor_id
+        `,
+        [group.id, actorExternalId],
+    );
+
+    return {
+        group: group.slug,
+        actor_external_id: actorExternalId,
+        removed: removed.rowCount === 1,
+    };
+}
+
+export async function listActorAccessGroups(actorId: number) {
+    await initializeDatabase();
+    const result = await db.query<AccessGroupMembershipRow>(
+        `
+            SELECT
+                access_groups.id,
+                access_groups.slug,
+                access_groups.name,
+                access_groups.description,
+                access_group_memberships.role,
+                access_group_memberships.can_read,
+                access_group_memberships.can_write,
+                access_groups.created_at,
+                access_groups.updated_at
+            FROM access_groups
+            INNER JOIN access_group_memberships
+                ON access_group_memberships.group_id = access_groups.id
+            WHERE access_group_memberships.actor_id = $1
+              AND access_group_memberships.removed_at IS NULL
+            ORDER BY access_groups.slug
+        `,
+        [actorId],
+    );
+
+    return result.rows.map(mapAccessGroupRow);
+}
+
+export async function saveGroupContext(
+    actorId: number,
+    slug: string,
+    text: string,
+    tags?: string[],
+    source?: string,
+) {
+    await initializeDatabase();
+    const group = await requireAccessGroupMembership(actorId, slug, "write");
+    const client = await db.connect();
+    let context: ContextRecord;
+
+    try {
+        context = await insertContext(
+            client,
+            text,
+            tags,
+            source,
+            actorId,
+            "group",
+            null,
+            group.id,
+        );
+    } finally {
+        client.release();
+    }
+
+    await maybeSaveContextEmbedding(context);
+    return context;
+}
+
+async function searchGroupContextByText(
+    actorId: number,
+    slug: string,
+    query: string,
+    limit: number,
+) {
+    const group = await requireAccessGroupMembership(actorId, slug, "read");
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.visibility = 'group'
+              AND contexts.group_id = $1
+              AND (
+                    contexts.content ILIKE $2
+                 OR contexts.source ILIKE $2
+                 OR contexts.tags::text ILIKE $2
+              )
+            ORDER BY contexts.created_at DESC, contexts.id DESC
+            LIMIT $3
+        `,
+        [group.id, `%${query}%`, limit],
+    );
+
+    return result.rows.map(mapContextRow);
+}
+
+export async function searchGroupContext(
+    actorId: number,
+    slug: string,
+    query: string,
+    limit?: number,
+    sensitivity: SearchSensitivity = DEFAULT_SEARCH_SENSITIVITY,
+    generateEmbedding: typeof maybeGenerateEmbedding = maybeGenerateEmbedding,
+) {
+    await initializeDatabase();
+    const resultLimit = normalizeLimit(limit);
+    const group = await requireAccessGroupMembership(actorId, slug, "read");
+    const embedding = await generateEmbedding(query);
+
+    if (!embedding.generated) {
+        return searchGroupContextByText(actorId, slug, query, resultLimit);
+    }
+
+    const result = await db.query<VectorSearchRow>(
+        `
+            SELECT
+                ${CONTEXT_PROJECTION},
+                embeddings.model,
+                embeddings.vector
+            FROM contexts
+            INNER JOIN embeddings ON embeddings.context_id = contexts.id
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.visibility = 'group'
+              AND contexts.group_id = $1
+              AND embeddings.model = $2
+              AND embeddings.vector IS NOT NULL
+        `,
+        [group.id, embedding.model],
+    );
+
+    return result.rows
+        .map((row) => {
+            const vector = parseEmbeddingVector(row.vector);
+            const similarity = vector ? cosineSimilarity(embedding.vector, vector) : null;
+            return similarity === null ? null : { context: mapContextRow(row), similarity };
+        })
+        .filter((item): item is { context: ContextRecord; similarity: number } => item !== null)
+        .filter((item) => matchesSearchSensitivity(item.similarity, sensitivity))
+        .sort((left, right) => right.similarity - left.similarity)
+        .slice(0, resultLimit)
+        .map((item) => item.context);
+}
+
+export async function listGroupContext(actorId: number, slug: string, limit?: number) {
+    await initializeDatabase();
+    const group = await requireAccessGroupMembership(actorId, slug, "read");
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            WHERE contexts.visibility = 'group'
+              AND contexts.group_id = $1
+            ORDER BY contexts.created_at DESC, contexts.id DESC
+            LIMIT $2
+        `,
+        [group.id, normalizeLimit(limit)],
+    );
+
+    return result.rows.map(mapContextRow);
+}
+
+export async function getGroupContext(actorId: number, id: number) {
+    await initializeDatabase();
+    const result = await db.query<ContextRow>(
+        `
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            LEFT JOIN actors ON actors.id = contexts.actor_id
+            INNER JOIN access_group_memberships
+                ON access_group_memberships.group_id = contexts.group_id
+            WHERE contexts.id = $1
+              AND contexts.visibility = 'group'
+              AND access_group_memberships.actor_id = $2
+              AND access_group_memberships.removed_at IS NULL
+              AND access_group_memberships.can_read
+        `,
+        [id, actorId],
+    );
+
+    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+}
+
+export async function updateGroupContext(
+    actorId: number,
+    id: number,
+    text?: string,
+    tags?: string[],
+    source?: string,
+) {
+    await initializeDatabase();
+    const hasText = text !== undefined;
+    const hasTags = tags !== undefined;
+    const hasSource = source !== undefined;
+
+    if (!hasText && !hasTags && !hasSource) {
+        throw new Error("At least one of text, tags, or source must be provided.");
+    }
+
+    const tagValue = hasTags
+        ? (await getTagsColumnType()) === "_text"
+            ? tags
+            : JSON.stringify(tags)
+        : null;
+    const result = await db.query<ContextRow>(
+        `
+            WITH updated AS (
+                UPDATE contexts
+                SET
+                    content = CASE WHEN $3 THEN $4 ELSE content END,
+                    tags = CASE WHEN $5 THEN $6 ELSE tags END,
+                    source = CASE WHEN $7 THEN $8 ELSE source END,
+                    updated_at = $9
+                FROM access_group_memberships
+                WHERE contexts.id = $1
+                  AND contexts.visibility = 'group'
+                  AND access_group_memberships.group_id = contexts.group_id
+                  AND access_group_memberships.actor_id = $2
+                  AND access_group_memberships.removed_at IS NULL
+                  AND access_group_memberships.can_write
+                RETURNING contexts.*
+            )
+            SELECT
+                updated.id,
+                updated.kind,
+                updated.visibility,
+                updated.channel_id,
+                updated.group_id,
+                updated.content,
+                updated.source,
+                updated.tags,
+                updated.created_at,
+                updated.updated_at,
+                actors.id AS actor_id,
+                actors.external_id AS actor_external_id,
+                actors.name AS actor_name,
+                actors.kind AS actor_kind,
+                actors.created_at AS actor_created_at,
+                actors.last_seen_at AS actor_last_seen_at
+            FROM updated
+            LEFT JOIN actors ON actors.id = updated.actor_id
+        `,
+        [
+            id,
+            actorId,
+            hasText,
+            text ?? null,
+            hasTags,
+            tagValue,
+            hasSource,
+            source ?? null,
+            new Date().toISOString(),
+        ],
+    );
+    const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
+
+    if (context && hasText) {
+        await maybeSaveContextEmbedding(context);
+    }
+
+    return context;
+}
+
+export async function deleteGroupContext(actorId: number, id: number) {
+    await initializeDatabase();
+    const result = await db.query<ContextRow>(
+        `
+            WITH deleted AS (
+                DELETE FROM contexts
+                USING access_group_memberships
+                WHERE contexts.id = $1
+                  AND contexts.visibility = 'group'
+                  AND access_group_memberships.group_id = contexts.group_id
+                  AND access_group_memberships.actor_id = $2
+                  AND access_group_memberships.removed_at IS NULL
+                  AND access_group_memberships.can_write
+                RETURNING contexts.*
+            )
+            SELECT
+                deleted.id,
+                deleted.kind,
+                deleted.visibility,
+                deleted.channel_id,
+                deleted.group_id,
                 deleted.content,
                 deleted.source,
                 deleted.tags,
@@ -1679,6 +2292,7 @@ export async function updatePersonalContext(
                 updated.kind,
                 updated.visibility,
                 updated.channel_id,
+                updated.group_id,
                 updated.content,
                 updated.source,
                 updated.tags,
@@ -1730,6 +2344,7 @@ export async function deletePersonalContext(actorId: number, id: number) {
                 deleted.kind,
                 deleted.visibility,
                 deleted.channel_id,
+                deleted.group_id,
                 deleted.content,
                 deleted.source,
                 deleted.tags,
@@ -1922,6 +2537,7 @@ export async function contextPurgeConfirm(
                 deleted.kind,
                 deleted.visibility,
                 deleted.channel_id,
+                deleted.group_id,
                 deleted.content,
                 deleted.source,
                 deleted.tags,
