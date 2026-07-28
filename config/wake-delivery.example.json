@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "socket_path": "/run/agent-runtime/wake.sock",
+  "endpoint": "/v1/wakes",
+  "credential_file": "/run/credentials/personal-context-server/wake-hmac-secret",
+  "connect_timeout_ms": 2000,
+  "request_timeout_ms": 10000,
+  "retry": {
+    "max_attempts": 3,
+    "base_delay_ms": 250
+  },
+  "max_response_bytes": 16384
+}

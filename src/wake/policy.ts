@@ -4,7 +4,7 @@ const actorExternalIdSchema = z.string().min(1).max(200).regex(/^actor:[a-z0-9:_
 
 export const wakePolicySchema = z.object({
     version: z.literal(1),
-    mode: z.enum(["disabled", "dry-run"]),
+    mode: z.enum(["disabled", "dry-run", "deliver"]),
     target_actor_external_id: actorExternalIdSchema,
     allowed_requester_actors: z.array(actorExternalIdSchema).min(1).max(50),
     allowed_trigger_types: z.array(z.string().min(1).max(100)).min(1).max(50),
@@ -47,6 +47,28 @@ export type WakeHistoryEntry = {
     target_actor_external_id: string;
 };
 
+export const wakeInvocationSchema = z.object({
+    target_actor_external_id: actorExternalIdSchema,
+    requested_by_actor: actorExternalIdSchema,
+    trigger: z.object({
+        event_id: z.string().uuid(),
+        type: z.string().min(1).max(100),
+        source: z.string().min(1).max(200),
+        occurred_at: z.iso.datetime({ offset: true }),
+        channel: z.string().min(1).max(200).nullable(),
+    }).strict(),
+    summary: z.string().max(100_000).nullable(),
+    context_ids: z.array(z.number().int().positive()).max(1_000),
+    metadata: z.record(z.string(), z.union([
+        z.string(), z.number(), z.boolean(), z.null(),
+    ])),
+    timeout_seconds: z.number().int().positive().max(3_600),
+    policy_version: z.number().int().positive(),
+    dry_run: z.boolean(),
+}).strict();
+
+export type WakeInvocation = z.infer<typeof wakeInvocationSchema>;
+
 export type WakeDecision = {
     decision: "allow" | "deny";
     reasons: string[];
@@ -55,23 +77,7 @@ export type WakeDecision = {
     mode: WakePolicy["mode"];
     event_id: string;
     target_actor_external_id: string;
-    invocation: {
-        target_actor_external_id: string;
-        requested_by_actor: string;
-        trigger: {
-            event_id: string;
-            type: string;
-            source: string;
-            occurred_at: string;
-            channel: string | null;
-        };
-        summary: string | null;
-        context_ids: number[];
-        metadata: Record<string, string | number | boolean | null>;
-        timeout_seconds: number;
-        policy_version: number;
-        dry_run: true;
-    } | null;
+    invocation: WakeInvocation | null;
 };
 
 function boundedMetadata(
@@ -176,7 +182,7 @@ export function evaluateWakePolicy(
                 metadata: boundedMetadata(event.metadata, policy.payload.allowed_metadata_keys),
                 timeout_seconds: policy.invocation_timeout_seconds,
                 policy_version: policy.version,
-                dry_run: true,
+                dry_run: policy.mode !== "deliver",
             }
             : null,
     };

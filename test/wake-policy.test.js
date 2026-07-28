@@ -54,6 +54,12 @@ test("wake policy allows only a bounded dry-run invocation payload", () => {
     assert.equal("secret" in decision.invocation.metadata, false);
 });
 
+test("deliver mode produces the same bounded invocation with execution explicitly enabled", () => {
+    const decision = evaluateWakePolicy({ ...policy, mode: "deliver" }, event(), [], now);
+    assert.equal(decision.decision, "allow");
+    assert.equal(decision.invocation.dry_run, false);
+});
+
 test("wake policy fails closed across identity, trigger, source, channel, time, replay, cooldown, and rate limits", () => {
     const candidate = event({
         requested_by_actor: "actor:openai:chatgpt",

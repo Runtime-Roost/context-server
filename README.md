@@ -238,10 +238,10 @@ and SHA-256 keys determine every filesystem path.
 
 ### Wake-policy groundwork
 
-The repository includes a deliberately non-executing wake-policy evaluator for
-future local-agent orchestration. It turns a typed event plus a versioned policy
-into either a denied decision or a bounded **dry-run** invocation envelope. It
-does not spawn Codex, a shell, or any other process.
+The repository includes a wake-policy evaluator and an optional local handoff
+to agent-runtime. It turns a typed event plus a versioned policy into either a
+denied decision or a bounded invocation envelope. PCS does not spawn Codex, a
+shell, or any other process.
 
 The v1 policy requires explicit allowlists for requesting actors, trigger types,
 sources, and optionally channels. It also applies event-age limits, replay
@@ -261,12 +261,51 @@ npm run wake-policy:dry-run -- \
   --pretty
 ```
 
-An allowed decision still includes `"dry_run": true`. Automatic launches remain
-intentionally unavailable. A future execution layer must be a separate,
-explicitly enabled component with a fixed executable, no shell interpolation,
-bounded stdin payload, timeout/termination handling, durable idempotency, and
-operator-controlled enablement. The JSONL log provides operational
-accountability but is not a cryptographically tamper-evident audit ledger.
+An allowed dry-run decision still includes `"dry_run": true`. To hand an
+authorized invocation to agent-runtime, copy the example policy to a protected
+path, explicitly set its mode to `"deliver"`, and use
+[config/wake-delivery.example.json](config/wake-delivery.example.json):
+
+```bash
+npm run wake-policy:run -- \
+  --policy /secure/path/wake-policy.json \
+  --event config/wake-event.example.json \
+  --audit data/wake/audit.jsonl \
+  --delivery config/wake-delivery.example.json \
+  --pretty
+```
+
+Delivery is local-only HTTP over the configured absolute Unix socket. PCS posts
+the strict invocation object to `POST /v1/wakes`; it cannot supply a workspace,
+prompt template, executable, or command. agent-runtime maps the authorized
+target actor and trigger/source to its own fixed local route.
+
+The request uses `Idempotency-Key: <trigger.event_id>`,
+`X-Agent-Runtime-Timestamp`, and `X-Agent-Runtime-Signature`. The signature is
+`sha256=<lowercase hex HMAC-SHA256>` over the exact bytes
+`timestamp + "\n" + idempotency_key + "\n" + raw_json_body`. The shared secret
+is read from the absolute mode-restricted credential path; it is never accepted
+from a wake event or CLI argument. agent-runtime bounds timestamp skew and
+returns 202 for both a newly queued request and an identical duplicate. PCS
+retries only transport failures, 408, 425, 429, and 5xx responses. Other 4xx
+responses fail closed.
+
+Before sending, PCS writes the exact bounded invocation and SHA-256 digest to a
+durable append-only outbox in the audit journal under the same lock as the
+authorization decision. Every attempt is appended and synced while holding the
+delivery lock. A failed delivery can be retried without re-evaluating a changed
+event or policy:
+
+```bash
+npm run wake-delivery:retry -- \
+  --retry-event 00000000-0000-4000-8000-000000000001 \
+  --audit data/wake/audit.jsonl \
+  --delivery config/wake-delivery.example.json
+```
+
+Once a 202 acceptance is audited, PCS will not resend that outbox entry. The
+JSONL journal provides operational accountability but is not a
+cryptographically tamper-evident audit ledger.
 
 ### Authenticated channels
 
