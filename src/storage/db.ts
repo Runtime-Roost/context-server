@@ -547,6 +547,21 @@ const migrations: Migration[] = [
                 ON context_attachments(attachment_id, sort_order, context_id);
         `,
     },
+    {
+        version: 11,
+        name: "context_acknowledgements",
+        sql: `
+            CREATE TABLE IF NOT EXISTS context_acknowledgements (
+                context_id BIGINT NOT NULL REFERENCES contexts(id) ON DELETE CASCADE,
+                actor_id BIGINT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+                acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (context_id, actor_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS context_acknowledgements_actor_time_idx
+                ON context_acknowledgements(actor_id, acknowledged_at, context_id);
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;

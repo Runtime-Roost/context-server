@@ -15,8 +15,17 @@ export type ContextRecord = {
     source: string | null;
     tags: string[];
     actor: ActorRecord | null;
+    acknowledged_by: ContextAcknowledgement[];
     created_at: string;
     updated_at: string;
+};
+
+export type ContextAcknowledgement = {
+    id: number;
+    external_id: string | null;
+    name: string;
+    kind: string | null;
+    acknowledged_at: string;
 };
 
 export type ActorRecord = {
@@ -37,6 +46,15 @@ export type ActorIdentity = {
 
 export type SaveContextResult = {
     context: ContextRecord;
+    actor_resolution?: {
+        created: boolean;
+    };
+};
+
+export type AcknowledgeContextResult = {
+    context: ContextRecord | null;
+    actor: ActorRecord | null;
+    acknowledged: boolean;
     actor_resolution?: {
         created: boolean;
     };
@@ -72,6 +90,7 @@ type ContextRow = {
     actor_kind: string | null;
     actor_created_at: string | Date | null;
     actor_last_seen_at: string | Date | null;
+    acknowledged_by: unknown;
     created_at: string | Date;
     updated_at: string | Date;
 };
@@ -229,6 +248,27 @@ function normalizePurgeCutoff(before: string) {
     return cutoff.toISOString();
 }
 
+function parseAcknowledgements(value: unknown): ContextAcknowledgement[] {
+    const parsed = typeof value === "string" ? JSON.parse(value) as unknown : value;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item) => {
+        const acknowledgement = item as Record<string, unknown>;
+        return {
+            id: Number(acknowledgement.id),
+            external_id: typeof acknowledgement.external_id === "string"
+                ? acknowledgement.external_id
+                : null,
+            name: typeof acknowledgement.name === "string"
+                ? acknowledgement.name
+                : "Unknown actor",
+            kind: typeof acknowledgement.kind === "string" ? acknowledgement.kind : null,
+            acknowledged_at: normalizeTimestamp(
+                acknowledgement.acknowledged_at as string | Date,
+            ),
+        };
+    });
+}
+
 function mapContextRow(row: ContextRow): ContextRecord {
     return {
         id: Number(row.id),
@@ -249,6 +289,7 @@ function mapContextRow(row: ContextRow): ContextRecord {
                   created_at: normalizeTimestamp(row.actor_created_at!),
                   last_seen_at: normalizeTimestamp(row.actor_last_seen_at!),
               },
+        acknowledged_by: parseAcknowledgements(row.acknowledged_by),
         created_at: normalizeTimestamp(row.created_at),
         updated_at: normalizeTimestamp(row.updated_at),
     };
@@ -281,7 +322,23 @@ const CONTEXT_PROJECTION = `
     actors.name AS actor_name,
     actors.kind AS actor_kind,
     actors.created_at AS actor_created_at,
-    actors.last_seen_at AS actor_last_seen_at
+    actors.last_seen_at AS actor_last_seen_at,
+    COALESCE((
+        SELECT jsonb_agg(
+            jsonb_build_object(
+                'id', acknowledging_actors.id,
+                'external_id', acknowledging_actors.external_id,
+                'name', acknowledging_actors.name,
+                'kind', acknowledging_actors.kind,
+                'acknowledged_at', context_acknowledgements.acknowledged_at
+            )
+            ORDER BY context_acknowledgements.acknowledged_at, acknowledging_actors.id
+        )
+        FROM context_acknowledgements
+        INNER JOIN actors AS acknowledging_actors
+            ON acknowledging_actors.id = context_acknowledgements.actor_id
+        WHERE context_acknowledgements.context_id = contexts.id
+    ), '[]'::jsonb) AS acknowledged_by
 `;
 
 function parseEmbeddingVector(value: unknown) {
@@ -579,6 +636,77 @@ export async function saveContextWithActor(
     };
 }
 
+export async function acknowledgeContextWithActor(
+    contextId: number,
+    actor?: ActorIdentity,
+    activeActorId?: number | null,
+): Promise<AcknowledgeContextResult> {
+    await initializeDatabase();
+    const client = await db.connect();
+
+    try {
+        await client.query("BEGIN");
+        const visible = await client.query(
+            `SELECT id FROM contexts WHERE id = $1 AND visibility = 'whiteboard'`,
+            [contextId],
+        );
+        if (visible.rowCount === 0) {
+            await client.query("ROLLBACK");
+            return { context: null, actor: null, acknowledged: false };
+        }
+
+        const identified = actor
+            ? await resolveActor(actor, client)
+            : null;
+        const actorId = identified?.actor.id ?? activeActorId ?? null;
+        if (actorId === null) {
+            await client.query("ROLLBACK");
+            throw new Error("Actor identification is required to acknowledge a context.");
+        }
+
+        const inserted = await client.query(
+            `
+                INSERT INTO context_acknowledgements (context_id, actor_id)
+                VALUES ($1, $2)
+                ON CONFLICT (context_id, actor_id) DO NOTHING
+                RETURNING acknowledged_at
+            `,
+            [contextId, actorId],
+        );
+        const result = await client.query<ContextRow>(
+            `
+                SELECT ${CONTEXT_PROJECTION}
+                FROM contexts
+                LEFT JOIN actors ON actors.id = contexts.actor_id
+                WHERE contexts.id = $1
+                  AND contexts.visibility = 'whiteboard'
+            `,
+            [contextId],
+        );
+        const acknowledgingActor = identified?.actor
+            ?? mapActorRow((await client.query<ActorRow>(
+                `
+                    SELECT id, external_id, name, kind, metadata, created_at, last_seen_at
+                    FROM actors
+                    WHERE id = $1
+                `,
+                [actorId],
+            )).rows[0]);
+        await client.query("COMMIT");
+        return {
+            context: result.rows[0] ? mapContextRow(result.rows[0]) : null,
+            actor: acknowledgingActor,
+            acknowledged: inserted.rowCount === 1,
+            ...(identified ? { actor_resolution: { created: identified.created } } : {}),
+        };
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 async function searchContextByText(
     query: string,
     limit: number,
@@ -850,25 +978,10 @@ export async function updateContext(
                   AND visibility = 'whiteboard'
                 RETURNING *
             )
-            SELECT
-                updated.id,
-                updated.kind,
-                updated.visibility,
-                updated.channel_id,
-                updated.group_id,
-                updated.content,
-                updated.source,
-                updated.tags,
-                updated.created_at,
-                updated.updated_at,
-                actors.id AS actor_id,
-                actors.external_id AS actor_external_id,
-                actors.name AS actor_name,
-                actors.kind AS actor_kind,
-                actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
-            FROM updated
-            LEFT JOIN actors ON actors.id = updated.actor_id
+            SELECT ${CONTEXT_PROJECTION}
+            FROM contexts
+            INNER JOIN updated ON updated.id = contexts.id
+            LEFT JOIN actors ON actors.id = contexts.actor_id
         `,
         [
             id,
@@ -2379,6 +2492,10 @@ export async function getDatabaseMetadata() {
                     WHERE NOT EXISTS (
                         SELECT 1 FROM contexts WHERE contexts.actor_id = actors.id
                     )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM context_acknowledgements
+                          WHERE context_acknowledgements.actor_id = actors.id
+                      )
                 ) AS orphan_actor_count,
                 (
                     SELECT COUNT(*)
@@ -2386,6 +2503,10 @@ export async function getDatabaseMetadata() {
                     WHERE actors.external_id IS NULL
                       AND NOT EXISTS (
                           SELECT 1 FROM contexts WHERE contexts.actor_id = actors.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM context_acknowledgements
+                          WHERE context_acknowledgements.actor_id = actors.id
                       )
                 ) AS purgeable_actor_count,
                 pg_database_size(current_database()) AS total_size_bytes,
@@ -2434,11 +2555,12 @@ export async function vacuumDatabase() {
     await db.query("VACUUM (ANALYZE) contexts");
     await db.query("VACUUM (ANALYZE) embeddings");
     await db.query("VACUUM (ANALYZE) actors");
+    await db.query("VACUUM (ANALYZE) context_acknowledgements");
 
     const after = await getDatabaseMetadata();
 
     return {
-        tables: ["contexts", "embeddings", "actors"],
+        tables: ["contexts", "embeddings", "actors", "context_acknowledgements"],
         before,
         after,
     };
@@ -2582,6 +2704,11 @@ async function getActorPurgePreview(before: string) {
                   FROM contexts
                   WHERE contexts.actor_id = actors.id
               )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM context_acknowledgements
+                  WHERE context_acknowledgements.actor_id = actors.id
+              )
         `,
         [before]
     );
@@ -2660,6 +2787,11 @@ export async function actorPurgeConfirm(
                   SELECT 1
                   FROM contexts
                   WHERE contexts.actor_id = actors.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM context_acknowledgements
+                  WHERE context_acknowledgements.actor_id = actors.id
               )
             RETURNING id, external_id, name, kind, metadata, created_at, last_seen_at
         `,

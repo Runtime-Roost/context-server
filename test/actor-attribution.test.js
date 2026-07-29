@@ -14,6 +14,7 @@ const {
     runDatabaseMigrations,
 } = await import("../dist/storage/db.js");
 const {
+    acknowledgeContextWithActor,
     actorPurgeConfirm,
     actorPurgePreview,
     identifyActor,
@@ -91,7 +92,7 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
         assert.equal(legacy.rows[0].visibility, "whiteboard");
         assert.equal(legacy.rows[0].channel_id, null);
         assert.equal(legacy.rows[0].group_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     } finally {
         await isolatedPool.end();
         await adminPool.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -406,6 +407,127 @@ test("get_context returns an exact record or null", async () => {
     }
 });
 
+test("context acknowledgements are actor-scoped, idempotent, ordered, and Whiteboard-only", async () => {
+    const marker = uniqueValue("context-acknowledgement");
+    const context = await saveContext(marker, ["acknowledgement"], "acknowledgement test");
+    const hidden = await db.query(
+        `
+            INSERT INTO contexts (kind, visibility, content, tags, created_at, updated_at)
+            VALUES ('note', 'direct', $1, ARRAY[]::text[], NOW(), NOW())
+            RETURNING id
+        `,
+        [`${marker} hidden`],
+    );
+    const hiddenId = Number(hidden.rows[0].id);
+    const firstExternalId = uniqueValue("actor:test:ack:first");
+    const secondExternalId = uniqueValue("actor:test:ack:second");
+    let firstActorId;
+    let secondActorId;
+
+    try {
+        const second = await acknowledgeContextWithActor(context.id, {
+            external_id: secondExternalId,
+            name: "Second Acknowledging Actor",
+            kind: "ai",
+            metadata: { private: "must not be returned" },
+        });
+        secondActorId = second.actor.id;
+        const first = await acknowledgeContextWithActor(context.id, {
+            external_id: firstExternalId,
+            name: "First Acknowledging Actor",
+            kind: "human",
+        });
+        firstActorId = first.actor.id;
+        const repeated = await acknowledgeContextWithActor(
+            context.id,
+            undefined,
+            firstActorId,
+        );
+
+        assert.equal(second.acknowledged, true);
+        assert.equal(first.acknowledged, true);
+        assert.equal(repeated.acknowledged, false);
+        assert.deepEqual(
+            repeated.context.acknowledged_by.map(({ external_id }) => external_id),
+            [secondExternalId, firstExternalId],
+        );
+        assert.equal("metadata" in repeated.context.acknowledged_by[0], false);
+        assert.equal((await getContext(context.id)).acknowledged_by.length, 2);
+
+        const refused = await acknowledgeContextWithActor(
+            hiddenId,
+            undefined,
+            firstActorId,
+        );
+        assert.deepEqual(refused, {
+            context: null,
+            actor: null,
+            acknowledged: false,
+        });
+
+        await db.query("DELETE FROM contexts WHERE id = $1", [context.id]);
+        const cascaded = await db.query(
+            "SELECT COUNT(*)::int AS count FROM context_acknowledgements WHERE context_id = $1",
+            [context.id],
+        );
+        assert.equal(cascaded.rows[0].count, 0);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[context.id, hiddenId]]);
+        if (firstActorId && secondActorId) {
+            await db.query(
+                "DELETE FROM actors WHERE id = ANY($1::bigint[])",
+                [[firstActorId, secondActorId]],
+            );
+        }
+    }
+});
+
+test("acknowledge_context requires actor identity and is idempotent over MCP", async () => {
+    const context = await saveContext(
+        uniqueValue("acknowledgement-mcp"),
+        ["acknowledgement"],
+        "acknowledgement MCP test",
+    );
+    const connection = await connectTestClient();
+    const externalId = uniqueValue("actor:test:ack:mcp");
+    let actorId;
+
+    try {
+        const unidentified = await connection.client.callTool({
+            name: "acknowledge_context",
+            arguments: { context_id: context.id },
+        });
+        assert.equal(unidentified.isError, true);
+        assert.equal(textResult(unidentified).error.code, "ACTOR_IDENTIFICATION_REQUIRED");
+
+        const first = textResult(await connection.client.callTool({
+            name: "acknowledge_context",
+            arguments: {
+                context_id: context.id,
+                actor: {
+                    external_id: externalId,
+                    name: "MCP Acknowledging Actor",
+                    kind: "ai",
+                },
+            },
+        }));
+        actorId = first.context.acknowledged_by[0].id;
+        assert.equal(first.acknowledged, true);
+        assert.equal(first.context.acknowledged_by[0].external_id, externalId);
+
+        const repeated = textResult(await connection.client.callTool({
+            name: "acknowledge_context",
+            arguments: { context_id: context.id },
+        }));
+        assert.equal(repeated.acknowledged, false);
+        assert.equal(repeated.context.acknowledged_by.length, 1);
+    } finally {
+        await connection.close();
+        await db.query("DELETE FROM contexts WHERE id = $1", [context.id]);
+        if (actorId) await db.query("DELETE FROM actors WHERE id = $1", [actorId]);
+    }
+});
+
 test("whiteboard is the only currently discoverable and writable visibility", async () => {
     const marker = uniqueValue("whiteboard-policy");
     const whiteboard = await saveContext(
@@ -535,6 +657,8 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         const searchSchema = byName.get("search_context")?.inputSchema;
         const recentSchema = byName.get("list_recent_context")?.inputSchema;
         const getContextSchema = byName.get("get_context")?.inputSchema;
+        const acknowledgeTool = byName.get("acknowledge_context");
+        const acknowledgeSchema = acknowledgeTool?.inputSchema;
         const saveSchema = byName.get("save_context")?.inputSchema;
         const updateSchema = byName.get("update_context")?.inputSchema;
 
@@ -544,6 +668,15 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         assert.ok(recentSchema.properties.actor_external_id);
         assert.deepEqual(getContextSchema.required, ["id"]);
         assert.ok(getContextSchema.properties.id);
+        assert.deepEqual(acknowledgeSchema.required, ["context_id"]);
+        assert.deepEqual(acknowledgeSchema.properties.actor.required, ["external_id", "name"]);
+        assert.deepEqual(acknowledgeTool.annotations, {
+            title: "Acknowledge Context",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        });
         assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text", "visibility"]);
         assert.deepEqual(saveSchema.properties.visibility.enum, ["whiteboard"]);
         assert.deepEqual(saveSchema.properties.actor.required, ["external_id", "name"]);

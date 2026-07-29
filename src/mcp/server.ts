@@ -15,6 +15,7 @@ import {
     CHANNEL_ROLE_VALUES,
     SEARCH_SENSITIVITY_VALUES,
     WRITABLE_CONTEXT_VISIBILITY_VALUES,
+    acknowledgeContextWithActor,
     actorPurgeConfirm,
     actorPurgePreview,
     addAccessGroupMember,
@@ -1428,6 +1429,74 @@ export function createServer() {
                 ],
             };
         }
+    );
+
+    server.registerTool(
+        "acknowledge_context",
+        {
+            description: "Acknowledge an ordinary Whiteboard context as an identified actor. Repeated acknowledgements by the same actor are idempotent. This tool cannot acknowledge channel, group, personal, direct, or system records.",
+            inputSchema: {
+                context_id: z.number().int().positive().describe("The Whiteboard context id to acknowledge."),
+                actor: z.object({
+                    external_id: z.string().min(1).describe("Stable operational actor ID, such as actor:openai:codex."),
+                    name: z.string().min(1).describe("Actor display name."),
+                    kind: z.string().min(1).optional().describe("Optional actor category, such as ai or human."),
+                    metadata: z.record(z.string(), z.unknown()).optional().describe("Optional actor metadata retained on the actor record but never returned in acknowledged_by."),
+                }).optional().describe("Explicit acknowledging actor. Takes precedence over the active actor session."),
+            },
+            annotations: {
+                title: "Acknowledge Context",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+        },
+        async ({ context_id, actor }) => {
+            if (!actor && actorSession.actorId === null) {
+                return {
+                    isError: true,
+                    content: [{
+                        type: "text" as const,
+                        text: JSON.stringify({
+                            error: {
+                                code: "ACTOR_IDENTIFICATION_REQUIRED",
+                                message: "Retry acknowledge_context with an actor object. Clients that preserve MCP session continuity may instead call identify_actor first.",
+                                required_action: {
+                                    tool: "acknowledge_context",
+                                    include: {
+                                        actor: {
+                                            external_id: "actor:<provider>:<name>",
+                                            name: "<display name>",
+                                            kind: "ai",
+                                        },
+                                    },
+                                },
+                            },
+                        }),
+                    }],
+                };
+            }
+            const result = await acknowledgeContextWithActor(
+                context_id,
+                actor,
+                actorSession.actorId,
+            );
+            if (result.actor) actorSession.activate(result.actor.id);
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        context_id,
+                        acknowledged: result.acknowledged,
+                        context: result.context,
+                        ...(result.actor_resolution
+                            ? { actor_resolution: result.actor_resolution }
+                            : {}),
+                    }),
+                }],
+            };
+        },
     );
 
     server.registerTool(
