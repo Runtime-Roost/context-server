@@ -6,7 +6,7 @@ Requires=personal-context-inspection.service
 [Service]
 Type=simple
 WorkingDirectory=%h/github/personal-context-server
-EnvironmentFile=%h/github/personal-context-server/.env
+EnvironmentFile=%h/.config/personal-context/inspection-mobile.env
 ExecStart=/usr/bin/node %h/github/personal-context-server/dist/inspection/mobile-server.js
 Restart=on-failure
 RestartSec=2

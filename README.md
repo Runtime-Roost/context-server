@@ -142,6 +142,9 @@ Set the `INSPECTION_MOBILE_*` values shown in `.env.example`. The TLS private
 key and per-phone bearer token must be regular mode-0600 files outside the
 repository. The gateway exposes only `GET /api/inspection` and content-only
 `PATCH /api/whiteboard/:id`; it holds no MCP, runtime, or agent credential.
+The installed user service reads those non-secret paths and bind settings from
+the mode-0600 `%h/.config/personal-context/inspection-mobile.env`; the token
+itself remains in the separate file named by `INSPECTION_MOBILE_TOKEN_PATH`.
 
 ### Actor attribution
 
