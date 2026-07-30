@@ -19,6 +19,20 @@ data class WhiteboardContext(
     val editable: Boolean,
     val blockedReason: String?,
 )
+data class ArchiveInfo(
+    val reason: String,
+    val archivedAt: String,
+    val archivedBy: Actor,
+)
+data class ArchivedContext(
+    val id: Long,
+    val content: String,
+    val source: String?,
+    val actor: Actor?,
+    val acknowledgements: List<Acknowledgement>,
+    val updatedAt: String,
+    val archive: ArchiveInfo,
+)
 data class PrivateChannel(
     val id: Long,
     val name: String,
@@ -34,6 +48,7 @@ data class PrivateEnvelope(
 )
 data class InspectionSnapshot(
     val whiteboard: List<WhiteboardContext>,
+    val archive: List<ArchivedContext>,
     val channels: List<PrivateChannel>,
     val envelopes: List<PrivateEnvelope>,
 )
@@ -58,6 +73,24 @@ class InspectionRepository(private val token: String) {
                     updatedAt = item.getString("updated_at"),
                     editable = item.getBoolean("editable"),
                     blockedReason = item.stringOrNull("edit_blocked_reason"),
+                )
+            },
+            archive = root.getJSONArray("archive").objects().map { item ->
+                val archive = item.getJSONObject("archive")
+                ArchivedContext(
+                    id = item.getLong("id"),
+                    content = item.getString("content"),
+                    source = item.stringOrNull("source"),
+                    actor = item.objectOrNull("actor")?.actor(),
+                    acknowledgements = item.getJSONArray("acknowledged_by").objects().map {
+                        Acknowledgement(it.getString("name"), it.getString("acknowledged_at"))
+                    },
+                    updatedAt = item.getString("updated_at"),
+                    archive = ArchiveInfo(
+                        reason = archive.getString("reason"),
+                        archivedAt = archive.getString("archived_at"),
+                        archivedBy = archive.getJSONObject("archived_by").actor(),
+                    ),
                 )
             },
             channels = root.getJSONArray("private_channels").objects().map { item ->
@@ -102,6 +135,24 @@ class InspectionRepository(private val token: String) {
         request(
             "DELETE",
             "/api/whiteboard/${context.id}",
+            JSONObject().put("expected_updated_at", context.updatedAt),
+        )
+    }
+
+    suspend fun archive(context: WhiteboardContext, reason: String) {
+        request(
+            "POST",
+            "/api/whiteboard/${context.id}/archive",
+            JSONObject()
+                .put("expected_updated_at", context.updatedAt)
+                .put("reason", reason),
+        )
+    }
+
+    suspend fun restore(context: ArchivedContext) {
+        request(
+            "POST",
+            "/api/archive/${context.id}/restore",
             JSONObject().put("expected_updated_at", context.updatedAt),
         )
     }

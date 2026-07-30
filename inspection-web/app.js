@@ -1,4 +1,10 @@
-const state = { snapshot: null, editing: null, deleting: null, previewing: false };
+const state = {
+  snapshot: null,
+  editing: null,
+  deleting: null,
+  archiving: null,
+  previewing: false,
+};
 const byId = (id) => document.getElementById(id);
 const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 
@@ -75,6 +81,61 @@ function renderWhiteboard(contexts) {
     remove.disabled = !context.editable;
     remove.title = context.edit_blocked_reason || "Delete this whiteboard note";
     remove.addEventListener("click", () => openDelete(context));
+    const archive = card.querySelector(".archive");
+    archive.disabled = !context.editable;
+    archive.title = context.edit_blocked_reason || "Archive this Whiteboard note";
+    archive.addEventListener("click", () => openArchive(context));
+    host.append(card);
+  }
+}
+
+function applyCollapse(content, expand, value) {
+  content.textContent = value;
+  if (value.length > 280 || value.split("\n").length > 4) {
+    expand.classList.remove("hidden");
+    expand.addEventListener("click", () => {
+      const collapsed = content.classList.toggle("collapsed");
+      expand.textContent = collapsed ? "Show more" : "Show less";
+    });
+  }
+}
+
+function renderAcknowledgements(host, values) {
+  if (values.length) {
+    const label = document.createElement("span");
+    label.className = "ack-label";
+    label.textContent = "Acknowledged by";
+    host.append(label);
+    for (const acknowledgement of values) {
+      const actor = document.createElement("span");
+      actor.className = "ack";
+      actor.textContent = acknowledgement.name;
+      actor.title = `Acknowledged ${new Date(acknowledgement.acknowledged_at).toLocaleString()}`;
+      host.append(actor);
+    }
+  } else {
+    host.textContent = "No actor acknowledgements";
+    host.classList.add("muted");
+  }
+}
+
+function renderArchive(contexts) {
+  const host = byId("archive");
+  host.replaceChildren();
+  byId("archive-count").textContent = contexts.length;
+  for (const context of contexts) {
+    const card = byId("archive-template").content.firstElementChild.cloneNode(true);
+    card.querySelector(".actor").textContent = actorName(context.actor);
+    const time = card.querySelector("time");
+    time.textContent = relativeTime(context.archive.archived_at);
+    time.dateTime = context.archive.archived_at;
+    applyCollapse(card.querySelector(".content"), card.querySelector(".expand"), context.content);
+    card.querySelector(".archive-reason p").textContent = context.archive.reason;
+    card.querySelector(".archive-reason small").textContent =
+      `Archived by ${actorName(context.archive.archived_by)} · ${new Date(context.archive.archived_at).toLocaleString()}`;
+    renderAcknowledgements(card.querySelector(".acknowledgements"), context.acknowledged_by);
+    card.querySelector(".context-id").textContent = `#${context.id} · ${context.source || "no source"}`;
+    card.querySelector(".restore").addEventListener("click", () => restoreArchive(context));
     host.append(card);
   }
 }
@@ -133,6 +194,7 @@ async function refresh({ quiet = false } = {}) {
     state.snapshot = body;
     renderWhiteboard(body.whiteboard);
     renderPrivate(body);
+    renderArchive(body.archive);
     showError("");
     byId("health").textContent = "Live";
     document.querySelector(".health i").classList.add("live");
@@ -196,6 +258,58 @@ byId("editor-form").addEventListener("submit", async (event) => {
   }
 });
 
+function openArchive(context) {
+  if (!context.editable) return;
+  state.archiving = context;
+  byId("archive-title").textContent = `Archive context #${context.id}?`;
+  byId("archive-reason").value = "";
+  byId("archive-status").textContent = "";
+  byId("archive-dialog").showModal();
+  byId("archive-reason").focus();
+}
+
+byId("archive-form").addEventListener("submit", async (event) => {
+  if (event.submitter?.value === "cancel" || !state.archiving) return;
+  event.preventDefault();
+  const button = byId("confirm-archive");
+  button.disabled = true;
+  byId("archive-status").textContent = "Archiving…";
+  try {
+    const response = await fetch(`/api/whiteboard/${state.archiving.id}/archive`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expected_updated_at: state.archiving.updated_at,
+        reason: byId("archive-reason").value,
+      }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.reason || body.error || `Archive failed (${response.status})`);
+    byId("archive-dialog").close();
+    state.archiving = null;
+    await refresh({ quiet: true });
+  } catch (error) {
+    byId("archive-status").textContent = error.message || String(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+async function restoreArchive(context) {
+  try {
+    const response = await fetch(`/api/archive/${context.id}/restore`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expected_updated_at: context.updated_at }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || `Restore failed (${response.status})`);
+    await refresh({ quiet: true });
+  } catch (error) {
+    showError(error.message || String(error));
+  }
+}
+
 function openDelete(context) {
   if (!context.editable) return;
   state.deleting = context;
@@ -233,6 +347,7 @@ document.querySelectorAll(".tabs button").forEach((button) => {
     document.querySelectorAll(".tabs button").forEach((item) => item.classList.toggle("active", item === button));
     byId("whiteboard-view").classList.toggle("hidden", button.dataset.view !== "whiteboard");
     byId("private-view").classList.toggle("hidden", button.dataset.view !== "private");
+    byId("archive-view").classList.toggle("hidden", button.dataset.view !== "archive");
   });
 });
 

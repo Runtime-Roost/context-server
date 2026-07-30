@@ -3,14 +3,18 @@ import { readFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+    archiveInspectionWhiteboardContext,
     createInspectionWhiteboardContext,
     deleteInspectionWhiteboardContext,
     getInspectionSnapshot,
+    restoreInspectionWhiteboardContext,
     updateInspectionWhiteboardContext,
     type InspectionSnapshot,
     type InspectionWhiteboardContext,
+    type WhiteboardArchiveResult,
     type WhiteboardDeleteResult,
     type WhiteboardEditResult,
+    type WhiteboardRestoreResult,
 } from "./store.js";
 
 const repositoryRoot = resolve(fileURLToPath(new URL("../../", import.meta.url)));
@@ -22,6 +26,8 @@ export type InspectionStore = {
     create(content: string): Promise<InspectionWhiteboardContext>;
     update(id: number, content: string, expectedUpdatedAt: string): Promise<WhiteboardEditResult>;
     delete(id: number, expectedUpdatedAt: string): Promise<WhiteboardDeleteResult>;
+    archive(id: number, expectedUpdatedAt: string, reason: string): Promise<WhiteboardArchiveResult>;
+    restore(id: number, expectedUpdatedAt: string): Promise<WhiteboardRestoreResult>;
 };
 
 const defaultStore: InspectionStore = {
@@ -29,6 +35,8 @@ const defaultStore: InspectionStore = {
     create: createInspectionWhiteboardContext,
     update: updateInspectionWhiteboardContext,
     delete: deleteInspectionWhiteboardContext,
+    archive: archiveInspectionWhiteboardContext,
+    restore: restoreInspectionWhiteboardContext,
 };
 
 function json(response: ServerResponse, status: number, body: unknown) {
@@ -117,6 +125,8 @@ export function createInspectionServer({
             }
 
             const edit = url.pathname.match(/^\/api\/whiteboard\/([1-9][0-9]*)$/);
+            const archive = url.pathname.match(/^\/api\/whiteboard\/([1-9][0-9]*)\/archive$/);
+            const restore = url.pathname.match(/^\/api\/archive\/([1-9][0-9]*)\/restore$/);
             if (request.method === "POST" && url.pathname === "/api/whiteboard") {
                 if (!mutationOriginAllowed(request, allowedOrigin)) {
                     json(response, 403, { error: "origin_not_allowed" });
@@ -185,6 +195,54 @@ export function createInspectionServer({
                     : result.status === "not_found" ? 404
                     : result.status === "conflict" ? 409
                     : 403;
+                json(response, status, result);
+                return;
+            }
+            if (request.method === "POST" && archive) {
+                if (!mutationOriginAllowed(request, allowedOrigin)) {
+                    json(response, 403, { error: "origin_not_allowed" });
+                    return;
+                }
+                const body = await readJson(request) as Record<string, unknown>;
+                if (
+                    typeof body.expected_updated_at !== "string"
+                    || Number.isNaN(Date.parse(body.expected_updated_at))
+                    || typeof body.reason !== "string"
+                    || body.reason.trim().length < 1
+                    || body.reason.length > 2000
+                ) {
+                    json(response, 400, { error: "invalid_whiteboard_archive" });
+                    return;
+                }
+                const result = await store.archive(
+                    Number(archive[1]),
+                    body.expected_updated_at,
+                    body.reason,
+                );
+                const status = result.status === "archived" ? 200
+                    : result.status === "not_found" ? 404
+                    : result.status === "conflict" ? 409
+                    : 403;
+                json(response, status, result);
+                return;
+            }
+            if (request.method === "POST" && restore) {
+                if (!mutationOriginAllowed(request, allowedOrigin)) {
+                    json(response, 403, { error: "origin_not_allowed" });
+                    return;
+                }
+                const body = await readJson(request) as Record<string, unknown>;
+                if (
+                    typeof body.expected_updated_at !== "string"
+                    || Number.isNaN(Date.parse(body.expected_updated_at))
+                ) {
+                    json(response, 400, { error: "invalid_whiteboard_restore" });
+                    return;
+                }
+                const result = await store.restore(Number(restore[1]), body.expected_updated_at);
+                const status = result.status === "restored" ? 200
+                    : result.status === "not_found" ? 404
+                    : 409;
                 json(response, status, result);
                 return;
             }

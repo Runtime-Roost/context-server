@@ -6,6 +6,8 @@ This native client is intentionally narrower than Agent Approval. It can:
 - create plain, unrouted Whiteboard notes;
 - edit only an existing, server-approved Whiteboard body;
 - delete only an existing, server-approved Whiteboard note;
+- archive an ordinary note with a required, actor-attributed reason;
+- view archived notes and restore them to the Whiteboard;
 - list private channel/message envelopes without bodies.
 
 It has no agent, task, wake, approval, message-send, tag, source, visibility, or

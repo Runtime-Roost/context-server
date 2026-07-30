@@ -71,10 +71,17 @@ dialog { width: min(720px, calc(100% - 28px)); padding: 0; border: 1px solid var
 dialog::backdrop { background: rgba(17, 29, 23, .48); backdrop-filter: blur(3px); }
 #editor-form { padding: 24px; }
 #delete-form { padding: 24px; }
+#archive-form { padding: 24px; }
 .dialog-topline, .dialog-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .edit-note { color: var(--muted); font-size: 13px; line-height: 1.5; }
 textarea { display: block; width: 100%; min-height: 320px; resize: vertical; padding: 16px; border: 1px solid var(--line); border-radius: 13px; background: white; color: var(--ink); font: 17px/1.55 Georgia, serif; }
 .note-preview { min-height: 320px; max-height: 55vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 16px; border: 1px solid var(--line); border-radius: 13px; background: white; font: 17px/1.55 Georgia, serif; }
+.reason-input { min-height: 130px; font-family: inherit; font-size: 15px; }
+.archived-card { border-color: #c9d8ce; }
+.archive-reason { margin: 12px 0; padding: 13px; border-radius: 12px; background: var(--forest-soft); }
+.archive-reason span { color: var(--forest); font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.archive-reason p { margin: 7px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.archive-reason small { color: var(--muted); }
 .dialog-actions { justify-content: flex-end; margin-top: 15px; }
 #editor-status { flex: 1; color: #923f3a; font-size: 12px; }
 

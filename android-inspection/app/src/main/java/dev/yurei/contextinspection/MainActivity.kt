@@ -4,6 +4,8 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -80,7 +82,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class View { WHITEBOARD, PRIVATE }
+private enum class View { WHITEBOARD, PRIVATE, ARCHIVE }
 
 @Composable
 private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
@@ -102,6 +104,7 @@ private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
     var editing by remember { mutableStateOf<WhiteboardContext?>(null) }
     var creating by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf<WhiteboardContext?>(null) }
+    var archiving by remember { mutableStateOf<WhiteboardContext?>(null) }
 
     suspend fun refresh() {
         runCatching { repository.snapshot() }
@@ -122,7 +125,10 @@ private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
         item { Header(error == null && snapshot != null) }
         error?.let { item { ErrorCard(it) } }
         item {
-            Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                Modifier.padding(horizontal = 16.dp).horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 FilterChip(
                     selected = view == View.WHITEBOARD,
                     onClick = { view = View.WHITEBOARD },
@@ -133,9 +139,18 @@ private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
                     onClick = { view = View.PRIVATE },
                     label = { Text("Private mail ${snapshot?.envelopes?.size ?: "—"}") },
                 )
-                Spacer(Modifier.weight(1f))
-                TextButton(onClick = { scope.launch { refresh() } }) { Text("Refresh") }
+                FilterChip(
+                    selected = view == View.ARCHIVE,
+                    onClick = { view = View.ARCHIVE },
+                    label = { Text("Archive ${snapshot?.archive?.size ?: "—"}") },
+                )
             }
+        }
+        item {
+            TextButton(
+                onClick = { scope.launch { refresh() } },
+                modifier = Modifier.padding(horizontal = 8.dp),
+            ) { Text("Refresh") }
         }
         if (view == View.WHITEBOARD) {
             item {
@@ -150,10 +165,11 @@ private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
                         context,
                         onEdit = { editing = context },
                         onDelete = { deleting = context },
+                        onArchive = { archiving = context },
                     )
                 }
             }
-        } else {
+        } else if (view == View.PRIVATE) {
             item {
                 Text(
                     "Bodies withheld by server",
@@ -167,6 +183,26 @@ private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
             }
             snapshot?.envelopes?.let { envelopes ->
                 items(envelopes, key = { "envelope-${it.id}" }) { PrivateEnvelopeCard(it) }
+            }
+        } else {
+            item {
+                Text(
+                    "Archived notes keep their author, acknowledgements, and attributed reason.",
+                    color = Forest,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 18.dp),
+                )
+            }
+            snapshot?.archive?.let { contexts ->
+                items(contexts, key = { "archive-${it.id}" }) { context ->
+                    ArchiveCard(context) {
+                        scope.launch {
+                            runCatching { repository.restore(context) }
+                                .onSuccess { refresh() }
+                                .onFailure { error = it.message ?: "Restore failed" }
+                        }
+                    }
+                }
             }
         }
         item { Spacer(Modifier.size(24.dp)) }
@@ -202,6 +238,19 @@ private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
                 }) { Text("Delete note") }
             },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("Keep note") } },
+        )
+    }
+    archiving?.let { context ->
+        ArchiveDialog(
+            context = context,
+            dismiss = { archiving = null },
+            archive = { reason ->
+                scope.launch {
+                    runCatching { repository.archive(context, reason) }
+                        .onSuccess { archiving = null; refresh() }
+                        .onFailure { error = it.message ?: "Archive failed" }
+                }
+            },
         )
     }
 }
@@ -271,6 +320,7 @@ private fun WhiteboardCard(
     context: WhiteboardContext,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
+    onArchive: () -> Unit,
 ) {
     var expanded by remember(context.id) { mutableStateOf(false) }
     val long = context.content.length > 120 || context.content.count { it == '\n' } > 2
@@ -320,6 +370,7 @@ private fun WhiteboardCard(
                     modifier = Modifier.weight(1f).padding(end = 8.dp),
                 )
                 Row {
+                    TextButton(onClick = onArchive, enabled = context.editable) { Text("Archive") }
                     TextButton(onClick = onDelete, enabled = context.editable) { Text("Delete") }
                     OutlinedButton(
                         onClick = onEdit,
@@ -329,6 +380,96 @@ private fun WhiteboardCard(
             }
         }
     }
+}
+
+@Composable
+private fun ArchiveCard(context: ArchivedContext, restore: () -> Unit) {
+    var expanded by remember(context.id) { mutableStateOf(false) }
+    val long = context.content.length > 120 || context.content.count { it == '\n' } > 2
+    Card(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = AmberSoft),
+    ) {
+        Column(Modifier.padding(18.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(context.actor?.name ?: "Unattributed", fontWeight = FontWeight.Bold)
+                Text(formatTime(context.archive.archivedAt), color = Muted, fontSize = 11.sp)
+            }
+            Text(
+                context.content,
+                fontFamily = FontFamily.Serif,
+                fontSize = 16.sp,
+                lineHeight = 23.sp,
+                maxLines = if (expanded) Int.MAX_VALUE else 4,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(vertical = 16.dp),
+            )
+            if (long) {
+                TextButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "Show less" else "Show more")
+                }
+            }
+            Label("ARCHIVED BECAUSE")
+            Text(context.archive.reason, color = Ink, modifier = Modifier.padding(vertical = 6.dp))
+            Text(
+                "Archived by ${context.archive.archivedBy.name} · ${formatTime(context.archive.archivedAt)}",
+                color = Amber,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Color(0xFFD9DED9))
+            Text(
+                if (context.acknowledgements.isEmpty()) "No actor acknowledgements"
+                else "Acknowledged by ${context.acknowledgements.joinToString { it.name }}",
+                color = if (context.acknowledgements.isEmpty()) Muted else Forest,
+                fontSize = 11.sp,
+            )
+            Row(
+                Modifier.fillMaxWidth().padding(top = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("#${context.id} · ${context.source ?: "no source"}", color = Muted, fontSize = 11.sp)
+                OutlinedButton(onClick = restore) { Text("Restore") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ArchiveDialog(
+    context: WhiteboardContext,
+    dismiss: () -> Unit,
+    archive: (String) -> Unit,
+) {
+    var reason by remember(context.id) { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text("Archive context #${context.id}?", fontFamily = FontFamily.Serif) },
+        text = {
+            Column {
+                Text(
+                    "The note leaves the active Whiteboard. Your actor identity, this reason, and the note history are retained.",
+                    color = Muted,
+                    fontSize = 12.sp,
+                )
+                OutlinedTextField(
+                    value = reason,
+                    onValueChange = { reason = it },
+                    label = { Text("Reason") },
+                    placeholder = { Text("Project completed, superseded, no longer active…") },
+                    minLines = 4,
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = { archive(reason) }, enabled = reason.isNotBlank()) {
+                Text("Archive note")
+            }
+        },
+        dismissButton = { TextButton(onClick = dismiss) { Text("Keep active") } },
+    )
 }
 
 @Composable

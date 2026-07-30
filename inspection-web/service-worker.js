@@ -1,4 +1,4 @@
-const CACHE = "inspection-v2";
+const CACHE = "inspection-v3";
 const ASSETS = ["/", "/styles.css", "/app.js", "/manifest.json", "/mark.svg"];
 self.addEventListener("install", (event) => event.waitUntil(
   caches.open(CACHE).then((cache) => cache.addAll(ASSETS)),

@@ -69,6 +69,7 @@ export const CONTEXT_VISIBILITY_VALUES = [
     "personal",
     "system",
     "group",
+    "archived",
 ] as const;
 export type ContextVisibility = (typeof CONTEXT_VISIBILITY_VALUES)[number];
 export const WRITABLE_CONTEXT_VISIBILITY_VALUES = ["whiteboard"] as const;

@@ -24,6 +24,7 @@
       <nav class="tabs" aria-label="Inspection views">
         <button class="active" data-view="whiteboard">Whiteboard <span id="whiteboard-count">—</span></button>
         <button data-view="private">Private mail <span id="private-count">—</span></button>
+        <button data-view="archive">Archive <span id="archive-count">—</span></button>
       </nav>
 
       <section id="error" class="error hidden" role="alert"></section>
@@ -52,6 +53,17 @@
         </div>
         <div id="channels" class="channels"></div>
         <div id="private-messages" class="message-list"></div>
+      </section>
+
+      <section id="archive-view" class="view hidden">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">DURABLE HISTORY</p>
+            <h2>Note archive</h2>
+          </div>
+          <span class="privacy-seal">Restorable · attributed reasons</span>
+        </div>
+        <div id="archive" class="context-grid"></div>
       </section>
     </main>
 
@@ -89,6 +101,20 @@
       </form>
     </dialog>
 
+    <dialog id="archive-dialog">
+      <form method="dialog" id="archive-form">
+        <p class="eyebrow">ARCHIVE WHITEBOARD NOTE</p>
+        <h2 id="archive-title">Archive context?</h2>
+        <p>Explain why this note is leaving the active Whiteboard. The reason and your actor identity become durable history.</p>
+        <textarea id="archive-reason" class="reason-input" maxlength="2000" required placeholder="Project completed, information superseded, no longer active…"></textarea>
+        <div class="dialog-actions">
+          <span id="archive-status"></span>
+          <button class="quiet-button" value="cancel">Keep active</button>
+          <button id="confirm-archive" class="primary-button" value="default">Archive note</button>
+        </div>
+      </form>
+    </dialog>
+
     <template id="context-template">
       <article class="context-card">
         <div class="context-topline">
@@ -102,9 +128,31 @@
         <div class="context-footer">
           <span class="context-id"></span>
           <div>
+            <button class="archive button-link">Archive</button>
             <button class="delete button-link danger-text">Delete</button>
             <button class="edit quiet-button">Edit body</button>
           </div>
+        </div>
+      </article>
+    </template>
+
+    <template id="archive-template">
+      <article class="context-card archived-card">
+        <div class="context-topline">
+          <span class="actor"></span>
+          <time></time>
+        </div>
+        <p class="content collapsed"></p>
+        <button class="expand button-link hidden">Show more</button>
+        <div class="archive-reason">
+          <span>Archived because</span>
+          <p></p>
+          <small></small>
+        </div>
+        <div class="acknowledgements"></div>
+        <div class="context-footer">
+          <span class="context-id"></span>
+          <button class="restore primary-button">Restore to Whiteboard</button>
         </div>
       </article>
     </template>

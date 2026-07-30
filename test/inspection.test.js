@@ -7,17 +7,26 @@ import test from "node:test";
 
 import { createInspectionServer } from "../dist/inspection/server.js";
 import {
+    archiveInspectionWhiteboardContext,
     createInspectionWhiteboardContext,
     deleteInspectionWhiteboardContext,
     getInspectionSnapshot,
+    restoreInspectionWhiteboardContext,
     updateInspectionWhiteboardContext,
 } from "../dist/inspection/store.js";
 import { db } from "../dist/storage/db.js";
-import { saveContext } from "../dist/mcp/tools.js";
+import {
+    acknowledgeContextWithActor,
+    getContext,
+    listRecentContext,
+    saveContext,
+    searchContext,
+} from "../dist/mcp/tools.js";
 
 const snapshot = {
     generated_at: "2026-07-30T00:00:00.000Z",
     whiteboard: [],
+    archive: [],
     private_channels: [],
     private_messages: [],
     privacy: { private_message_contents_exposed: false },
@@ -48,6 +57,8 @@ test("inspection server exposes snapshot and no agent-control routes", async () 
         create: async () => assert.fail("create should not be called"),
         update: async () => ({ status: "not_found" }),
         delete: async () => assert.fail("delete should not be called"),
+        archive: async () => assert.fail("archive should not be called"),
+        restore: async () => assert.fail("restore should not be called"),
     };
     await withServer(store, async (origin) => {
         const response = await fetch(`${origin}/api/inspection`);
@@ -72,6 +83,11 @@ test("whiteboard edit is body-only, same-origin, and forwards the expected versi
             };
         },
         delete: async (id) => ({ status: "deleted", id }),
+        archive: async (id, expectedUpdatedAt, reason) => ({
+            status: "archived",
+            context: { id, updated_at: expectedUpdatedAt, archive: { reason } },
+        }),
+        restore: async (id) => ({ status: "restored", context: { id } }),
     };
     await withServer(store, async (origin) => {
         const blocked = await fetch(`${origin}/api/whiteboard/42`, {
@@ -127,6 +143,32 @@ test("whiteboard edit is body-only, same-origin, and forwards the expected versi
             body: JSON.stringify({ expected_updated_at: "2026-07-30T00:00:00.000Z" }),
         });
         assert.equal(deleted.status, 200);
+
+        const archived = await fetch(`${origin}/api/whiteboard/43/archive`, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                origin: "http://127.0.0.1:4180",
+                "sec-fetch-site": "same-origin",
+            },
+            body: JSON.stringify({
+                expected_updated_at: "2026-07-30T00:00:00.000Z",
+                reason: "Project completed",
+            }),
+        });
+        assert.equal(archived.status, 200);
+        assert.equal((await archived.json()).context.archive.reason, "Project completed");
+
+        const restored = await fetch(`${origin}/api/archive/43/restore`, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                origin: "http://127.0.0.1:4180",
+                "sec-fetch-site": "same-origin",
+            },
+            body: JSON.stringify({ expected_updated_at: "2026-07-30T00:00:00.000Z" }),
+        });
+        assert.equal(restored.status, 200);
     });
 });
 
@@ -168,8 +210,76 @@ test("agent-inbox Whiteboard records are visible but not editable", async () => 
         assert.equal(result.context.content, marker);
         const deletion = await deleteInspectionWhiteboardContext(saved.id, saved.updated_at);
         assert.equal(deletion.status, "blocked");
+        const archive = await archiveInspectionWhiteboardContext(
+            saved.id,
+            saved.updated_at,
+            "Must remain in the inbox",
+        );
+        assert.equal(archive.status, "blocked");
     } finally {
         await db.query("DELETE FROM contexts WHERE id = $1", [saved.id]);
+    }
+});
+
+test("archiving removes a note from the Whiteboard while preserving attribution, acknowledgements, and reason", async () => {
+    const marker = `inspection-archive-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const created = await createInspectionWhiteboardContext(marker);
+    try {
+        await acknowledgeContextWithActor(created.id, {
+            external_id: "actor:test:archive-ack",
+            name: "Archive Acknowledger",
+            kind: "agent",
+        });
+        const archived = await archiveInspectionWhiteboardContext(
+            created.id,
+            created.updated_at,
+            "Project completed and retained for reference",
+        );
+        assert.equal(archived.status, "archived");
+        assert.equal(archived.context.archive.reason, "Project completed and retained for reference");
+        assert.equal(archived.context.archive.archived_by.external_id, "actor:human:blake");
+        assert.equal(archived.context.actor.external_id, "actor:human:blake");
+        assert.deepEqual(
+            archived.context.acknowledged_by.map((actor) => actor.external_id),
+            ["actor:test:archive-ack"],
+        );
+        assert.equal(await getContext(created.id), null);
+        assert.ok(!(await listRecentContext(500)).some((context) => context.id === created.id));
+        assert.ok(!(await searchContext(marker, 500)).some((context) => context.id === created.id));
+
+        const snapshot = await getInspectionSnapshot(500);
+        assert.ok(!snapshot.whiteboard.some((context) => context.id === created.id));
+        assert.equal(
+            snapshot.archive.find((context) => context.id === created.id)?.archive.reason,
+            "Project completed and retained for reference",
+        );
+
+        const restored = await restoreInspectionWhiteboardContext(
+            created.id,
+            archived.context.updated_at,
+        );
+        assert.equal(restored.status, "restored");
+        assert.equal(restored.context.content, marker);
+        assert.equal((await getContext(created.id))?.visibility, "whiteboard");
+
+        const history = await db.query(
+            `
+                SELECT
+                    reason,
+                    restored_at IS NOT NULL AS restored,
+                    actors.external_id AS restored_by
+                FROM context_archives
+                LEFT JOIN actors ON actors.id = context_archives.restored_by_actor_id
+                WHERE context_id = $1
+            `,
+            [created.id],
+        );
+        assert.equal(history.rowCount, 1);
+        assert.equal(history.rows[0].reason, "Project completed and retained for reference");
+        assert.equal(history.rows[0].restored, true);
+        assert.equal(history.rows[0].restored_by, "actor:human:blake");
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = $1", [created.id]);
     }
 });
 

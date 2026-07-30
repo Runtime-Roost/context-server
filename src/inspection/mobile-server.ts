@@ -46,6 +46,10 @@ export function createInspectionMobileServer({
         const path = request.url ?? "";
         const allowed = (request.method === "GET" && path === "/api/inspection")
             || (request.method === "POST" && path === "/api/whiteboard")
+            || (request.method === "POST"
+                && /^\/api\/whiteboard\/[1-9][0-9]*\/archive$/.test(path))
+            || (request.method === "POST"
+                && /^\/api\/archive\/[1-9][0-9]*\/restore$/.test(path))
             || (["PATCH", "DELETE"].includes(request.method ?? "")
                 && /^\/api\/whiteboard\/[1-9][0-9]*$/.test(path));
         if (!allowed || !authorized(request.headers.authorization, token)) {
