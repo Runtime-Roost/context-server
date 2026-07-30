@@ -1,6 +1,11 @@
 import { maybeSaveContextEmbedding } from "../embeddings/index.js";
 import { db, initializeDatabase } from "../storage/db.js";
-import { getContext, listRecentContext, type ContextRecord } from "../mcp/tools.js";
+import {
+    getContext,
+    listRecentContext,
+    saveContextWithActor,
+    type ContextRecord,
+} from "../mcp/tools.js";
 
 export type InspectionWhiteboardContext = ContextRecord & {
     editable: boolean;
@@ -230,6 +235,24 @@ export type WhiteboardEditResult =
     | { status: "conflict"; context: InspectionWhiteboardContext }
     | { status: "blocked"; reason: string; context: InspectionWhiteboardContext };
 
+export async function createInspectionWhiteboardContext(
+    content: string,
+): Promise<InspectionWhiteboardContext> {
+    const result = await saveContextWithActor(
+        content,
+        [],
+        "inspection-tool",
+        {
+            external_id: "actor:human:blake",
+            name: "Blake",
+            kind: "human",
+        },
+        null,
+        "whiteboard",
+    );
+    return inspectionContext(result.context);
+}
+
 export async function updateInspectionWhiteboardContext(
     id: number,
     content: string,
@@ -273,4 +296,45 @@ export async function updateInspectionWhiteboardContext(
     if (!updated) return { status: "not_found" };
     await maybeSaveContextEmbedding(updated);
     return { status: "updated", context: inspectionContext(updated) };
+}
+
+export type WhiteboardDeleteResult =
+    | { status: "deleted"; id: number }
+    | { status: "not_found" }
+    | { status: "conflict"; context: InspectionWhiteboardContext }
+    | { status: "blocked"; reason: string; context: InspectionWhiteboardContext };
+
+export async function deleteInspectionWhiteboardContext(
+    id: number,
+    expectedUpdatedAt: string,
+): Promise<WhiteboardDeleteResult> {
+    await initializeDatabase();
+    const existing = await getContext(id);
+    if (!existing) return { status: "not_found" };
+    const visible = inspectionContext(existing);
+    if (!visible.editable) {
+        return {
+            status: "blocked",
+            reason: "This note is an agent inbox item. Deleting it could change invocation delivery.",
+            context: visible,
+        };
+    }
+    if (existing.updated_at !== expectedUpdatedAt) {
+        return { status: "conflict", context: visible };
+    }
+    const result = await db.query(
+        `
+            DELETE FROM contexts
+            WHERE id = $1
+              AND visibility = 'whiteboard'
+              AND updated_at = $2::timestamptz
+            RETURNING id
+        `,
+        [id, expectedUpdatedAt],
+    );
+    if (result.rowCount === 1) return { status: "deleted", id };
+    const latest = await getContext(id);
+    return latest
+        ? { status: "conflict", context: inspectionContext(latest) }
+        : { status: "not_found" };
 }

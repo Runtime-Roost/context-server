@@ -7,6 +7,8 @@ import test from "node:test";
 
 import { createInspectionServer } from "../dist/inspection/server.js";
 import {
+    createInspectionWhiteboardContext,
+    deleteInspectionWhiteboardContext,
     getInspectionSnapshot,
     updateInspectionWhiteboardContext,
 } from "../dist/inspection/store.js";
@@ -43,7 +45,9 @@ async function withServer(store, callback) {
 test("inspection server exposes snapshot and no agent-control routes", async () => {
     const store = {
         snapshot: async () => snapshot,
+        create: async () => assert.fail("create should not be called"),
         update: async () => ({ status: "not_found" }),
+        delete: async () => assert.fail("delete should not be called"),
     };
     await withServer(store, async (origin) => {
         const response = await fetch(`${origin}/api/inspection`);
@@ -59,6 +63,7 @@ test("whiteboard edit is body-only, same-origin, and forwards the expected versi
     const calls = [];
     const store = {
         snapshot: async () => snapshot,
+        create: async (content) => ({ id: 43, content }),
         update: async (...args) => {
             calls.push(args);
             return {
@@ -66,6 +71,7 @@ test("whiteboard edit is body-only, same-origin, and forwards the expected versi
                 context: { id: args[0], content: args[1] },
             };
         },
+        delete: async (id) => ({ status: "deleted", id }),
     };
     await withServer(store, async (origin) => {
         const blocked = await fetch(`${origin}/api/whiteboard/42`, {
@@ -98,6 +104,29 @@ test("whiteboard edit is body-only, same-origin, and forwards the expected versi
         });
         assert.equal(accepted.status, 200);
         assert.deepEqual(calls, [[42, "changed", "2026-07-30T00:00:00.000Z"]]);
+
+        const created = await fetch(`${origin}/api/whiteboard`, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                origin: "http://127.0.0.1:4180",
+                "sec-fetch-site": "same-origin",
+            },
+            body: JSON.stringify({ content: "new note", tags: ["ignored"] }),
+        });
+        assert.equal(created.status, 201);
+        assert.equal((await created.json()).context.content, "new note");
+
+        const deleted = await fetch(`${origin}/api/whiteboard/43`, {
+            method: "DELETE",
+            headers: {
+                "content-type": "application/json",
+                origin: "http://127.0.0.1:4180",
+                "sec-fetch-site": "same-origin",
+            },
+            body: JSON.stringify({ expected_updated_at: "2026-07-30T00:00:00.000Z" }),
+        });
+        assert.equal(deleted.status, 200);
     });
 });
 
@@ -137,7 +166,27 @@ test("agent-inbox Whiteboard records are visible but not editable", async () => 
         assert.equal(result.status, "blocked");
         assert.match(result.reason, /invocation payload/i);
         assert.equal(result.context.content, marker);
+        const deletion = await deleteInspectionWhiteboardContext(saved.id, saved.updated_at);
+        assert.equal(deletion.status, "blocked");
     } finally {
         await db.query("DELETE FROM contexts WHERE id = $1", [saved.id]);
+    }
+});
+
+test("inspection-created notes are plain attributed Whiteboard records and can be deleted", async () => {
+    const marker = `inspection-create-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const created = await createInspectionWhiteboardContext(marker);
+    try {
+        assert.equal(created.content, marker);
+        assert.equal(created.visibility, "whiteboard");
+        assert.deepEqual(created.tags, []);
+        assert.equal(created.source, "inspection-tool");
+        assert.equal(created.actor.external_id, "actor:human:blake");
+        const deleted = await deleteInspectionWhiteboardContext(created.id, created.updated_at);
+        assert.deepEqual(deleted, { status: "deleted", id: created.id });
+        assert.equal(await db.query("SELECT id FROM contexts WHERE id = $1", [created.id])
+            .then((result) => result.rowCount), 0);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = $1", [created.id]);
     }
 });

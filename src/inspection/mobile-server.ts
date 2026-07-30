@@ -45,7 +45,9 @@ export function createInspectionMobileServer({
     return createServer({ key, cert, minVersion: "TLSv1.3" }, (request, response) => {
         const path = request.url ?? "";
         const allowed = (request.method === "GET" && path === "/api/inspection")
-            || (request.method === "PATCH" && /^\/api\/whiteboard\/[1-9][0-9]*$/.test(path));
+            || (request.method === "POST" && path === "/api/whiteboard")
+            || (["PATCH", "DELETE"].includes(request.method ?? "")
+                && /^\/api\/whiteboard\/[1-9][0-9]*$/.test(path));
         if (!allowed || !authorized(request.headers.authorization, token)) {
             response.writeHead(allowed ? 401 : 404, {
                 "content-type": "application/json",
@@ -65,6 +67,9 @@ export function createInspectionMobileServer({
                 "sec-fetch-site": "same-origin",
                 ...(request.headers["content-type"]
                     ? { "content-type": request.headers["content-type"] }
+                    : {}),
+                ...(request.headers["content-length"]
+                    ? { "content-length": request.headers["content-length"] }
                     : {}),
             },
             timeout: 12_000,

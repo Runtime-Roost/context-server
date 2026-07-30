@@ -34,7 +34,10 @@
             <p class="eyebrow">SHARED MEMORY</p>
             <h2>Whiteboard</h2>
           </div>
-          <button id="refresh" class="quiet-button">Refresh</button>
+          <div class="heading-actions">
+            <button id="refresh" class="quiet-button">Refresh</button>
+            <button id="new-note" class="primary-button">New note</button>
+          </div>
         </div>
         <div id="whiteboard" class="context-grid" aria-live="polite"></div>
       </section>
@@ -63,10 +66,25 @@
         </div>
         <p class="edit-note">Only the note body can change. Actor, source, visibility, and routing tags stay server-owned.</p>
         <textarea id="editor-content" maxlength="1000000" required></textarea>
+        <div id="editor-preview" class="note-preview hidden"></div>
         <div class="dialog-actions">
           <span id="editor-status"></span>
+          <button id="toggle-preview" class="quiet-button" type="button">Preview</button>
           <button class="quiet-button" value="cancel">Cancel</button>
           <button id="save" class="primary-button" value="default">Save changes</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="delete-dialog">
+      <form method="dialog" id="delete-form">
+        <p class="eyebrow">DELETE WHITEBOARD NOTE</p>
+        <h2 id="delete-title">Delete context?</h2>
+        <p>This removes the note and its acknowledgements. Agent inbox notes cannot be deleted here.</p>
+        <div class="dialog-actions">
+          <span id="delete-status"></span>
+          <button class="quiet-button" value="cancel">Keep note</button>
+          <button id="confirm-delete" class="danger-button" value="default">Delete note</button>
         </div>
       </form>
     </dialog>
@@ -77,12 +95,16 @@
           <span class="actor"></span>
           <time></time>
         </div>
-        <p class="content"></p>
+        <p class="content collapsed"></p>
+        <button class="expand button-link hidden">Show more</button>
         <div class="tags"></div>
         <div class="acknowledgements"></div>
         <div class="context-footer">
           <span class="context-id"></span>
-          <button class="edit quiet-button">Edit body</button>
+          <div>
+            <button class="delete button-link danger-text">Delete</button>
+            <button class="edit quiet-button">Edit body</button>
+          </div>
         </div>
       </article>
     </template>

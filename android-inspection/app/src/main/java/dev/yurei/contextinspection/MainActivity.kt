@@ -38,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -99,6 +100,8 @@ private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var view by remember { mutableStateOf(View.WHITEBOARD) }
     var editing by remember { mutableStateOf<WhiteboardContext?>(null) }
+    var creating by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf<WhiteboardContext?>(null) }
 
     suspend fun refresh() {
         runCatching { repository.snapshot() }
@@ -135,9 +138,19 @@ private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
             }
         }
         if (view == View.WHITEBOARD) {
+            item {
+                Button(
+                    onClick = { creating = true },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                ) { Text("Create new note") }
+            }
             snapshot?.whiteboard?.let { contexts ->
                 items(contexts, key = { "whiteboard-${it.id}" }) { context ->
-                    WhiteboardCard(context, onEdit = { editing = context })
+                    WhiteboardCard(
+                        context,
+                        onEdit = { editing = context },
+                        onDelete = { deleting = context },
+                    )
                 }
             }
         } else {
@@ -159,17 +172,36 @@ private fun InspectionApp(initialToken: String, saveToken: (String) -> Unit) {
         item { Spacer(Modifier.size(24.dp)) }
     }
 
-    editing?.let { context ->
-        EditDialog(
-            context = context,
-            dismiss = { editing = null },
+    if (creating || editing != null) {
+        NoteEditorDialog(
+            context = editing,
+            dismiss = { editing = null; creating = false },
             save = { content ->
                 scope.launch {
-                    runCatching { repository.update(context, content) }
-                        .onSuccess { editing = null; refresh() }
+                    runCatching {
+                        editing?.let { repository.update(it, content) } ?: repository.create(content)
+                    }
+                        .onSuccess { editing = null; creating = false; refresh() }
                         .onFailure { error = it.message ?: "Save failed" }
                 }
             },
+        )
+    }
+    deleting?.let { context ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text("Delete context #${context.id}?", fontFamily = FontFamily.Serif) },
+            text = { Text("This removes the note and its acknowledgements. Agent inbox notes cannot be deleted here.") },
+            confirmButton = {
+                Button(onClick = {
+                    scope.launch {
+                        runCatching { repository.delete(context) }
+                            .onSuccess { deleting = null; refresh() }
+                            .onFailure { error = it.message ?: "Delete failed" }
+                    }
+                }) { Text("Delete note") }
+            },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text("Keep note") } },
         )
     }
 }
@@ -235,7 +267,13 @@ private fun ErrorCard(message: String) {
 }
 
 @Composable
-private fun WhiteboardCard(context: WhiteboardContext, onEdit: () -> Unit) {
+private fun WhiteboardCard(
+    context: WhiteboardContext,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    var expanded by remember(context.id) { mutableStateOf(false) }
+    val long = context.content.length > 120 || context.content.count { it == '\n' } > 2
     Card(
         Modifier.fillMaxWidth().padding(horizontal = 16.dp),
         shape = RoundedCornerShape(18.dp),
@@ -249,10 +287,17 @@ private fun WhiteboardCard(context: WhiteboardContext, onEdit: () -> Unit) {
             Text(
                 context.content,
                 fontFamily = FontFamily.Serif,
-                fontSize = 17.sp,
-                lineHeight = 25.sp,
+                fontSize = 16.sp,
+                lineHeight = 23.sp,
+                maxLines = if (expanded) Int.MAX_VALUE else 4,
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(vertical = 16.dp),
             )
+            if (long) {
+                TextButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "Show less" else "Show more")
+                }
+            }
             if (context.tags.isNotEmpty()) {
                 Text(context.tags.joinToString("  ·  "), color = Muted, fontSize = 11.sp)
             }
@@ -268,11 +313,19 @@ private fun WhiteboardCard(context: WhiteboardContext, onEdit: () -> Unit) {
                 Modifier.fillMaxWidth().padding(top = 12.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Text("#${context.id} · ${context.source ?: "no source"}", color = Muted, fontSize = 11.sp)
-                OutlinedButton(
-                    onClick = onEdit,
-                    enabled = context.editable,
-                ) { Text(if (context.editable) "Edit body" else "Inbox note") }
+                Text(
+                    "#${context.id} · ${context.source ?: "no source"}",
+                    color = Muted,
+                    fontSize = 11.sp,
+                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                )
+                Row {
+                    TextButton(onClick = onDelete, enabled = context.editable) { Text("Delete") }
+                    OutlinedButton(
+                        onClick = onEdit,
+                        enabled = context.editable,
+                    ) { Text(if (context.editable) "Edit body" else "Inbox note") }
+                }
             }
         }
     }
@@ -325,15 +378,21 @@ private fun PrivateEnvelopeCard(envelope: PrivateEnvelope) {
 }
 
 @Composable
-private fun EditDialog(
-    context: WhiteboardContext,
+private fun NoteEditorDialog(
+    context: WhiteboardContext?,
     dismiss: () -> Unit,
     save: (String) -> Unit,
 ) {
-    var content by remember(context.id) { mutableStateOf(context.content) }
+    var content by remember(context?.id) { mutableStateOf(context?.content.orEmpty()) }
+    var preview by remember(context?.id) { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = dismiss,
-        title = { Text("Edit context #${context.id}", fontFamily = FontFamily.Serif) },
+        title = {
+            Text(
+                context?.let { "Edit context #${it.id}" } ?: "Create a Whiteboard note",
+                fontFamily = FontFamily.Serif,
+            )
+        },
         text = {
             Column {
                 Text(
@@ -341,15 +400,33 @@ private fun EditDialog(
                     color = Muted,
                     fontSize = 12.sp,
                 )
-                OutlinedTextField(
-                    value = content,
-                    onValueChange = { content = it },
-                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                    minLines = 8,
-                )
+                if (preview) {
+                    Text(
+                        content.ifBlank { "Nothing to preview yet." },
+                        fontFamily = FontFamily.Serif,
+                        fontSize = 16.sp,
+                        lineHeight = 23.sp,
+                        modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = content,
+                        onValueChange = { content = it },
+                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                        minLines = 8,
+                    )
+                }
+                TextButton(onClick = { preview = !preview }) {
+                    Text(if (preview) "Back to edit" else "Preview")
+                }
             }
         },
-        confirmButton = { Button(onClick = { save(content) }) { Text("Save changes") } },
+        confirmButton = {
+            Button(
+                onClick = { save(content) },
+                enabled = content.isNotBlank(),
+            ) { Text(if (context == null) "Create note" else "Save changes") }
+        },
         dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
     )
 }

@@ -121,9 +121,11 @@ It listens only on `http://127.0.0.1:4180` by default. The browser receives
 Whiteboard records, attribution, and actor acknowledgements. It may edit only
 the body of an existing Whiteboard note, using optimistic concurrency. Source,
 tags, visibility, and actor attribution remain server-owned. Notes carrying a
-`message-to-*` inbox tag are read-only because changing their body could alter
-an agent invocation payload. There are no create, wake, submit, approve, or
-agent-control routes.
+`message-to-*` inbox tag are read-only because changing or deleting them could
+alter agent delivery. New notes are plain Whiteboard records attributed to
+`actor:human:blake`, with no tags and the fixed source `inspection-tool`.
+Deletion is version-checked and uses the same inbox guard. There are no wake,
+submit, approve, or agent-control routes.
 
 Private channel and direct-message bodies are excluded in SQL, not merely
 hidden by the UI. The Inspection API returns only an envelope: channel,
@@ -140,8 +142,9 @@ npm run inspection:mobile
 
 Set the `INSPECTION_MOBILE_*` values shown in `.env.example`. The TLS private
 key and per-phone bearer token must be regular mode-0600 files outside the
-repository. The gateway exposes only `GET /api/inspection` and content-only
-`PATCH /api/whiteboard/:id`; it holds no MCP, runtime, or agent credential.
+repository. The gateway exposes only `GET /api/inspection` and the bounded
+Whiteboard create/body-update/delete routes; it holds no MCP, runtime, or agent
+credential.
 The installed user service reads those non-secret paths and bind settings from
 the mode-0600 `%h/.config/personal-context/inspection-mobile.env`; the token
 itself remains in the separate file named by `INSPECTION_MOBILE_TOKEN_PATH`.

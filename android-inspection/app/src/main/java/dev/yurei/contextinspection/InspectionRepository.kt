@@ -90,6 +90,22 @@ class InspectionRepository(private val token: String) {
         )
     }
 
+    suspend fun create(content: String) {
+        request(
+            "POST",
+            "/api/whiteboard",
+            JSONObject().put("content", content),
+        )
+    }
+
+    suspend fun delete(context: WhiteboardContext) {
+        request(
+            "DELETE",
+            "/api/whiteboard/${context.id}",
+            JSONObject().put("expected_updated_at", context.updatedAt),
+        )
+    }
+
     private suspend fun request(method: String, path: String, body: JSONObject? = null): JSONObject =
         withContext(Dispatchers.IO) {
             require(token.length >= 32) { "Phone is not enrolled" }

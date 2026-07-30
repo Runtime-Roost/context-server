@@ -3,9 +3,13 @@ import { readFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+    createInspectionWhiteboardContext,
+    deleteInspectionWhiteboardContext,
     getInspectionSnapshot,
     updateInspectionWhiteboardContext,
     type InspectionSnapshot,
+    type InspectionWhiteboardContext,
+    type WhiteboardDeleteResult,
     type WhiteboardEditResult,
 } from "./store.js";
 
@@ -15,12 +19,16 @@ const MAX_BODY_BYTES = 1_050_000;
 
 export type InspectionStore = {
     snapshot(limit?: number): Promise<InspectionSnapshot>;
+    create(content: string): Promise<InspectionWhiteboardContext>;
     update(id: number, content: string, expectedUpdatedAt: string): Promise<WhiteboardEditResult>;
+    delete(id: number, expectedUpdatedAt: string): Promise<WhiteboardDeleteResult>;
 };
 
 const defaultStore: InspectionStore = {
     snapshot: getInspectionSnapshot,
+    create: createInspectionWhiteboardContext,
     update: updateInspectionWhiteboardContext,
+    delete: deleteInspectionWhiteboardContext,
 };
 
 function json(response: ServerResponse, status: number, body: unknown) {
@@ -109,6 +117,26 @@ export function createInspectionServer({
             }
 
             const edit = url.pathname.match(/^\/api\/whiteboard\/([1-9][0-9]*)$/);
+            if (request.method === "POST" && url.pathname === "/api/whiteboard") {
+                if (!mutationOriginAllowed(request, allowedOrigin)) {
+                    json(response, 403, { error: "origin_not_allowed" });
+                    return;
+                }
+                const body = await readJson(request) as Record<string, unknown>;
+                if (
+                    typeof body.content !== "string"
+                    || body.content.trim().length < 1
+                    || body.content.length > 1_000_000
+                ) {
+                    json(response, 400, { error: "invalid_whiteboard_note" });
+                    return;
+                }
+                json(response, 201, {
+                    status: "created",
+                    context: await store.create(body.content),
+                });
+                return;
+            }
             if (request.method === "PATCH" && edit) {
                 if (!mutationOriginAllowed(request, allowedOrigin)) {
                     json(response, 403, { error: "origin_not_allowed" });
@@ -130,6 +158,30 @@ export function createInspectionServer({
                     body.expected_updated_at,
                 );
                 const status = result.status === "updated" ? 200
+                    : result.status === "not_found" ? 404
+                    : result.status === "conflict" ? 409
+                    : 403;
+                json(response, status, result);
+                return;
+            }
+            if (request.method === "DELETE" && edit) {
+                if (!mutationOriginAllowed(request, allowedOrigin)) {
+                    json(response, 403, { error: "origin_not_allowed" });
+                    return;
+                }
+                const body = await readJson(request) as Record<string, unknown>;
+                if (
+                    typeof body.expected_updated_at !== "string"
+                    || Number.isNaN(Date.parse(body.expected_updated_at))
+                ) {
+                    json(response, 400, { error: "invalid_whiteboard_delete" });
+                    return;
+                }
+                const result = await store.delete(
+                    Number(edit[1]),
+                    body.expected_updated_at,
+                );
+                const status = result.status === "deleted" ? 200
                     : result.status === "not_found" ? 404
                     : result.status === "conflict" ? 409
                     : 403;

@@ -1,4 +1,4 @@
-const state = { snapshot: null, editing: null };
+const state = { snapshot: null, editing: null, deleting: null, previewing: false };
 const byId = (id) => document.getElementById(id);
 const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 
@@ -34,6 +34,15 @@ function renderWhiteboard(contexts) {
     time.dateTime = context.updated_at;
     time.title = new Date(context.updated_at).toLocaleString();
     card.querySelector(".content").textContent = context.content;
+    const content = card.querySelector(".content");
+    const expand = card.querySelector(".expand");
+    if (context.content.length > 280 || context.content.split("\n").length > 4) {
+      expand.classList.remove("hidden");
+      expand.addEventListener("click", () => {
+        const collapsed = content.classList.toggle("collapsed");
+        expand.textContent = collapsed ? "Show more" : "Show less";
+      });
+    }
     const tags = card.querySelector(".tags");
     for (const tag of context.tags) {
       const chip = document.createElement("span");
@@ -62,6 +71,10 @@ function renderWhiteboard(contexts) {
     edit.disabled = !context.editable;
     edit.title = context.edit_blocked_reason || "Edit this whiteboard note";
     edit.addEventListener("click", () => openEditor(context));
+    const remove = card.querySelector(".delete");
+    remove.disabled = !context.editable;
+    remove.title = context.edit_blocked_reason || "Delete this whiteboard note";
+    remove.addEventListener("click", () => openDelete(context));
     host.append(card);
   }
 }
@@ -130,29 +143,40 @@ async function refresh({ quiet = false } = {}) {
   }
 }
 
-function openEditor(context) {
-  if (!context.editable) return;
+function setPreview(enabled) {
+  state.previewing = enabled;
+  byId("editor-content").classList.toggle("hidden", enabled);
+  byId("editor-preview").classList.toggle("hidden", !enabled);
+  byId("editor-preview").textContent = byId("editor-content").value || "Nothing to preview yet.";
+  byId("toggle-preview").textContent = enabled ? "Edit" : "Preview";
+}
+
+function openEditor(context = null) {
+  if (context && !context.editable) return;
   state.editing = context;
-  byId("editor-title").textContent = `Edit context #${context.id}`;
-  byId("editor-content").value = context.content;
+  byId("editor-title").textContent = context ? `Edit context #${context.id}` : "Create a Whiteboard note";
+  byId("editor-content").value = context?.content ?? "";
+  byId("save").textContent = context ? "Save changes" : "Create note";
   byId("editor-status").textContent = "";
+  setPreview(false);
   byId("editor").showModal();
   byId("editor-content").focus();
 }
 
 byId("editor-form").addEventListener("submit", async (event) => {
-  if (event.submitter?.value === "cancel" || !state.editing) return;
+  if (event.submitter?.value === "cancel") return;
   event.preventDefault();
   const button = byId("save");
   button.disabled = true;
   byId("editor-status").textContent = "Saving…";
   try {
-    const response = await fetch(`/api/whiteboard/${state.editing.id}`, {
-      method: "PATCH",
+    const editing = state.editing;
+    const response = await fetch(editing ? `/api/whiteboard/${editing.id}` : "/api/whiteboard", {
+      method: editing ? "PATCH" : "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         content: byId("editor-content").value,
-        expected_updated_at: state.editing.updated_at,
+        ...(editing ? { expected_updated_at: editing.updated_at } : {}),
       }),
     });
     const body = await response.json();
@@ -172,6 +196,38 @@ byId("editor-form").addEventListener("submit", async (event) => {
   }
 });
 
+function openDelete(context) {
+  if (!context.editable) return;
+  state.deleting = context;
+  byId("delete-title").textContent = `Delete context #${context.id}?`;
+  byId("delete-status").textContent = "";
+  byId("delete-dialog").showModal();
+}
+
+byId("delete-form").addEventListener("submit", async (event) => {
+  if (event.submitter?.value === "cancel" || !state.deleting) return;
+  event.preventDefault();
+  const button = byId("confirm-delete");
+  button.disabled = true;
+  byId("delete-status").textContent = "Deleting…";
+  try {
+    const response = await fetch(`/api/whiteboard/${state.deleting.id}`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expected_updated_at: state.deleting.updated_at }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.reason || body.error || `Delete failed (${response.status})`);
+    byId("delete-dialog").close();
+    state.deleting = null;
+    await refresh({ quiet: true });
+  } catch (error) {
+    byId("delete-status").textContent = error.message || String(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 document.querySelectorAll(".tabs button").forEach((button) => {
   button.addEventListener("click", () => {
     document.querySelectorAll(".tabs button").forEach((item) => item.classList.toggle("active", item === button));
@@ -181,6 +237,8 @@ document.querySelectorAll(".tabs button").forEach((button) => {
 });
 
 byId("refresh").addEventListener("click", () => refresh());
+byId("new-note").addEventListener("click", () => openEditor());
+byId("toggle-preview").addEventListener("click", () => setPreview(!state.previewing));
 void refresh();
 setInterval(() => void refresh({ quiet: true }), 15_000);
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js").catch(() => {});

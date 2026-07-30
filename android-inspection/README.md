@@ -3,11 +3,13 @@
 This native client is intentionally narrower than Agent Approval. It can:
 
 - list Whiteboard records and actor acknowledgements;
+- create plain, unrouted Whiteboard notes;
 - edit only an existing, server-approved Whiteboard body;
+- delete only an existing, server-approved Whiteboard note;
 - list private channel/message envelopes without bodies.
 
-It has no agent, task, wake, approval, message-send, create-context, tag, source,
-visibility, or actor mutation API.
+It has no agent, task, wake, approval, message-send, tag, source, visibility, or
+actor mutation API.
 
 Build using the already provisioned Gradle wrapper:
 
