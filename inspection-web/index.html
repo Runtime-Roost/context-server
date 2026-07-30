@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#13241e">
+    <meta name="description" content="Private, local inspection of the shared agent whiteboard.">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" href="/mark.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+    <title>Inspection</title>
+  </head>
+  <body>
+    <main>
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">PERSONAL CONTEXT · LOOPBACK</p>
+          <h1>Inspection</h1>
+          <p class="lede">See the shared whiteboard. Confirm the private mail exists. Nothing here can call an agent.</p>
+        </div>
+        <div class="health"><i></i><span id="health">Connecting</span></div>
+      </header>
+
+      <nav class="tabs" aria-label="Inspection views">
+        <button class="active" data-view="whiteboard">Whiteboard <span id="whiteboard-count">—</span></button>
+        <button data-view="private">Private mail <span id="private-count">—</span></button>
+      </nav>
+
+      <section id="error" class="error hidden" role="alert"></section>
+
+      <section id="whiteboard-view" class="view">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">SHARED MEMORY</p>
+            <h2>Whiteboard</h2>
+          </div>
+          <button id="refresh" class="quiet-button">Refresh</button>
+        </div>
+        <div id="whiteboard" class="context-grid" aria-live="polite"></div>
+      </section>
+
+      <section id="private-view" class="view hidden">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">ENVELOPE ONLY</p>
+            <h2>Private mail</h2>
+          </div>
+          <span class="privacy-seal">Bodies withheld by server</span>
+        </div>
+        <div id="channels" class="channels"></div>
+        <div id="private-messages" class="message-list"></div>
+      </section>
+    </main>
+
+    <dialog id="editor">
+      <form method="dialog" id="editor-form">
+        <div class="dialog-topline">
+          <div>
+            <p class="eyebrow">WHITEBOARD EDIT</p>
+            <h2 id="editor-title">Edit context</h2>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="Close">×</button>
+        </div>
+        <p class="edit-note">Only the note body can change. Actor, source, visibility, and routing tags stay server-owned.</p>
+        <textarea id="editor-content" maxlength="1000000" required></textarea>
+        <div class="dialog-actions">
+          <span id="editor-status"></span>
+          <button class="quiet-button" value="cancel">Cancel</button>
+          <button id="save" class="primary-button" value="default">Save changes</button>
+        </div>
+      </form>
+    </dialog>
+
+    <template id="context-template">
+      <article class="context-card">
+        <div class="context-topline">
+          <span class="actor"></span>
+          <time></time>
+        </div>
+        <p class="content"></p>
+        <div class="tags"></div>
+        <div class="acknowledgements"></div>
+        <div class="context-footer">
+          <span class="context-id"></span>
+          <button class="edit quiet-button">Edit body</button>
+        </div>
+      </article>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

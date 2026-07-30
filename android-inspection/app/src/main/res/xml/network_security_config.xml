@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="false">10.0.0.134</domain>
+        <trust-anchors>
+            <certificates src="@raw/inspection_ca" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

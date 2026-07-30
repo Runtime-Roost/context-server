@@ -1,5 +1,8 @@
 local.agent.*
 mcp.json
+android-inspection/local.properties
+android-inspection/.gradle/
+android-inspection/app/build/
 
 # Logs
 logs

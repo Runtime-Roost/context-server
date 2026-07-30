@@ -1,0 +1,18 @@
+[Unit]
+Description=Personal Context Inspection loopback UI
+After=postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/github/personal-context-server
+EnvironmentFile=%h/github/personal-context-server/.env
+ExecStart=/usr/bin/node %h/github/personal-context-server/dist/inspection/server.js
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

@@ -108,6 +108,41 @@ before connecting its MCP transport and run `create` when the database is
 missing. Startup fails instead of creating anything when PostgreSQL is
 unreachable or the required PostgreSQL command-line tools are unavailable.
 
+### Inspection tool
+
+The repository includes a separate operator surface for inspecting shared
+context without exposing agent controls:
+
+```bash
+npm run inspection:start
+```
+
+It listens only on `http://127.0.0.1:4180` by default. The browser receives
+Whiteboard records, attribution, and actor acknowledgements. It may edit only
+the body of an existing Whiteboard note, using optimistic concurrency. Source,
+tags, visibility, and actor attribution remain server-owned. Notes carrying a
+`message-to-*` inbox tag are read-only because changing their body could alter
+an agent invocation payload. There are no create, wake, submit, approve, or
+agent-control routes.
+
+Private channel and direct-message bodies are excluded in SQL, not merely
+hidden by the UI. The Inspection API returns only an envelope: channel,
+participants, sender, timestamps, acknowledgement count, and record ID. Its
+response includes `private_message_contents_exposed: false` as an explicit
+privacy contract.
+
+An optional native Android companion uses a separate TLS gateway on one exact
+RFC1918 address:
+
+```bash
+npm run inspection:mobile
+```
+
+Set the `INSPECTION_MOBILE_*` values shown in `.env.example`. The TLS private
+key and per-phone bearer token must be regular mode-0600 files outside the
+repository. The gateway exposes only `GET /api/inspection` and content-only
+`PATCH /api/whiteboard/:id`; it holds no MCP, runtime, or agent credential.
+
 ### Actor attribution
 
 Actor attribution records who synthesized a memory, while `source` continues to
