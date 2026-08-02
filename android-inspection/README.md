@@ -16,7 +16,7 @@ actor mutation API.
 Build using the already provisioned Gradle wrapper:
 
 ```bash
-/home/alu52/github/agent-console/android/gradlew \
+/home/alu52/github/agent-companion/android/gradlew \
   -p /home/alu52/github/personal-context-server/android-inspection \
   assembleDebug
 ```
