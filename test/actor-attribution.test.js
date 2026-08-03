@@ -14,10 +14,12 @@ const {
     runDatabaseMigrations,
 } = await import("../dist/storage/db.js");
 const {
+    acknowledgeContextWithActor,
     actorPurgeConfirm,
     actorPurgePreview,
     identifyActor,
     deleteContext,
+    getContext,
     getDatabaseMetadata,
     getUserProfile,
     listRecentContext,
@@ -84,10 +86,13 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
 
         await runDatabaseMigrations(isolatedPool);
 
-        const legacy = await isolatedPool.query("SELECT actor_id FROM contexts");
+        const legacy = await isolatedPool.query("SELECT actor_id, visibility, channel_id, group_id FROM contexts");
         const applied = await isolatedPool.query("SELECT version FROM schema_migrations ORDER BY version");
         assert.equal(legacy.rows[0].actor_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2]);
+        assert.equal(legacy.rows[0].visibility, "whiteboard");
+        assert.equal(legacy.rows[0].channel_id, null);
+        assert.equal(legacy.rows[0].group_id, null);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     } finally {
         await isolatedPool.end();
         await adminPool.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -354,6 +359,12 @@ test("administrative context projections and metadata include actors", async () 
     const saved = await saveContext(uniqueValue("admin-projection"), [], undefined, identified.actor.id);
 
     try {
+        const fetched = await getContext(saved.id);
+        assert.equal(fetched.id, saved.id);
+        assert.equal(fetched.content, saved.content);
+        assert.equal(fetched.actor.external_id, externalId);
+        assert.equal(await getContext(2_147_483_647), null);
+
         const updated = await updateContext(saved.id, "updated actor projection");
         assert.equal(updated.actor.external_id, externalId);
 
@@ -366,6 +377,205 @@ test("administrative context projections and metadata include actors", async () 
     } finally {
         await db.query("DELETE FROM contexts WHERE id = $1", [saved.id]);
         await db.query("DELETE FROM actors WHERE id = $1", [identified.actor.id]);
+    }
+});
+
+test("get_context returns an exact record or null", async () => {
+    const marker = uniqueValue("get-context");
+    const saved = await saveContext(marker, ["exact-id"], "get_context test");
+    const connection = await connectTestClient();
+
+    try {
+        const found = textResult(await connection.client.callTool({
+            name: "get_context",
+            arguments: { id: saved.id },
+        }));
+        assert.equal(found.id, saved.id);
+        assert.equal(found.context.id, saved.id);
+        assert.equal(found.context.content, marker);
+        assert.equal(found.context.visibility, "whiteboard");
+
+        const missing = textResult(await connection.client.callTool({
+            name: "get_context",
+            arguments: { id: 2_147_483_647 },
+        }));
+        assert.equal(missing.id, 2_147_483_647);
+        assert.equal(missing.context, null);
+    } finally {
+        await connection.close();
+        await db.query("DELETE FROM contexts WHERE id = $1", [saved.id]);
+    }
+});
+
+test("context acknowledgements are actor-scoped, idempotent, ordered, and Whiteboard-only", async () => {
+    const marker = uniqueValue("context-acknowledgement");
+    const context = await saveContext(marker, ["acknowledgement"], "acknowledgement test");
+    const hidden = await db.query(
+        `
+            INSERT INTO contexts (kind, visibility, content, tags, created_at, updated_at)
+            VALUES ('note', 'direct', $1, ARRAY[]::text[], NOW(), NOW())
+            RETURNING id
+        `,
+        [`${marker} hidden`],
+    );
+    const hiddenId = Number(hidden.rows[0].id);
+    const firstExternalId = uniqueValue("actor:test:ack:first");
+    const secondExternalId = uniqueValue("actor:test:ack:second");
+    let firstActorId;
+    let secondActorId;
+
+    try {
+        const second = await acknowledgeContextWithActor(context.id, {
+            external_id: secondExternalId,
+            name: "Second Acknowledging Actor",
+            kind: "ai",
+            metadata: { private: "must not be returned" },
+        });
+        secondActorId = second.actor.id;
+        const first = await acknowledgeContextWithActor(context.id, {
+            external_id: firstExternalId,
+            name: "First Acknowledging Actor",
+            kind: "human",
+        });
+        firstActorId = first.actor.id;
+        const repeated = await acknowledgeContextWithActor(
+            context.id,
+            undefined,
+            firstActorId,
+        );
+
+        assert.equal(second.acknowledged, true);
+        assert.equal(first.acknowledged, true);
+        assert.equal(repeated.acknowledged, false);
+        assert.deepEqual(
+            repeated.context.acknowledged_by.map(({ external_id }) => external_id),
+            [secondExternalId, firstExternalId],
+        );
+        assert.equal("metadata" in repeated.context.acknowledged_by[0], false);
+        assert.equal((await getContext(context.id)).acknowledged_by.length, 2);
+
+        const refused = await acknowledgeContextWithActor(
+            hiddenId,
+            undefined,
+            firstActorId,
+        );
+        assert.deepEqual(refused, {
+            context: null,
+            actor: null,
+            acknowledged: false,
+        });
+
+        await db.query("DELETE FROM contexts WHERE id = $1", [context.id]);
+        const cascaded = await db.query(
+            "SELECT COUNT(*)::int AS count FROM context_acknowledgements WHERE context_id = $1",
+            [context.id],
+        );
+        assert.equal(cascaded.rows[0].count, 0);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[context.id, hiddenId]]);
+        if (firstActorId && secondActorId) {
+            await db.query(
+                "DELETE FROM actors WHERE id = ANY($1::bigint[])",
+                [[firstActorId, secondActorId]],
+            );
+        }
+    }
+});
+
+test("acknowledge_context requires actor identity and is idempotent over MCP", async () => {
+    const context = await saveContext(
+        uniqueValue("acknowledgement-mcp"),
+        ["acknowledgement"],
+        "acknowledgement MCP test",
+    );
+    const connection = await connectTestClient();
+    const externalId = uniqueValue("actor:test:ack:mcp");
+    let actorId;
+
+    try {
+        const unidentified = await connection.client.callTool({
+            name: "acknowledge_context",
+            arguments: { context_id: context.id },
+        });
+        assert.equal(unidentified.isError, true);
+        assert.equal(textResult(unidentified).error.code, "ACTOR_IDENTIFICATION_REQUIRED");
+
+        const first = textResult(await connection.client.callTool({
+            name: "acknowledge_context",
+            arguments: {
+                context_id: context.id,
+                actor: {
+                    external_id: externalId,
+                    name: "MCP Acknowledging Actor",
+                    kind: "ai",
+                },
+            },
+        }));
+        actorId = first.context.acknowledged_by[0].id;
+        assert.equal(first.acknowledged, true);
+        assert.equal(first.context.acknowledged_by[0].external_id, externalId);
+
+        const repeated = textResult(await connection.client.callTool({
+            name: "acknowledge_context",
+            arguments: { context_id: context.id },
+        }));
+        assert.equal(repeated.acknowledged, false);
+        assert.equal(repeated.context.acknowledged_by.length, 1);
+    } finally {
+        await connection.close();
+        await db.query("DELETE FROM contexts WHERE id = $1", [context.id]);
+        if (actorId) await db.query("DELETE FROM actors WHERE id = $1", [actorId]);
+    }
+});
+
+test("whiteboard is the only currently discoverable and writable visibility", async () => {
+    const marker = uniqueValue("whiteboard-policy");
+    const whiteboard = await saveContext(
+        `${marker} shared`,
+        ["profile", marker],
+        "whiteboard policy test",
+        null,
+        "whiteboard",
+    );
+    const hidden = await db.query(
+        `
+            INSERT INTO contexts (
+                kind,
+                visibility,
+                content,
+                source,
+                tags,
+                created_at,
+                updated_at
+            )
+            VALUES ('note', 'direct', $1, 'whiteboard policy test', $2, NOW(), NOW())
+            RETURNING id
+        `,
+        [`${marker} hidden`, ["profile", marker]],
+    );
+    const hiddenId = Number(hidden.rows[0].id);
+
+    try {
+        assert.equal(whiteboard.visibility, "whiteboard");
+        assert.equal((await getContext(whiteboard.id))?.id, whiteboard.id);
+        assert.equal(await getContext(hiddenId), null);
+
+        const searchResults = await searchContext(marker, 20, "low");
+        assert.ok(searchResults.some((context) => context.id === whiteboard.id));
+        assert.ok(searchResults.every((context) => context.id !== hiddenId));
+
+        const recentResults = await listRecentContext(100);
+        assert.ok(recentResults.some((context) => context.id === whiteboard.id));
+        assert.ok(recentResults.every((context) => context.id !== hiddenId));
+
+        const profile = await getUserProfile();
+        assert.ok(profile.results.some((context) => context.id === whiteboard.id));
+        assert.ok(profile.results.every((context) => context.id !== hiddenId));
+
+        assert.equal(await updateContext(hiddenId, "must remain hidden"), null);
+        assert.equal(await deleteContext(hiddenId), null);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[whiteboard.id, hiddenId]]);
     }
 });
 
@@ -446,15 +656,89 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         const identifySchema = byName.get("identify_actor")?.inputSchema;
         const searchSchema = byName.get("search_context")?.inputSchema;
         const recentSchema = byName.get("list_recent_context")?.inputSchema;
+        const getContextSchema = byName.get("get_context")?.inputSchema;
+        const acknowledgeTool = byName.get("acknowledge_context");
+        const acknowledgeSchema = acknowledgeTool?.inputSchema;
         const saveSchema = byName.get("save_context")?.inputSchema;
+        const updateSchema = byName.get("update_context")?.inputSchema;
 
         assert.deepEqual(identifySchema.required, ["name"]);
         assert.ok(identifySchema.properties.external_id);
         assert.ok(searchSchema.properties.actor_external_id);
         assert.ok(recentSchema.properties.actor_external_id);
-        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text"]);
+        assert.deepEqual(getContextSchema.required, ["id"]);
+        assert.ok(getContextSchema.properties.id);
+        assert.deepEqual(acknowledgeSchema.required, ["context_id"]);
+        assert.deepEqual(acknowledgeSchema.properties.actor.required, ["external_id", "name"]);
+        assert.deepEqual(acknowledgeTool.annotations, {
+            title: "Acknowledge Context",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        });
+        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text", "visibility"]);
+        assert.deepEqual(saveSchema.properties.visibility.enum, ["whiteboard"]);
         assert.deepEqual(saveSchema.properties.actor.required, ["external_id", "name"]);
         assert.ok(saveSchema.properties.actor.properties.external_id);
+        assert.deepEqual(updateSchema.properties.visibility.enum, ["whiteboard"]);
+        for (const toolName of [
+            "create_channel",
+            "add_channel_member",
+            "remove_channel_member",
+            "list_channels",
+            "save_channel_context",
+            "search_channel_context",
+            "list_channel_context",
+            "get_channel_context",
+            "update_channel_context",
+            "delete_channel_context",
+            "create_access_group",
+            "add_access_group_member",
+            "remove_access_group_member",
+            "list_access_groups",
+            "save_group_context",
+            "search_group_context",
+            "list_group_context",
+            "get_group_context",
+            "update_group_context",
+            "delete_group_context",
+        ]) {
+            const schema = byName.get(toolName)?.inputSchema;
+            assert.ok(schema, `${toolName} must be registered`);
+            assert.ok(schema.properties.auth, `${toolName} must expose explicit cryptographic auth`);
+            assert.ok(!schema.required?.includes("auth"), `${toolName} must allow trusted tunnel-bound auth`);
+        }
+        for (const toolName of [
+            "list_channels",
+            "search_channel_context",
+            "list_channel_context",
+            "get_channel_context",
+            "list_access_groups",
+            "search_group_context",
+            "list_group_context",
+            "get_group_context",
+        ]) {
+            assert.deepEqual(
+                byName.get(toolName)?.annotations,
+                {
+                    title: byName.get(toolName)?.annotations?.title,
+                    readOnlyHint: true,
+                    destructiveHint: false,
+                    idempotentHint: true,
+                    openWorldHint: false,
+                },
+                `${toolName} must advertise truthful closed-world read-only semantics`,
+            );
+            assert.ok(byName.get(toolName)?.annotations?.title);
+        }
+        for (const toolName of [
+            "request_actor_session",
+            "get_actor_session_request_status",
+            "claim_actor_session",
+        ]) {
+            assert.ok(byName.get(toolName), `${toolName} must be registered`);
+        }
         assert.ok(byName.get("actor_purge_preview"));
         assert.ok(byName.get("actor_purge_confirm"));
     } finally {

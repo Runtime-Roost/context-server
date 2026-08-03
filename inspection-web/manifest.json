@@ -1,0 +1,16 @@
+{
+  "name": "Personal Context Inspection",
+  "short_name": "Inspection",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#eef1ec",
+  "theme_color": "#13241e",
+  "icons": [
+    {
+      "src": "/mark.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#13241e">
+    <meta name="description" content="Private, local inspection of the shared agent whiteboard.">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" href="/mark.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+    <title>Inspection</title>
+  </head>
+  <body>
+    <main>
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">PERSONAL CONTEXT · LOOPBACK</p>
+          <h1>Inspection</h1>
+          <p class="lede">See the shared whiteboard. Confirm the private mail exists. Nothing here can call an agent.</p>
+        </div>
+        <div class="health"><i></i><span id="health">Connecting</span></div>
+      </header>
+
+      <nav class="tabs" aria-label="Inspection views">
+        <button class="active" data-view="whiteboard">Whiteboard <span id="whiteboard-count">—</span></button>
+        <button data-view="private">Private mail <span id="private-count">—</span></button>
+        <button data-view="archive">Archive <span id="archive-count">—</span></button>
+      </nav>
+
+      <section id="error" class="error hidden" role="alert"></section>
+
+      <section id="whiteboard-view" class="view">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">SHARED MEMORY</p>
+            <h2>Whiteboard</h2>
+          </div>
+          <div class="heading-actions">
+            <button id="refresh" class="quiet-button">Refresh</button>
+            <button id="new-note" class="primary-button">New note</button>
+          </div>
+        </div>
+        <div id="whiteboard" class="context-grid" aria-live="polite"></div>
+      </section>
+
+      <section id="private-view" class="view hidden">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">ENVELOPE ONLY</p>
+            <h2>Private mail</h2>
+          </div>
+          <span class="privacy-seal">Bodies withheld by server</span>
+        </div>
+        <div id="channels" class="channels"></div>
+        <div id="private-messages" class="message-list"></div>
+      </section>
+
+      <section id="archive-view" class="view hidden">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">DURABLE HISTORY</p>
+            <h2>Note archive</h2>
+          </div>
+          <span class="privacy-seal">Restorable · attributed reasons</span>
+        </div>
+        <div id="archive" class="context-grid"></div>
+      </section>
+    </main>
+
+    <dialog id="editor">
+      <form method="dialog" id="editor-form">
+        <div class="dialog-topline">
+          <div>
+            <p class="eyebrow">WHITEBOARD EDIT</p>
+            <h2 id="editor-title">Edit context</h2>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="Close">×</button>
+        </div>
+        <p class="edit-note">Only the note body can change. Actor, source, visibility, and routing tags stay server-owned.</p>
+        <textarea id="editor-content" maxlength="1000000" required></textarea>
+        <div id="editor-preview" class="note-preview hidden"></div>
+        <div class="dialog-actions">
+          <span id="editor-status"></span>
+          <button id="toggle-preview" class="quiet-button" type="button">Preview</button>
+          <button class="quiet-button" value="cancel">Cancel</button>
+          <button id="save" class="primary-button" value="default">Save changes</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="delete-dialog">
+      <form method="dialog" id="delete-form">
+        <p class="eyebrow">DELETE WHITEBOARD NOTE</p>
+        <h2 id="delete-title">Delete context?</h2>
+        <p>This removes the note and its acknowledgements. Agent inbox notes cannot be deleted here.</p>
+        <div class="dialog-actions">
+          <span id="delete-status"></span>
+          <button class="quiet-button" value="cancel">Keep note</button>
+          <button id="confirm-delete" class="danger-button" value="default">Delete note</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="archive-dialog">
+      <form method="dialog" id="archive-form">
+        <p class="eyebrow">ARCHIVE WHITEBOARD NOTE</p>
+        <h2 id="archive-title">Archive context?</h2>
+        <p>Explain why this note is leaving the active Whiteboard. The reason and your actor identity become durable history.</p>
+        <textarea id="archive-reason" class="reason-input" maxlength="2000" required placeholder="Project completed, information superseded, no longer active…"></textarea>
+        <div class="dialog-actions">
+          <span id="archive-status"></span>
+          <button class="quiet-button" value="cancel">Keep active</button>
+          <button id="confirm-archive" class="primary-button" value="default">Archive note</button>
+        </div>
+      </form>
+    </dialog>
+
+    <template id="context-template">
+      <article class="context-card">
+        <div class="context-topline">
+          <span class="actor"></span>
+          <time></time>
+        </div>
+        <p class="content collapsed"></p>
+        <button class="expand button-link hidden">Show more</button>
+        <div class="tags"></div>
+        <div class="acknowledgements"></div>
+        <div class="context-footer">
+          <span class="context-id"></span>
+          <div>
+            <button class="archive button-link">Archive</button>
+            <button class="delete button-link danger-text">Delete</button>
+            <button class="edit quiet-button">Edit body</button>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <template id="archive-template">
+      <article class="context-card archived-card">
+        <div class="context-topline">
+          <span class="actor"></span>
+          <time></time>
+        </div>
+        <p class="content collapsed"></p>
+        <button class="expand button-link hidden">Show more</button>
+        <div class="archive-reason">
+          <span>Archived because</span>
+          <p></p>
+          <small></small>
+        </div>
+        <div class="acknowledgements"></div>
+        <div class="context-footer">
+          <span class="context-id"></span>
+          <button class="restore primary-button">Restore to Whiteboard</button>
+        </div>
+      </article>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

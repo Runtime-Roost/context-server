@@ -1,0 +1,156 @@
+import assert from "node:assert/strict";
+import { createHash, generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+process.env.PGDATABASE ??= "personal_context";
+process.env.EMBEDDINGS_ENABLED = "false";
+process.env.ATTACHMENT_STORAGE_DIR = await mkdtemp(join(tmpdir(), "pcs-attachments-test-"));
+
+const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+const { buildRequestSigningMessage, enrollActorKey } = await import("../dist/auth/request-auth.js");
+const { createServer } = await import("../dist/mcp/server.js");
+const { db } = await import("../dist/storage/db.js");
+const { identifyActor } = await import("../dist/mcp/tools.js");
+
+function unique(prefix) {
+    return `${prefix}-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function proof(tool, payload, keyId, privateKey) {
+    const timestamp = new Date().toISOString();
+    const nonce = randomUUID();
+    return {
+        key_id: keyId,
+        timestamp,
+        nonce,
+        signature: sign(
+            null,
+            Buffer.from(buildRequestSigningMessage(tool, payload, timestamp, nonce)),
+            privateKey,
+        ).toString("base64url"),
+    };
+}
+
+async function call(client, name, payload, key, privateKey) {
+    return client.callTool({
+        name,
+        arguments: { ...payload, auth: proof(name, payload, key.key_id, privateKey) },
+    });
+}
+
+function json(result) {
+    const text = result.content.find((item) => item.type === "text");
+    assert.ok(text);
+    return JSON.parse(text.text);
+}
+
+test("group attachments upload through real handlers and revoke with membership", async () => {
+    const ownerExternal = unique("actor:test:attachment-owner");
+    const memberExternal = unique("actor:test:attachment-member");
+    const outsiderExternal = unique("actor:test:attachment-outsider");
+    const group = unique("attachment-group").toLowerCase();
+    const actors = [];
+    for (const [external_id, name] of [
+        [ownerExternal, "Attachment Owner"],
+        [memberExternal, "Attachment Member"],
+        [outsiderExternal, "Attachment Outsider"],
+    ]) {
+        actors.push(await identifyActor({ external_id, name, kind: "ai" }));
+    }
+    const identities = actors.map(() => generateKeyPairSync("ed25519"));
+    const keys = await Promise.all(actors.map((actor, index) => enrollActorKey(
+        actor.actor.external_id,
+        identities[index].publicKey.export({ type: "spki", format: "pem" }).toString(),
+        "attachment-test",
+    )));
+    const server = createServer();
+    const client = new Client({ name: "attachment-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    let attachmentId;
+    let contextId;
+    let groupId;
+
+    try {
+        groupId = json(await call(client, "create_access_group", {
+            slug: group, name: "Attachment Group",
+        }, keys[0], identities[0].privateKey)).group.id;
+        await call(client, "add_access_group_member", {
+            group, actor_external_id: memberExternal, role: "member", can_read: true, can_write: true,
+        }, keys[0], identities[0].privateKey);
+
+        const bytes = Buffer.from("immutable journal bytes split across chunks");
+        const sha256 = createHash("sha256").update(bytes).digest("hex");
+        const begun = json(await call(client, "begin_attachment_upload", {
+            scope: "group", group, filename: "../Great Journal.pdf", media_type: "application/pdf",
+            expected_size_bytes: bytes.length, expected_sha256: sha256,
+        }, keys[0], identities[0].privateKey)).upload;
+
+        const badOffset = await call(client, "append_attachment_chunk", {
+            upload_id: begun.upload_id, offset: 1, data_base64: bytes.subarray(0, 8).toString("base64"),
+        }, keys[0], identities[0].privateKey);
+        assert.equal(badOffset.isError, true);
+        assert.equal(json(badOffset).error.code, "ATTACHMENT_OFFSET_INVALID");
+
+        let offset = 0;
+        for (const chunk of [bytes.subarray(0, 11), bytes.subarray(11)]) {
+            const appended = json(await call(client, "append_attachment_chunk", {
+                upload_id: begun.upload_id, offset, data_base64: chunk.toString("base64"),
+            }, keys[0], identities[0].privateKey)).upload;
+            offset = appended.received_size_bytes;
+        }
+        const finalized = json(await call(client, "finalize_attachment_upload", {
+            upload_id: begun.upload_id,
+        }, keys[0], identities[0].privateKey)).attachment;
+        attachmentId = finalized.id;
+        assert.equal(finalized.sha256, sha256);
+        assert.equal(finalized.scope, "group");
+        assert.equal(finalized.group_id, groupId);
+        assert.equal(finalized.original_filename, "../Great Journal.pdf");
+
+        const saved = json(await call(client, "save_group_context", {
+            group, text: "Journal source manifest", tags: ["journal", "manifest"],
+        }, keys[0], identities[0].privateKey)).saved;
+        contextId = saved.id;
+        const linked = json(await call(client, "link_attachment_to_context", {
+            attachment_id: attachmentId, context_id: contextId, relationship: "source",
+            sort_order: 0, page_start: 1, page_end: 148,
+        }, keys[1], identities[1].privateKey)).link;
+        assert.equal(Number(linked.context_id), contextId);
+
+        const chunk = json(await call(client, "read_attachment_chunk", {
+            id: attachmentId, offset: 0, length: 512,
+        }, keys[1], identities[1].privateKey)).chunk;
+        assert.deepEqual(Buffer.from(chunk.data_base64, "base64"), bytes);
+        assert.equal(chunk.eof, true);
+
+        const outsider = json(await call(client, "get_attachment", {
+            id: attachmentId,
+        }, keys[2], identities[2].privateKey));
+        assert.equal(outsider.attachment, null);
+
+        await call(client, "remove_access_group_member", {
+            group, actor_external_id: memberExternal,
+        }, keys[0], identities[0].privateKey);
+        const revoked = json(await call(client, "read_attachment_chunk", {
+            id: attachmentId,
+        }, keys[1], identities[1].privateKey));
+        assert.equal(revoked.chunk, null);
+    } finally {
+        await client.close();
+        await server.close();
+        if (contextId) await db.query("DELETE FROM contexts WHERE id = $1", [contextId]);
+        if (attachmentId) await db.query("DELETE FROM attachments WHERE id = $1", [attachmentId]);
+        if (groupId) await db.query("DELETE FROM access_groups WHERE id = $1", [groupId]);
+        for (const actor of actors) await db.query("DELETE FROM actors WHERE id = $1", [actor.actor.id]);
+    }
+});
+
+test.after(async () => {
+    await db.end();
+    await rm(process.env.ATTACHMENT_STORAGE_DIR, { recursive: true, force: true });
+});

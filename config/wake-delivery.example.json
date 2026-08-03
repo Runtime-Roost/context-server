@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "socket_path": "/run/user/1000/agent-runtime/scheduler.sock",
+  "endpoint": "/v1/wakes",
+  "credential_file": "/home/alu52/.config/agent-runtime/wake-hmac.key",
+  "connect_timeout_ms": 2000,
+  "request_timeout_ms": 10000,
+  "retry": {
+    "max_attempts": 3,
+    "base_delay_ms": 250
+  },
+  "max_response_bytes": 16384
+}
