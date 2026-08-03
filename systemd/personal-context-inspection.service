@@ -4,9 +4,9 @@ After=postgresql.service
 
 [Service]
 Type=simple
-WorkingDirectory=%h/github/personal-context-server
-EnvironmentFile=%h/github/personal-context-server/.env
-ExecStart=/usr/bin/node %h/github/personal-context-server/dist/inspection/server.js
+WorkingDirectory=%h/github/context-server
+EnvironmentFile=%h/github/context-server/.env
+ExecStart=/usr/bin/node %h/github/context-server/dist/inspection/server.js
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
