@@ -247,6 +247,13 @@ export function createServer() {
             description: process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() === "true"
                 ? "Request local approval for this exact OpenAI conversation. Approval activates the trusted tunnel identity automatically; do not call claim_actor_session or provide an auth object afterward."
                 : "Request an operator-approved expiring actor session for a native client that cannot hold an Ed25519 signing key. Keep the returned claim code private, then use it after local approval with claim_actor_session.",
+            annotations: {
+                title: "Request Actor Session Approval",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
             inputSchema: {
                 actor_external_id: z.string().min(1).describe("Durable actor identity the client asks the local operator to approve."),
                 client_label: z.string().min(1).max(200).optional().describe("Human-readable client or conversation label shown to the operator."),
@@ -278,6 +285,13 @@ export function createServer() {
         "get_actor_session_request_status",
         {
             description: "Native-client flow only: check whether an actor-session request is pending, approved, denied, expired, or claimed using its one-time claim code. Trusted OpenAI tunnel conversations activate during local approval and must not call this tool.",
+            annotations: {
+                title: "Check Actor Session Request",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
             inputSchema: {
                 request_id: z.string().min(1).describe("Request identifier returned by request_actor_session."),
                 claim_code: z.string().min(32).describe("Secret claim code returned with the request."),
@@ -302,6 +316,13 @@ export function createServer() {
         "claim_actor_session",
         {
             description: "Native-client flow only: claim a locally approved actor-session request exactly once and receive an expiring capability for explicit auth. Trusted OpenAI tunnel conversations activate during local approval and must not call this tool or receive the capability.",
+            annotations: {
+                title: "Claim Approved Actor Session",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
             inputSchema: {
                 request_id: z.string().min(1).describe("Approved request identifier."),
                 claim_code: z.string().min(32).describe("Secret claim code returned by request_actor_session."),
@@ -417,7 +438,14 @@ export function createServer() {
     server.registerTool(
         "search_context",
         {
-            description: "Search saved personal context by query. Sensitivity controls semantic filtering strictness: low is broad, medium is balanced, and high is narrow.",
+            description: "Read matching notes from the local shared Whiteboard. This does not modify data or contact external services. Sensitivity controls semantic filtering strictness: low is broad, medium is balanced, and high is narrow.",
+            annotations: {
+                title: "Search Shared Whiteboard",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
             inputSchema: {
                 query: z.string().min(1).describe("The search query."),
                 limit: z.number().int().positive().optional().describe("Maximum number of context items to return."),
@@ -449,7 +477,14 @@ export function createServer() {
     server.registerTool(
         "get_user_profile",
         {
-            description: "Return the active OS username alongside contexts explicitly tagged profile.",
+            description: "Read the local shared Whiteboard notes explicitly tagged profile, plus the local OS username. This does not modify data or contact external services.",
+            annotations: {
+                title: "Read Shared User Profile",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         async () => {
             const profile = await getUserProfile();
@@ -468,7 +503,14 @@ export function createServer() {
     server.registerTool(
         "list_recent_context",
         {
-            description: "List recently saved personal context items.",
+            description: "Read the newest notes from the local shared Whiteboard. This does not modify data or contact external services.",
+            annotations: {
+                title: "List Recent Shared Whiteboard Notes",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
             inputSchema: {
                 limit: z.number().int().positive().optional().describe("Maximum number of recent context items to return."),
                 actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
@@ -1390,7 +1432,14 @@ export function createServer() {
     server.registerTool(
         "database_metadata",
         {
-            description: "Return simple database metadata, including saved context count and storage sizes.",
+            description: "Read local database counts and storage sizes. This does not return note contents, modify data, or contact external services.",
+            annotations: {
+                title: "Read Local Context Database Metadata",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         async () => {
             const metadata = await getDatabaseMetadata();
@@ -1409,7 +1458,14 @@ export function createServer() {
     server.registerTool(
         "get_context",
         {
-            description: "Get a saved personal context item by its exact id.",
+            description: "Read one local shared Whiteboard note by its exact ID. Non-Whiteboard records are not accessible. This does not modify data or contact external services.",
+            annotations: {
+                title: "Read Shared Whiteboard Note",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
             inputSchema: {
                 id: z.number().int().positive().describe("The id of the context item to retrieve."),
             },
