@@ -463,6 +463,13 @@ npm run actor-session:deny -- --request-id asr_<id>
 npm run actor-session:revoke -- --session-id as_<id>
 ```
 
+The compiled `dist/auth/operator-actor-sessions.js` module is the narrow local
+operator adapter used by Agent Runtime. It exports sanitized pending request
+metadata and exact approve/deny decisions bound to request ID, actor external
+ID, and client label. It intentionally returns no claim code, token, identity
+hash, or database row. This module is for a trusted local runtime process, not
+an MCP tool or network endpoint.
+
 Requesting a session does not authenticate the requester and grants nothing.
 Approval is a deliberate local trust decision that checks both request ID and
 expected actor ID. The high-entropy claim code prevents another caller that

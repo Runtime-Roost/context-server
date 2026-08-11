@@ -9,8 +9,13 @@ const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
 const {
     approveActorSessionRequest,
+    requestActorSession,
     revokeActorSession,
 } = await import("../dist/auth/actor-sessions.js");
+const {
+    decideActorSessionRequest,
+    listPendingActorSessionRequests,
+} = await import("../dist/auth/operator-actor-sessions.js");
 const { createServer } = await import("../dist/mcp/server.js");
 const { db } = await import("../dist/storage/db.js");
 const { getContext, identifyActor } = await import("../dist/mcp/tools.js");
@@ -541,6 +546,42 @@ test("local approval binds the exact requesting OpenAI conversation", async () =
         } else {
             process.env.TRUST_OPENAI_TUNNEL_IDENTITY = previousTrust;
         }
+    }
+});
+
+test("operator adapter lists sanitized requests and binds decisions to reviewed metadata", async () => {
+    const actorExternalId = uniqueValue("actor:test:operator-review");
+    const actor = await identifyActor({ external_id: actorExternalId, name: "Operator Review", kind: "ai" });
+    const requested = await requestActorSession(actorExternalId, "Phone-bound request");
+    try {
+        const listed = await listPendingActorSessionRequests();
+        const pending = listed.find(({ request_id }) => request_id === requested.request_id);
+        assert.deepEqual(pending, {
+            request_id: requested.request_id,
+            actor_external_id: actorExternalId,
+            actor_name: "Operator Review",
+            client_label: "Phone-bound request",
+            requested_at: pending.requested_at,
+            request_expires_at: pending.request_expires_at,
+            binding: "native_client",
+            status: "pending",
+        });
+        assert.equal("claim_code" in pending, false);
+        await assert.rejects(decideActorSessionRequest(requested.request_id, {
+            approved: true,
+            expected_actor_external_id: actorExternalId,
+            expected_client_label: "Changed label",
+            ttl_seconds: 3600,
+        }), /No exact unexpired pending/);
+        const denied = await decideActorSessionRequest(requested.request_id, {
+            approved: false,
+            expected_actor_external_id: actorExternalId,
+            expected_client_label: "Phone-bound request",
+        });
+        assert.equal(denied.status, "denied");
+    } finally {
+        await db.query("DELETE FROM actor_session_requests WHERE request_id = $1", [requested.request_id]);
+        await db.query("DELETE FROM actors WHERE id = $1", [actor.actor.id]);
     }
 });
 
