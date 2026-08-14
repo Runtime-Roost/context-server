@@ -597,6 +597,33 @@ const migrations: Migration[] = [
                 ON context_archives(archived_at DESC, id DESC);
         `,
     },
+    {
+        version: 13,
+        name: "attachment_audit_events",
+        sql: `
+            CREATE TABLE IF NOT EXISTS attachment_audit_events (
+                id BIGSERIAL PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                actor_id BIGINT REFERENCES actors(id) ON DELETE SET NULL,
+                owner_actor_id BIGINT REFERENCES actors(id) ON DELETE SET NULL,
+                group_id BIGINT REFERENCES access_groups(id) ON DELETE SET NULL,
+                attachment_id UUID,
+                upload_id UUID,
+                size_bytes BIGINT CHECK (size_bytes IS NULL OR size_bytes >= 0),
+                details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS attachment_audit_events_created_at_idx
+                ON attachment_audit_events(created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS attachment_audit_events_owner_idx
+                ON attachment_audit_events(owner_actor_id, created_at DESC)
+                WHERE owner_actor_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS attachment_audit_events_group_idx
+                ON attachment_audit_events(group_id, created_at DESC)
+                WHERE group_id IS NOT NULL;
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;

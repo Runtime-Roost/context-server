@@ -58,7 +58,9 @@ The same command is available in VS Code under **Tasks: Run Task** as
 The generated file is local machine configuration and is automatically added
 to `.gitignore`. Standard `PGHOST`, `PGDATABASE`, `PGUSER`, `AUTO_MANAGE_DB`,
 `REQUIRE_ACTOR_IDENTIFICATION`, `TRUST_OPENAI_TUNNEL_IDENTITY`, and
-`EMBEDDINGS_ENABLED`, and `ATTACHMENT_STORAGE_DIR` environment variables
+`EMBEDDINGS_ENABLED`, `ATTACHMENT_STORAGE_DIR`,
+`ATTACHMENT_PERSONAL_QUOTA_BYTES`, and `ATTACHMENT_GROUP_QUOTA_BYTES`
+environment variables
 override the generated defaults.
 Automatic database management is disabled by default.
 
@@ -259,7 +261,14 @@ the bytes live in a content-addressed filesystem store under
 directory inside a publicly served tree. Back it up together with PostgreSQL:
 neither half is a complete archive by itself.
 
-Uploads are bounded at 100 MiB and use an integrity-checked sequence:
+Personal actors and access groups each have a strict 100 MiB logical attachment
+quota by default. Configure the independent byte limits with
+`ATTACHMENT_PERSONAL_QUOTA_BYTES` and `ATTACHMENT_GROUP_QUOTA_BYTES`. Finalized
+attachments and the full declared size of every active upload both count, so
+parallel uploads cannot over-reserve a scope. Content deduplication saves
+physical disk without bypassing logical quota accounting.
+
+Uploads use an integrity-checked sequence:
 
 1. `begin_attachment_upload` declares personal or group ownership, filename,
    media type, exact byte length, and SHA-256.
@@ -270,6 +279,16 @@ Uploads are bounded at 100 MiB and use an integrity-checked sequence:
 
 Unfinished uploads expire after 24 hours and are pruned when a new upload
 begins. `cancel_attachment_upload` removes one immediately.
+
+`get_attachment_quota` reports finalized, reserved, available, and limit bytes.
+Quota reservation is serialized per actor or group in PostgreSQL. Every upload
+reservation, finalization, cancellation, deletion, and reconciliation result is
+written to the append-only `attachment_audit_events` ledger.
+
+Run `npm run attachments:audit` for a strict reconciliation of database rows,
+stored object sizes and SHA-256 values, partial-upload sizes, and orphan files.
+The command records its result and exits nonzero on any discrepancy. It reports
+orphans for operator review and never deletes or repairs them automatically.
 
 `get_attachment`, `list_attachments`, and `read_attachment_chunk` enforce the
 current personal owner or group membership before returning metadata or bytes.

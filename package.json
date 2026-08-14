@@ -16,6 +16,7 @@
     "wake-policy:dry-run": "npm run build && node dist/wake/cli.js",
     "wake-policy:run": "npm run build && node dist/wake/cli.js",
     "wake-delivery:retry": "npm run build && node dist/wake/cli.js",
+    "attachments:audit": "npm run build && node scripts/audit-attachments.mjs",
     "inspection:start": "npm run build && node dist/inspection/server.js",
     "inspection:mobile": "npm run build && node dist/inspection/mobile-server.js",
     "mcp:config": "node scripts/generate-mcp-config.mjs",

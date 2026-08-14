@@ -66,6 +66,7 @@ import {
     deleteAttachment,
     finalizeAttachmentUpload,
     getAttachment,
+    getAttachmentQuota,
     linkAttachmentToContext,
     listAttachments,
     listContextAttachments,
@@ -108,6 +109,8 @@ function authenticationError(error: unknown) {
         "ATTACHMENT_OFFSET_INVALID",
         "ATTACHMENT_CHUNK_INVALID",
         "ATTACHMENT_SCOPE_INVALID",
+        "ATTACHMENT_QUOTA_EXCEEDED",
+        "ATTACHMENT_QUOTA_CONFIG_INVALID",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -1710,7 +1713,7 @@ export function createServer() {
                 group: z.string().min(3).max(64).optional().describe("Required only for group ownership."),
                 filename: z.string().min(1).max(500),
                 media_type: z.string().min(3).max(200),
-                expected_size_bytes: z.number().int().nonnegative().max(100 * 1024 * 1024),
+                expected_size_bytes: z.number().int().nonnegative(),
                 expected_sha256: z.string().regex(/^[0-9a-fA-F]{64}$/),
                 auth: requestAuthSchema.optional(),
             },
@@ -1721,6 +1724,27 @@ export function createServer() {
                 const authenticated = await authenticateTool("begin_attachment_upload", payload, auth, extra);
                 const upload = await beginAttachmentUpload(authenticated.actor_id, scope, filename, media_type, expected_size_bytes, expected_sha256, group);
                 return { content: [{ type: "text", text: JSON.stringify({ upload }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "get_attachment_quota",
+        {
+            description: "Get strict finalized, reserved, and available attachment bytes for an authorized personal or group scope.",
+            annotations: { title: "Get Attachment Quota", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: {
+                scope: z.enum(ATTACHMENT_SCOPE_VALUES),
+                group: z.string().min(3).max(64).optional(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ scope, group, auth }, extra) => {
+            const payload = { scope, group };
+            try {
+                const authenticated = await authenticateTool("get_attachment_quota", payload, auth, extra);
+                const quota = await getAttachmentQuota(authenticated.actor_id, scope, group);
+                return { content: [{ type: "text", text: JSON.stringify({ quota }) }] };
             } catch (error) { return authenticationError(error); }
         },
     );
