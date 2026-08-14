@@ -143,8 +143,9 @@ participants, sender, timestamps, acknowledgement count, and record ID. Its
 response includes `private_message_contents_exposed: false` as an explicit
 privacy contract.
 
-An optional native Android companion uses a separate TLS gateway on one exact
-RFC1918 address:
+The standalone native Android inspection companion is obsolete and retained
+temporarily for compatibility testing. Agent Companion is the active phone UI.
+The obsolete client uses a separate TLS gateway on one exact RFC1918 address:
 
 ```bash
 npm run inspection:mobile
