@@ -1,7 +1,8 @@
 import { db, initializeDatabase } from "../storage/db.js";
 import { approveActorSessionRequest, denyActorSessionRequest } from "./actor-sessions.js";
 
-const TTL_PRESETS = new Set([900, 3_600, 86_400, 604_800]);
+const DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60;
+const TTL_PRESETS = new Set([900, 3_600, 86_400, 604_800, DEFAULT_TTL_SECONDS]);
 const REQUEST_ID = /^asr_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ACTOR_ID = /^actor:[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/i;
 
@@ -60,7 +61,7 @@ export async function decideActorSessionRequest(requestId: string, decision: {
     if (!REQUEST_ID.test(requestId) || !ACTOR_ID.test(decision.expected_actor_external_id)) {
         throw new Error("Invalid actor-session decision binding");
     }
-    if (decision.approved && !TTL_PRESETS.has(decision.ttl_seconds ?? 86_400)) {
+    if (decision.approved && !TTL_PRESETS.has(decision.ttl_seconds ?? DEFAULT_TTL_SECONDS)) {
         throw new Error("Invalid actor-session TTL preset");
     }
     if (!decision.approved && decision.ttl_seconds !== undefined) {
@@ -82,7 +83,7 @@ export async function decideActorSessionRequest(requestId: string, decision: {
             client_label: decision.expected_client_label, status: "denied" as const };
     }
     const approved = await approveActorSessionRequest(
-        requestId, decision.expected_actor_external_id, decision.ttl_seconds ?? 86_400,
+        requestId, decision.expected_actor_external_id, decision.ttl_seconds ?? DEFAULT_TTL_SECONDS,
     );
     const activated = "activated_session" in approved ? approved.activated_session : undefined;
     return {

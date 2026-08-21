@@ -8,6 +8,7 @@ import {
     authenticateOpenAITunnelActorSession,
     claimActorSession,
     getActorSessionRequestStatus,
+    renewActorSession,
     requestActorSession,
 } from "../auth/actor-sessions.js";
 import {
@@ -102,6 +103,7 @@ function authenticationError(error: unknown) {
         "ACTOR_SESSION_REQUEST_NOT_FOUND",
         "ACTOR_SESSION_REQUEST_REJECTED",
         "SESSION_REVOKED",
+        "SESSION_RENEWAL_NOT_ALLOWED",
         "AUTHENTICATION_REQUIRED",
         "ATTACHMENT_UPLOAD_NOT_FOUND_OR_NOT_AUTHORIZED",
         "ATTACHMENT_UPLOAD_INCOMPLETE",
@@ -248,8 +250,8 @@ export function createServer() {
         "request_actor_session",
         {
             description: process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() === "true"
-                ? "Request local approval for this exact OpenAI conversation. Approval activates the trusted tunnel identity automatically; do not call claim_actor_session or provide an auth object afterward."
-                : "Request an operator-approved expiring actor session for a native client that cannot hold an Ed25519 signing key. Keep the returned claim code private, then use it after local approval with claim_actor_session.",
+                ? "Request local approval for this exact OpenAI conversation. Approval activates a renewable trusted-thread lease automatically; do not call claim_actor_session, renew_actor_session, or provide an auth object afterward."
+                : "Request an operator-approved renewable actor-session lease for a native client that cannot hold an Ed25519 signing key. Keep the returned claim code private, then use it after local approval with claim_actor_session.",
             annotations: {
                 title: "Request Actor Session Approval",
                 readOnlyHint: false,
@@ -339,6 +341,33 @@ export function createServer() {
                         type: "text",
                         text: JSON.stringify({ session }),
                     }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "renew_actor_session",
+        {
+            description: "Native-client flow only: renew the current unrevoked actor-session lease for 30 days and atomically rotate its bearer token. The previous token stops working immediately. Trusted OpenAI conversations renew their bound lease automatically during authenticated use and must not call this tool.",
+            annotations: {
+                title: "Renew Actor Session Lease",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                auth: actorSessionAuthSchema.describe("Current native actor-session capability. A successful renewal returns its replacement token exactly once."),
+            },
+        },
+        async ({ auth }) => {
+            try {
+                const session = await renewActorSession(auth);
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ session }) }],
                 };
             } catch (error) {
                 return authenticationError(error);

@@ -38,8 +38,10 @@ export type OpenAITunnelIdentity = {
 
 const REQUEST_TTL_MS = 15 * 60 * 1000;
 const MAX_PENDING_REQUESTS_PER_ACTOR = 3;
-const DEFAULT_SESSION_TTL_SECONDS = 24 * 60 * 60;
+const DEFAULT_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const MAX_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const RENEWAL_WINDOW_SECONDS = 7 * 24 * 60 * 60;
+const RENEWED_LEASE_SECONDS = 30 * 24 * 60 * 60;
 const SESSION_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SESSION_NONCE_TTL_MS = 10 * 60 * 1000;
 const TOKEN_HASH_DOMAIN = "personal-context-server:actor-session:v1";
@@ -391,9 +393,12 @@ async function activateOpenAITunnelActorSession(requestId: string) {
                     expires_at,
                     predecessor_session_id,
                     openai_subject_hash,
-                    openai_session_hash
+                    openai_session_hash,
+                    lease_expires_at,
+                    lifecycle_kind,
+                    renewal_enabled
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $5, 'trusted_openai_thread', $9)
             `,
             [
                 sessionId,
@@ -404,6 +409,7 @@ async function activateOpenAITunnelActorSession(requestId: string) {
                 predecessorSessionId,
                 subjectHash,
                 openaiSessionHash,
+                request.approved_session_ttl_seconds === RENEWED_LEASE_SECONDS,
             ],
         );
         if (predecessorSessionId) {
@@ -459,7 +465,7 @@ export async function authenticateOpenAITunnelActorSession(
                 actor_sessions.actor_id,
                 actors.external_id AS actor_external_id,
                 actors.name AS actor_name,
-                actor_sessions.expires_at,
+                actor_sessions.lease_expires_at AS expires_at,
                 actor_sessions.revoked_at
             FROM actor_sessions
             INNER JOIN actors ON actors.id = actor_sessions.actor_id
@@ -482,13 +488,33 @@ export async function authenticateOpenAITunnelActorSession(
     const touched = await db.query(
         `
             UPDATE actor_sessions
-            SET last_used_at = NOW()
+            SET
+                last_used_at = NOW(),
+                lease_expires_at = CASE
+                    WHEN renewal_enabled AND lease_expires_at <= NOW() + ($2 * INTERVAL '1 second')
+                        THEN NOW() + ($3 * INTERVAL '1 second')
+                    ELSE lease_expires_at
+                END,
+                expires_at = CASE
+                    WHEN renewal_enabled AND lease_expires_at <= NOW() + ($2 * INTERVAL '1 second')
+                        THEN NOW() + ($3 * INTERVAL '1 second')
+                    ELSE expires_at
+                END,
+                last_renewed_at = CASE
+                    WHEN renewal_enabled AND lease_expires_at <= NOW() + ($2 * INTERVAL '1 second') THEN NOW()
+                    ELSE last_renewed_at
+                END,
+                renewal_count = CASE
+                    WHEN renewal_enabled AND lease_expires_at <= NOW() + ($2 * INTERVAL '1 second') THEN renewal_count + 1
+                    ELSE renewal_count
+                END
             WHERE session_id = $1
               AND revoked_at IS NULL
-              AND expires_at > NOW()
+              AND external_deleted_at IS NULL
+              AND lease_expires_at > NOW()
             RETURNING session_id
         `,
-        [session.session_id],
+        [session.session_id, RENEWAL_WINDOW_SECONDS, RENEWED_LEASE_SECONDS],
     );
     if (touched.rowCount !== 1) throw new Error("SESSION_REVOKED");
 
@@ -603,9 +629,12 @@ export async function claimActorSession(
                     token_hash,
                     client_label,
                     expires_at,
-                    predecessor_session_id
+                    predecessor_session_id,
+                    lease_expires_at,
+                    lifecycle_kind,
+                    renewal_enabled
                 )
-                VALUES ($1, $2, $3, $4, $5, $6)
+                VALUES ($1, $2, $3, $4, $5, $6, $5, 'native_bearer', $7)
             `,
             [
                 sessionId,
@@ -614,6 +643,7 @@ export async function claimActorSession(
                 request.client_label,
                 expiresAt.toISOString(),
                 predecessorSessionId,
+                request.approved_session_ttl_seconds === RENEWED_LEASE_SECONDS,
             ],
         );
         if (predecessorSessionId) {
@@ -686,7 +716,7 @@ export async function authenticateActorSession(
                 actors.external_id AS actor_external_id,
                 actors.name AS actor_name,
                 actor_sessions.token_hash,
-                actor_sessions.expires_at,
+                actor_sessions.lease_expires_at AS expires_at,
                 actor_sessions.revoked_at
             FROM actor_sessions
             INNER JOIN actors ON actors.id = actor_sessions.actor_id
@@ -736,7 +766,8 @@ export async function authenticateActorSession(
                 SET last_used_at = NOW()
                 WHERE session_id = $1
                   AND revoked_at IS NULL
-                  AND expires_at > NOW()
+                  AND lease_expires_at > NOW()
+                  AND external_deleted_at IS NULL
                 RETURNING session_id
             `,
             [auth.session_id],
@@ -764,6 +795,125 @@ export async function authenticateActorSession(
         actor_name: session.actor_name,
         key_id: session.session_id,
     };
+}
+
+export async function renewActorSession(auth: ActorSessionProof) {
+    const authenticated = await authenticateActorSession(auth);
+    const client = await db.connect();
+    const replacementToken = randomBytes(32).toString("base64url");
+    const replacementHash = hashCapability(replacementToken);
+
+    try {
+        await client.query("BEGIN");
+        await client.query("SELECT id FROM actors WHERE id = $1 FOR UPDATE", [authenticated.actor_id]);
+        const current = await client.query<{
+            session_id: string;
+            token_hash: string;
+            credential_generation: number;
+            renewal_enabled: boolean;
+        }>(`
+            SELECT session_id, token_hash, credential_generation, renewal_enabled
+            FROM actor_sessions
+            WHERE actor_id = $1
+              AND session_id = $2
+              AND lifecycle_kind = 'native_bearer'
+              AND revoked_at IS NULL
+              AND external_deleted_at IS NULL
+              AND lease_expires_at > NOW()
+            FOR UPDATE
+        `, [authenticated.actor_id, auth.session_id]);
+        const session = current.rows[0];
+        if (!session || !hashesEqual(session.token_hash, hashCapability(auth.session_token))) {
+            throw new Error("SESSION_REVOKED");
+        }
+        if (!session.renewal_enabled) throw new Error("SESSION_RENEWAL_NOT_ALLOWED");
+
+        const renewed = await client.query<{
+            session_id: string;
+            lease_expires_at: string | Date;
+            credential_generation: number;
+            renewal_count: number;
+        }>(`
+            UPDATE actor_sessions
+            SET
+                token_hash = $2,
+                expires_at = NOW() + ($3 * INTERVAL '1 second'),
+                lease_expires_at = NOW() + ($3 * INTERVAL '1 second'),
+                last_renewed_at = NOW(),
+                last_used_at = NOW(),
+                renewal_count = renewal_count + 1,
+                credential_generation = credential_generation + 1
+            WHERE session_id = $1
+            RETURNING session_id, lease_expires_at, credential_generation, renewal_count
+        `, [session.session_id, replacementHash, RENEWED_LEASE_SECONDS]);
+        await client.query("COMMIT");
+        const value = renewed.rows[0]!;
+        return {
+            session_id: value.session_id,
+            session_token: replacementToken,
+            actor_external_id: authenticated.actor_external_id,
+            actor_name: authenticated.actor_name,
+            expires_at: normalizeTimestamp(value.lease_expires_at),
+            credential_generation: value.credential_generation,
+            renewal_count: value.renewal_count,
+            warning: "Replace the previous session token immediately. The old token is no longer valid.",
+        };
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function recordExternalActorSessionLifecycleEvent(
+    identity: OpenAITunnelIdentity,
+    event: { event_id: string; event: "thread_deleted"; occurred_at: string },
+) {
+    if (event.event_id.length < 8 || event.event_id.length > 200) throw new Error("INVALID_EXTERNAL_LIFECYCLE_EVENT");
+    const occurredAt = new Date(event.occurred_at);
+    if (Number.isNaN(occurredAt.getTime()) || occurredAt.getTime() > Date.now() + SESSION_CLOCK_SKEW_MS) {
+        throw new Error("INVALID_EXTERNAL_LIFECYCLE_EVENT");
+    }
+    await initializeDatabase();
+    const subjectHash = hashOpenAIIdentity(identity.subject);
+    const sessionHash = hashOpenAIIdentity(identity.session);
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const matched = await client.query<{ session_id: string; external_lifecycle_event_id: string | null }>(`
+            SELECT session_id, external_lifecycle_event_id
+            FROM actor_sessions
+            WHERE openai_subject_hash = $1 AND openai_session_hash = $2
+            ORDER BY created_at DESC
+            LIMIT 1
+            FOR UPDATE
+        `, [subjectHash, sessionHash]);
+        const session = matched.rows[0];
+        if (!session) {
+            await client.query("COMMIT");
+            return { matched: false, event: event.event };
+        }
+        if (session.external_lifecycle_event_id && session.external_lifecycle_event_id !== event.event_id) {
+            throw new Error("EXTERNAL_LIFECYCLE_EVENT_CONFLICT");
+        }
+        await client.query(`
+            UPDATE actor_sessions
+            SET
+                external_deleted_at = COALESCE(external_deleted_at, $2),
+                external_lifecycle_event_id = COALESCE(external_lifecycle_event_id, $3),
+                revoked_at = COALESCE(revoked_at, NOW()),
+                revocation_reason = COALESCE(revocation_reason, 'external_thread_deleted')
+            WHERE session_id = $1
+        `, [session.session_id, occurredAt.toISOString(), event.event_id]);
+        await client.query("COMMIT");
+        return { matched: true, session_id: session.session_id, event: event.event };
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
 }
 
 export async function revokeActorSession(sessionId: string) {

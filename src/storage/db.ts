@@ -624,6 +624,57 @@ const migrations: Migration[] = [
                 WHERE group_id IS NOT NULL;
         `,
     },
+    {
+        version: 14,
+        name: "renewable_actor_session_leases",
+        sql: `
+            ALTER TABLE actor_sessions
+                ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS last_renewed_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS renewal_count INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS credential_generation INTEGER NOT NULL DEFAULT 1,
+                ADD COLUMN IF NOT EXISTS lifecycle_kind TEXT,
+                ADD COLUMN IF NOT EXISTS external_deleted_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS external_lifecycle_event_id TEXT;
+
+            UPDATE actor_sessions
+            SET
+                lease_expires_at = COALESCE(lease_expires_at, expires_at),
+                lifecycle_kind = COALESCE(
+                    lifecycle_kind,
+                    CASE
+                        WHEN openai_subject_hash IS NOT NULL AND openai_session_hash IS NOT NULL
+                            THEN 'trusted_openai_thread'
+                        ELSE 'native_bearer'
+                    END
+                );
+
+            ALTER TABLE actor_sessions
+                ALTER COLUMN lease_expires_at SET NOT NULL,
+                ALTER COLUMN lifecycle_kind SET NOT NULL;
+
+            ALTER TABLE actor_sessions
+                DROP CONSTRAINT IF EXISTS actor_sessions_lifecycle_kind_check;
+            ALTER TABLE actor_sessions
+                ADD CONSTRAINT actor_sessions_lifecycle_kind_check
+                CHECK (lifecycle_kind IN ('trusted_openai_thread', 'native_bearer'));
+
+            CREATE UNIQUE INDEX IF NOT EXISTS actor_sessions_external_lifecycle_event_idx
+                ON actor_sessions(external_lifecycle_event_id)
+                WHERE external_lifecycle_event_id IS NOT NULL;
+        `,
+    },
+    {
+        version: 15,
+        name: "authorize_actor_session_renewal",
+        sql: `
+            ALTER TABLE actor_sessions
+                ADD COLUMN IF NOT EXISTS renewal_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            CREATE INDEX IF NOT EXISTS actor_sessions_actor_lease_idx
+                ON actor_sessions(actor_id, lease_expires_at)
+                WHERE revoked_at IS NULL;
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;

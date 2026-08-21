@@ -9,6 +9,7 @@ const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
 const {
     approveActorSessionRequest,
+    recordExternalActorSessionLifecycleEvent,
     requestActorSession,
     revokeActorSession,
 } = await import("../dist/auth/actor-sessions.js");
@@ -65,7 +66,7 @@ async function connectTestClient() {
     };
 }
 
-async function requestAndApprove(client, actorExternalId, label) {
+async function requestAndApprove(client, actorExternalId, label, ttlSeconds = 3600) {
     const requested = textResult(await client.callTool({
         name: "request_actor_session",
         arguments: {
@@ -73,7 +74,7 @@ async function requestAndApprove(client, actorExternalId, label) {
             client_label: label,
         },
     })).request;
-    await approveActorSessionRequest(requested.request_id, actorExternalId, 3600);
+    await approveActorSessionRequest(requested.request_id, actorExternalId, ttlSeconds);
     const claimed = textResult(await client.callTool({
         name: "claim_actor_session",
         arguments: {
@@ -228,7 +229,8 @@ test("operator-approved actor sessions bootstrap remote private-channel clients 
         assert.equal(textResult(revokedRead).error.code, "SESSION_REVOKED");
 
         await db.query(
-            "UPDATE actor_sessions SET expires_at = NOW() - INTERVAL '1 second' WHERE session_id = $1",
+            `UPDATE actor_sessions SET expires_at = NOW() - INTERVAL '1 second',
+                lease_expires_at = NOW() - INTERVAL '1 second' WHERE session_id = $1`,
             [ownerSession.session_id],
         );
         const expiredOwner = await connection.client.callTool({
@@ -546,6 +548,145 @@ test("local approval binds the exact requesting OpenAI conversation", async () =
         } else {
             process.env.TRUST_OPENAI_TUNNEL_IDENTITY = previousTrust;
         }
+    }
+});
+
+test("trusted OpenAI use renews only the exact current thread inside the renewal window", async () => {
+    const previousTrust = process.env.TRUST_OPENAI_TUNNEL_IDENTITY;
+    process.env.TRUST_OPENAI_TUNNEL_IDENTITY = "true";
+    const actorExternalId = uniqueValue("actor:test:openai-renewal");
+    const actor = await identifyActor({ external_id: actorExternalId, name: "OpenAI Renewal", kind: "ai" });
+    const connection = await connectTestClient();
+    const meta = openAITunnelMeta("renewal-account", uniqueValue("renewal-thread"));
+    let requestId;
+    let sessionId;
+    try {
+        const requested = textResult(await connection.client.callTool({
+            name: "request_actor_session",
+            arguments: { actor_external_id: actorExternalId, client_label: "renewal-thread" },
+            _meta: meta,
+        })).request;
+        requestId = requested.request_id;
+        const approved = await approveActorSessionRequest(requestId, actorExternalId, 2_592_000);
+        sessionId = approved.activated_session.session_id;
+        await db.query(`UPDATE actor_sessions SET expires_at = NOW() + INTERVAL '1 day',
+            lease_expires_at = NOW() + INTERVAL '1 day' WHERE session_id = $1`, [sessionId]);
+
+        const authenticated = await connection.client.callTool({ name: "list_channels", arguments: {}, _meta: meta });
+        assert.notEqual(authenticated.isError, true);
+        const stored = await db.query(`SELECT lease_expires_at, last_renewed_at, renewal_count,
+            credential_generation, lifecycle_kind FROM actor_sessions WHERE session_id = $1`, [sessionId]);
+        assert.equal(stored.rows[0].lifecycle_kind, "trusted_openai_thread");
+        assert.equal(stored.rows[0].renewal_count, 1);
+        assert.equal(stored.rows[0].credential_generation, 1);
+        assert.ok(stored.rows[0].last_renewed_at);
+        const remainingDays = (new Date(stored.rows[0].lease_expires_at).getTime() - Date.now()) / 86_400_000;
+        assert.ok(remainingDays > 29 && remainingDays <= 30.01);
+    } finally {
+        if (requestId) await db.query("DELETE FROM actor_session_requests WHERE request_id = $1", [requestId]);
+        if (sessionId) await db.query("DELETE FROM actor_sessions WHERE session_id = $1", [sessionId]);
+        await db.query("DELETE FROM actors WHERE id = $1", [actor.actor.id]);
+        await connection.close();
+        if (previousTrust === undefined) delete process.env.TRUST_OPENAI_TUNNEL_IDENTITY;
+        else process.env.TRUST_OPENAI_TUNNEL_IDENTITY = previousTrust;
+    }
+});
+
+test("native renewal preserves session identity and immediately rotates its token", async () => {
+    const actorExternalId = uniqueValue("actor:test:native-renewal");
+    const actor = await identifyActor({ external_id: actorExternalId, name: "Native Renewal", kind: "ai" });
+    const connection = await connectTestClient();
+    let requestId;
+    let sessionId;
+    try {
+        const initial = await requestAndApprove(connection.client, actorExternalId, "native-renewal", 2_592_000);
+        requestId = initial.requested.request_id;
+        sessionId = initial.claimed.session_id;
+        const renewed = textResult(await connection.client.callTool({
+            name: "renew_actor_session",
+            arguments: { auth: sessionAuth(initial.claimed) },
+        })).session;
+        assert.equal(renewed.session_id, sessionId);
+        assert.notEqual(renewed.session_token, initial.claimed.session_token);
+        assert.equal(renewed.credential_generation, 2);
+        assert.equal(renewed.renewal_count, 1);
+
+        const oldToken = await connection.client.callTool({
+            name: "list_channels", arguments: { auth: sessionAuth(initial.claimed) },
+        });
+        assert.equal(oldToken.isError, true);
+        assert.equal(textResult(oldToken).error.code, "AUTHENTICATION_FAILED");
+        const currentToken = await connection.client.callTool({
+            name: "list_channels", arguments: { auth: sessionAuth(renewed) },
+        });
+        assert.notEqual(currentToken.isError, true);
+    } finally {
+        if (requestId) await db.query("DELETE FROM actor_session_requests WHERE request_id = $1", [requestId]);
+        if (sessionId) await db.query("DELETE FROM actor_sessions WHERE session_id = $1", [sessionId]);
+        await db.query("DELETE FROM actors WHERE id = $1", [actor.actor.id]);
+        await connection.close();
+    }
+});
+
+test("short fixed actor sessions cannot widen themselves into renewable leases", async () => {
+    const actorExternalId = uniqueValue("actor:test:fixed-session");
+    const actor = await identifyActor({ external_id: actorExternalId, name: "Fixed Session", kind: "ai" });
+    const connection = await connectTestClient();
+    let requestId;
+    let sessionId;
+    try {
+        const fixed = await requestAndApprove(connection.client, actorExternalId, "fixed-session", 3600);
+        requestId = fixed.requested.request_id;
+        sessionId = fixed.claimed.session_id;
+        const attempted = await connection.client.callTool({
+            name: "renew_actor_session", arguments: { auth: sessionAuth(fixed.claimed) },
+        });
+        assert.equal(attempted.isError, true);
+        assert.equal(textResult(attempted).error.code, "SESSION_RENEWAL_NOT_ALLOWED");
+        const stored = await db.query("SELECT renewal_enabled, renewal_count FROM actor_sessions WHERE session_id = $1", [sessionId]);
+        assert.equal(stored.rows[0].renewal_enabled, false);
+        assert.equal(stored.rows[0].renewal_count, 0);
+    } finally {
+        if (requestId) await db.query("DELETE FROM actor_session_requests WHERE request_id = $1", [requestId]);
+        if (sessionId) await db.query("DELETE FROM actor_sessions WHERE session_id = $1", [sessionId]);
+        await db.query("DELETE FROM actors WHERE id = $1", [actor.actor.id]);
+        await connection.close();
+    }
+});
+
+test("verified external deletion revokes only the exact bound OpenAI thread idempotently", async () => {
+    const previousTrust = process.env.TRUST_OPENAI_TUNNEL_IDENTITY;
+    process.env.TRUST_OPENAI_TUNNEL_IDENTITY = "true";
+    const actorExternalId = uniqueValue("actor:test:external-deletion");
+    const actor = await identifyActor({ external_id: actorExternalId, name: "External Deletion", kind: "ai" });
+    const connection = await connectTestClient();
+    const firstMeta = openAITunnelMeta("deletion-account", uniqueValue("deleted-thread"));
+    const secondMeta = openAITunnelMeta("deletion-account", uniqueValue("current-thread"));
+    const requestIds = [];
+    try {
+        let activeSession;
+        for (const [meta, label] of [[firstMeta, "deleted-thread"], [secondMeta, "current-thread"]]) {
+            const requested = textResult(await connection.client.callTool({
+                name: "request_actor_session", arguments: { actor_external_id: actorExternalId, client_label: label }, _meta: meta,
+            })).request;
+            requestIds.push(requested.request_id);
+            activeSession = (await approveActorSessionRequest(requested.request_id, actorExternalId, 2_592_000)).activated_session;
+        }
+        const event = { event_id: uniqueValue("openai-event"), event: "thread_deleted", occurred_at: new Date().toISOString() };
+        const first = await recordExternalActorSessionLifecycleEvent({ subject: firstMeta["openai/subject"], session: firstMeta["openai/session"] }, event);
+        const replay = await recordExternalActorSessionLifecycleEvent({ subject: firstMeta["openai/subject"], session: firstMeta["openai/session"] }, event);
+        assert.deepEqual(replay, first);
+        const current = await connection.client.callTool({ name: "list_channels", arguments: {}, _meta: secondMeta });
+        assert.notEqual(current.isError, true);
+        const active = await db.query("SELECT revoked_at FROM actor_sessions WHERE session_id = $1", [activeSession.session_id]);
+        assert.equal(active.rows[0].revoked_at, null);
+    } finally {
+        await db.query("DELETE FROM actor_session_requests WHERE request_id = ANY($1::text[])", [requestIds]);
+        await db.query("DELETE FROM actor_sessions WHERE actor_id = $1", [actor.actor.id]);
+        await db.query("DELETE FROM actors WHERE id = $1", [actor.actor.id]);
+        await connection.close();
+        if (previousTrust === undefined) delete process.env.TRUST_OPENAI_TUNNEL_IDENTITY;
+        else process.env.TRUST_OPENAI_TUNNEL_IDENTITY = previousTrust;
     }
 });
 

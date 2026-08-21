@@ -444,7 +444,7 @@ tokens and cryptographic proofs out of the model conversation:
    npm run actor-session:approve -- \
      --request-id asr_<id> \
      --actor actor:openai:chatgpt \
-     --ttl-seconds 86400
+     --ttl-seconds 2592000
    ```
 
 3. Approval atomically activates the exact OpenAI conversation that created the
@@ -456,6 +456,17 @@ tokens and cryptographic proofs out of the model conversation:
 The pending request expires after 15 minutes. Its OpenAI identity values are
 stored only as domain-separated hashes. Successful local approval performs the
 same atomic one-actor/one-timeline handoff as bearer-session claims.
+
+The approved conversation receives a 30-day renewable dead-man lease. Whenever
+the exact current trusted conversation authenticates during the final seven
+days, the server extends its lease to 30 days. This does not create another
+timeline or broaden authority. Replacement and operator revocation remain
+immediate. Context Server does not currently receive a trustworthy external
+conversation-deletion event, so it never infers deletion from inactivity.
+The core exposes a local-only, idempotent external lifecycle adapter for a
+future trusted tunnel integration. It hashes the exact subject/thread binding
+and can record `thread_deleted`; it is intentionally not registered as an MCP
+tool or network endpoint until an authoritative event source exists.
 
 Only enable `TRUST_OPENAI_TUNNEL_IDENTITY` when the server's MCP input is
 exclusively controlled by the trusted tunnel process. Direct MCP clients can
@@ -475,6 +486,11 @@ in authenticated channel calls:
      "nonce": "a-new-value-at-least-16-characters"
    }
    ```
+
+Native clients renew explicitly with `renew_actor_session`. A successful
+renewal preserves `session_id`, extends the lease to 30 days, and returns a new
+`session_token` exactly once. The previous token is invalid immediately. An
+expired, revoked, deleted, or replaced session cannot renew itself.
 
 Operators may deny or revoke the capability without handling its secret:
 
@@ -496,9 +512,9 @@ expected actor ID. The high-entropy claim code prevents another caller that
 only learns the request ID from claiming the approved capability. Requests
 expire after 15 minutes; approval starts a fresh 15-minute claim window.
 Claiming is one-time, and only token hashes are stored. Actor sessions are
-bearer capabilities protected by the MCP tunnel transport, limited expiry,
-revocation, timestamp checks, and one-use nonces. Ed25519 remains the stronger
-choice for runtimes that can sign locally.
+renewable capabilities protected by the MCP tunnel transport, a 30-day
+dead-man lease, immediate revocation, timestamp checks, and one-use nonces.
+Ed25519 remains the stronger choice for runtimes that can sign locally.
 
 Each durable actor has exactly one current actor-session timeline. Creating a
 replacement request does not disturb the current session. For trusted OpenAI
@@ -604,7 +620,8 @@ This project is licensed under the [MIT License](LICENSE).
 | `acknowledge_context` | Idempotently acknowledge an ordinary Whiteboard context. Arguments: `context_id` and optional explicit `actor`; otherwise the current MCP actor session is used. Other visibility classes are not accessible through this tool. | JSON text containing `{ "context_id", "acknowledged", "context" }`. Context records expose deterministic `acknowledged_by` actor entries without actor metadata. |
 | `request_actor_session` | Request a pending remote actor session for explicit local approval. Trusted OpenAI requests capture the current opaque conversation binding and omit the native claim code. | `{ "request": { "request_id", "status", ... } }` for OpenAI, or `{ "request": { "request_id", "claim_code", "status", ... } }` for native clients |
 | `get_actor_session_request_status` | Check a request using its request ID and secret claim code. | `{ "request": { "status", ... } }` |
-| `claim_actor_session` | Claim an approved request once and receive an expiring bearer capability. | `{ "session": { "session_id", "session_token", "expires_at", ... } }` |
+| `claim_actor_session` | Claim an approved request once and receive a renewable native bearer capability. | `{ "session": { "session_id", "session_token", "expires_at", ... } }` |
+| `renew_actor_session` | Native clients only: authenticate the current session, extend its lease to 30 days, and atomically rotate its bearer token. | `{ "session": { "session_id", "session_token", "expires_at", "credential_generation", "renewal_count", ... } }` |
 | `create_channel` | Create a private channel using an authenticated request. The signing actor becomes owner. | `{ "channel": channel }` |
 | `add_channel_member` | Add or restore a durable actor. Requires an authenticated channel owner/admin. | `{ "membership": membership }` |
 | `remove_channel_member` | Remove a non-owner actor. Requires an authenticated channel owner/admin. | `{ "membership": { "removed": boolean, ... } }` |
