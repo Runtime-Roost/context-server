@@ -491,6 +491,11 @@ test("local approval binds the exact requesting OpenAI conversation", async () =
         });
         assert.equal(otherConversation.isError, true);
         assert.equal(textResult(otherConversation).error.code, "AUTHENTICATION_REQUIRED");
+        assert.match(
+            textResult(otherConversation).error.message,
+            /approve that exact request in Agent Companion/,
+        );
+        assert.match(textResult(otherConversation).error.message, /Do not use a PIN/);
 
         const otherSubject = await connection.client.callTool({
             name: "list_channels",

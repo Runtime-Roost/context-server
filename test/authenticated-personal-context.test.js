@@ -99,6 +99,10 @@ test("personal context is private to the authenticated actor across every operat
         });
         assert.equal(unauthenticated.isError, true);
         assert.equal(textResult(unauthenticated).error.code, "AUTHENTICATION_REQUIRED");
+        assert.equal(
+            textResult(unauthenticated).error.message,
+            "Provide explicit cryptographic authentication or request and claim an operator-approved native actor session.",
+        );
 
         const saved = textResult(await signedCall(
             client,
