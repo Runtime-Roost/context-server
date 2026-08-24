@@ -91,7 +91,7 @@ const requestAuthSchema = z.union([
     actorSessionAuthSchema,
 ]);
 
-function authenticationError(error: unknown) {
+function authenticationError(error: unknown, safeDetails?: { actor_external_id?: string }) {
     const candidate = error instanceof Error ? error.message : "AUTHENTICATION_FAILED";
     const exposedCodes = new Set([
         "AUTHENTICATION_FAILED",
@@ -101,7 +101,7 @@ function authenticationError(error: unknown) {
         "ACCESS_GROUP_OWNER_CANNOT_BE_REMOVED",
         "ACTOR_NOT_FOUND",
         "ACTOR_SESSION_REQUEST_NOT_FOUND",
-        "ACTOR_SESSION_REQUEST_REJECTED",
+        "ACTOR_SESSION_PENDING_LIMIT_REACHED",
         "SESSION_REVOKED",
         "SESSION_RENEWAL_NOT_ALLOWED",
         "AUTHENTICATION_REQUIRED",
@@ -124,6 +124,9 @@ function authenticationError(error: unknown) {
                 text: JSON.stringify({
                     error: {
                         code,
+                        ...(code === "ACTOR_NOT_FOUND" && safeDetails?.actor_external_id
+                            ? { actor_external_id: safeDetails.actor_external_id }
+                            : {}),
                         message: code === "AUTHENTICATION_FAILED"
                             ? "The signed request could not be authenticated."
                             : code === "AUTHENTICATION_REQUIRED"
@@ -140,8 +143,10 @@ function authenticationError(error: unknown) {
                                     ? "The request was rejected."
                                     : code === "ACTOR_SESSION_REQUEST_NOT_FOUND"
                                         ? "The actor-session request was not found, was not approved, expired, was already claimed, or the claim code was invalid."
-                                        : code === "ACTOR_SESSION_REQUEST_REJECTED"
-                                            ? "The actor-session request was rejected."
+                                        : code === "ACTOR_NOT_FOUND"
+                                            ? "No durable actor matches the supplied actor_external_id. Use the exact canonical actor identity assigned by the operator; a display name or human name is not an actor identity."
+                                        : code === "ACTOR_SESSION_PENDING_LIMIT_REACHED"
+                                            ? "This actor already has the maximum number of unexpired pending or approved actor-session requests. Complete, deny, or allow those requests to expire before trying again."
                                     : candidate,
                     },
                 }),
@@ -262,7 +267,7 @@ export function createServer() {
                 openWorldHint: false,
             },
             inputSchema: {
-                actor_external_id: z.string().min(1).describe("Durable actor identity the client asks the local operator to approve."),
+                actor_external_id: z.string().min(1).max(200).describe("Exact canonical durable actor identity the client asks the local operator to approve. Display names and human names are not actor identities."),
                 client_label: z.string().min(1).max(200).optional().describe("Human-readable client or conversation label shown to the operator."),
             },
         },
@@ -283,7 +288,7 @@ export function createServer() {
                     }],
                 };
             } catch (error) {
-                return authenticationError(error);
+                return authenticationError(error, { actor_external_id });
             }
         },
     );

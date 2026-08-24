@@ -91,6 +91,13 @@ export async function requestActorSession(
     identity?: OpenAITunnelIdentity,
 ) {
     await initializeDatabase();
+    const actor = await db.query(
+        "SELECT 1 FROM actors WHERE external_id = $1",
+        [actorExternalId],
+    );
+    if (actor.rowCount !== 1) {
+        throw new Error("ACTOR_NOT_FOUND");
+    }
     const requestId = `asr_${randomUUID()}`;
     const claimCode = randomBytes(32).toString("base64url");
     const claimSecretHash = hashCapability(claimCode);
@@ -159,7 +166,7 @@ export async function requestActorSession(
     const request = result.rows[0];
 
     if (!request) {
-        throw new Error("ACTOR_SESSION_REQUEST_REJECTED");
+        throw new Error("ACTOR_SESSION_PENDING_LIMIT_REACHED");
     }
 
     const response = {

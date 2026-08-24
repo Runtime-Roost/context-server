@@ -85,6 +85,47 @@ async function requestAndApprove(client, actorExternalId, label, ttlSeconds = 36
     return { requested, claimed };
 }
 
+test("actor-session requests distinguish unknown canonical actors from local capacity", async () => {
+    const connection = await connectTestClient();
+    const unknownActor = uniqueValue("Blake");
+    const actorExternalId = uniqueValue("actor:test:request-capacity");
+    const actor = await identifyActor({ external_id: actorExternalId, name: "Request Capacity", kind: "ai" });
+    const requestIds = [];
+    try {
+        const unknown = await connection.client.callTool({
+            name: "request_actor_session",
+            arguments: { actor_external_id: unknownActor, client_label: "wrong identity" },
+        });
+        assert.equal(unknown.isError, true);
+        assert.deepEqual(textResult(unknown).error, {
+            code: "ACTOR_NOT_FOUND",
+            actor_external_id: unknownActor,
+            message: "No durable actor matches the supplied actor_external_id. Use the exact canonical actor identity assigned by the operator; a display name or human name is not an actor identity.",
+        });
+
+        for (let index = 0; index < 3; index += 1) {
+            const result = textResult(await connection.client.callTool({
+                name: "request_actor_session",
+                arguments: { actor_external_id: actorExternalId, client_label: `pending ${index + 1}` },
+            }));
+            requestIds.push(result.request.request_id);
+        }
+        const atCapacity = await connection.client.callTool({
+            name: "request_actor_session",
+            arguments: { actor_external_id: actorExternalId, client_label: "one too many" },
+        });
+        assert.equal(atCapacity.isError, true);
+        assert.equal(textResult(atCapacity).error.code, "ACTOR_SESSION_PENDING_LIMIT_REACHED");
+        assert.match(textResult(atCapacity).error.message, /maximum number of unexpired pending or approved/);
+    } finally {
+        if (requestIds.length > 0) {
+            await db.query("DELETE FROM actor_session_requests WHERE request_id = ANY($1::text[])", [requestIds]);
+        }
+        await db.query("DELETE FROM actors WHERE id = $1", [actor.actor.id]);
+        await connection.close();
+    }
+});
+
 test("operator-approved actor sessions bootstrap remote private-channel clients safely", async () => {
     const ownerExternalId = uniqueValue("actor:test:session-owner");
     const memberExternalId = uniqueValue("actor:test:session-member");
