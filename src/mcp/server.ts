@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
     authenticateRequest,
@@ -257,7 +257,36 @@ export function requireActorIdentificationEnabled() {
     return process.env.REQUIRE_ACTOR_IDENTIFICATION?.trim().toLowerCase() === "true";
 }
 
-export function createServer() {
+export type ContextServerSurface = "full" | "conversation";
+
+const CONVERSATION_TOOL_NAMES = new Set([
+    "request_actor_session",
+    "get_actor_session_request_status",
+    "save_context",
+    "search_context",
+    "get_context",
+    "acknowledge_context",
+    "save_channel_context",
+    "search_channel_context",
+    "get_channel_context",
+    "save_personal_context",
+    "search_personal_context",
+    "get_personal_context",
+]);
+
+function applyToolSurface(server: McpServer, surface: ContextServerSurface) {
+    if (surface === "full") return;
+
+    const registry = (server as unknown as {
+        _registeredTools: Record<string, RegisteredTool>;
+    })._registeredTools;
+
+    for (const [name, tool] of Object.entries(registry)) {
+        if (!CONVERSATION_TOOL_NAMES.has(name)) tool.disable();
+    }
+}
+
+export function createServer(options: { surface?: ContextServerSurface } = {}) {
     const actorSession = new ActiveActorSession();
     const server = new McpServer({
         name: "personal-context-server",
@@ -2040,5 +2069,6 @@ export function createServer() {
         }
     );
 
+    applyToolSurface(server, options.surface ?? "full");
     return server;
 }

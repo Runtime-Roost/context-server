@@ -21,7 +21,8 @@
     "inspection:mobile": "npm run build && node dist/inspection/mobile-server.js",
     "mcp:config": "node scripts/generate-mcp-config.mjs",
     "test": "npm run build && node --test test/*.test.js",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "start:conversation": "node dist/conversation-index.js"
   },
   "repository": {
     "type": "git",
