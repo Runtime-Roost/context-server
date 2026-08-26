@@ -15,6 +15,7 @@ import {
     ACCESS_GROUP_ROLE_VALUES,
     CHANNEL_ROLE_VALUES,
     SEARCH_SENSITIVITY_VALUES,
+    type ContextRecord,
     WRITABLE_CONTEXT_VISIBILITY_VALUES,
     acknowledgeContextWithActor,
     actorPurgeConfirm,
@@ -73,6 +74,59 @@ import {
     listContextAttachments,
     readAttachmentChunk,
 } from "../storage/attachments.js";
+
+const DEFAULT_CONTEXT_RESULT_LIMIT = 5;
+const MAX_CONTEXT_RESULT_CONTENT_CHARS = 8_000;
+const MAX_CONTEXT_RESULT_PAYLOAD_CHARS = 24_000;
+const LIST_CONTEXT_EXCERPT_CHARS = 500;
+
+type ProjectedContextRecord = ContextRecord & {
+    content_length?: number;
+    content_truncated?: boolean;
+};
+
+export function projectContextResults(
+    records: ContextRecord[],
+    mode: "search" | "list",
+) {
+    const projected: ProjectedContextRecord[] = [];
+    let payloadChars = 0;
+    let responseTruncated = false;
+
+    for (const record of records) {
+        const contentLimit = mode === "list"
+            ? LIST_CONTEXT_EXCERPT_CHARS
+            : MAX_CONTEXT_RESULT_CONTENT_CHARS;
+        const contentTruncated = record.content.length > contentLimit;
+        const candidate: ProjectedContextRecord = {
+            ...record,
+            content: contentTruncated
+                ? record.content.slice(0, contentLimit)
+                : record.content,
+            ...(contentTruncated
+                ? {
+                    content_length: record.content.length,
+                    content_truncated: true,
+                }
+                : {}),
+        };
+        const candidateChars = JSON.stringify(candidate).length;
+
+        if (payloadChars + candidateChars > MAX_CONTEXT_RESULT_PAYLOAD_CHARS) {
+            responseTruncated = true;
+            break;
+        }
+
+        projected.push(candidate);
+        payloadChars += candidateChars;
+    }
+
+    return {
+        results: projected,
+        response_truncated: responseTruncated || projected.length < records.length,
+        returned_count: projected.length,
+    };
+}
 
 const signedRequestAuthSchema = z.object({
     key_id: z.string().min(1).describe("Enrolled actor key identifier."),
@@ -477,7 +531,7 @@ export function createServer() {
     server.registerTool(
         "search_context",
         {
-            description: "Read matching notes from the local shared Whiteboard. This does not modify data or contact external services. Sensitivity controls semantic filtering strictness: low is broad, medium is balanced, and high is narrow.",
+            description: "Read semantically matching notes from the local shared Whiteboard. Defaults to high sensitivity and five results to avoid injecting unrelated history. Use low or medium only when the user explicitly asks for a broader search.",
             annotations: {
                 title: "Search Shared Whiteboard",
                 readOnlyHint: true,
@@ -488,13 +542,14 @@ export function createServer() {
             inputSchema: {
                 query: z.string().min(1).describe("The search query."),
                 limit: z.number().int().positive().optional().describe("Maximum number of context items to return."),
-                sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness. Low is broad (default), medium is balanced, and high is narrow and may return no results."),
+                sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness. High is the safe default and may return no results; medium and low progressively broaden retrieval."),
                 actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
             },
         },
         async ({ query, limit, sensitivity, actor_external_id }) => {
-            const selectedSensitivity = sensitivity ?? "low";
+            const selectedSensitivity = sensitivity ?? "high";
             const results = await searchContext(query, limit, selectedSensitivity, actor_external_id);
+            const projected = projectContextResults(results, "search");
 
             return {
                 content: [
@@ -502,10 +557,10 @@ export function createServer() {
                         type: "text",
                         text: JSON.stringify({
                             query,
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             sensitivity: selectedSensitivity,
                             ...(actor_external_id ? { actor_external_id } : {}),
-                            results,
+                            ...projected,
                         }),
                     },
                 ],
@@ -542,7 +597,7 @@ export function createServer() {
     server.registerTool(
         "list_recent_context",
         {
-            description: "Read the newest notes from the local shared Whiteboard. This does not modify data or contact external services.",
+            description: "Read compact excerpts of the newest notes from the local shared Whiteboard. Use get_context for one complete record.",
             annotations: {
                 title: "List Recent Shared Whiteboard Notes",
                 readOnlyHint: true,
@@ -557,15 +612,16 @@ export function createServer() {
         },
         async ({ limit, actor_external_id }) => {
             const results = await listRecentContext(limit, actor_external_id);
+            const projected = projectContextResults(results, "list");
 
             return {
                 content: [
                     {
                         type: "text",
                         text: JSON.stringify({
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             ...(actor_external_id ? { actor_external_id } : {}),
-                            results,
+                            ...projected,
                         }),
                     },
                 ],
@@ -747,7 +803,7 @@ export function createServer() {
     server.registerTool(
         "search_channel_context",
         {
-            description: "Search one channel's history after authenticating current read membership.",
+            description: "Search one channel's history after authenticating current read membership. Defaults to high sensitivity and five results to avoid injecting unrelated history.",
             annotations: {
                 title: "Search Channel History",
                 readOnlyHint: true,
@@ -768,7 +824,7 @@ export function createServer() {
 
             try {
                 const authenticated = await authenticateTool("search_channel_context", payload, auth, extra);
-                const selectedSensitivity = sensitivity ?? "low";
+                const selectedSensitivity = sensitivity ?? "high";
                 const results = await searchChannelContext(
                     authenticated.actor_id,
                     channel,
@@ -776,15 +832,16 @@ export function createServer() {
                     limit,
                     selectedSensitivity,
                 );
+                const projected = projectContextResults(results, "search");
                 return {
                     content: [{
                         type: "text",
                         text: JSON.stringify({
                             channel,
                             query,
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             sensitivity: selectedSensitivity,
-                            results,
+                            ...projected,
                         }),
                     }],
                 };
@@ -797,7 +854,7 @@ export function createServer() {
     server.registerTool(
         "list_channel_context",
         {
-            description: "List recent history from one channel after authenticating current read membership.",
+            description: "List compact excerpts of recent channel history after authenticating current read membership. Use get_channel_context for one complete record.",
             annotations: {
                 title: "List Channel History",
                 readOnlyHint: true,
@@ -821,10 +878,11 @@ export function createServer() {
                     channel,
                     limit,
                 );
+                const projected = projectContextResults(results, "list");
                 return {
                     content: [{
                         type: "text",
-                        text: JSON.stringify({ channel, limit: limit ?? 20, results }),
+                        text: JSON.stringify({ channel, limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT, ...projected }),
                     }],
                 };
             } catch (error) {
@@ -1089,7 +1147,7 @@ export function createServer() {
     server.registerTool(
         "search_group_context",
         {
-            description: "Search one access group's records after authenticating current read membership.",
+            description: "Search one access group's records after authenticating current read membership. Defaults to high sensitivity and five results.",
             annotations: {
                 title: "Search Group Context",
                 readOnlyHint: true,
@@ -1110,7 +1168,7 @@ export function createServer() {
 
             try {
                 const authenticated = await authenticateTool("search_group_context", payload, auth, extra);
-                const selectedSensitivity = sensitivity ?? "low";
+                const selectedSensitivity = sensitivity ?? "high";
                 const results = await searchGroupContext(
                     authenticated.actor_id,
                     group,
@@ -1118,15 +1176,16 @@ export function createServer() {
                     limit,
                     selectedSensitivity,
                 );
+                const projected = projectContextResults(results, "search");
                 return {
                     content: [{
                         type: "text",
                         text: JSON.stringify({
                             group,
                             query,
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             sensitivity: selectedSensitivity,
-                            results,
+                            ...projected,
                         }),
                     }],
                 };
@@ -1139,7 +1198,7 @@ export function createServer() {
     server.registerTool(
         "list_group_context",
         {
-            description: "List recent records owned by one access group after authenticating current read membership.",
+            description: "List compact excerpts of recent access-group records after authenticating current read membership. Use get_group_context for one complete record.",
             annotations: {
                 title: "List Group Context",
                 readOnlyHint: true,
@@ -1159,8 +1218,9 @@ export function createServer() {
             try {
                 const authenticated = await authenticateTool("list_group_context", payload, auth, extra);
                 const results = await listGroupContext(authenticated.actor_id, group, limit);
+                const projected = projectContextResults(results, "list");
                 return {
-                    content: [{ type: "text", text: JSON.stringify({ group, limit: limit ?? 20, results }) }],
+                    content: [{ type: "text", text: JSON.stringify({ group, limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT, ...projected }) }],
                 };
             } catch (error) {
                 return authenticationError(error);
@@ -1293,7 +1353,7 @@ export function createServer() {
     server.registerTool(
         "search_personal_context",
         {
-            description: "Search only the authenticated actor's private notebook. Actor ownership is enforced before semantic ranking.",
+            description: "Search only the authenticated actor's private notebook. Actor ownership is enforced before semantic ranking; retrieval defaults to high sensitivity and five results.",
             annotations: {
                 title: "Search Private Notebook",
                 readOnlyHint: true,
@@ -1313,21 +1373,22 @@ export function createServer() {
 
             try {
                 const authenticated = await authenticateTool("search_personal_context", payload, auth, extra);
-                const selectedSensitivity = sensitivity ?? "low";
+                const selectedSensitivity = sensitivity ?? "high";
                 const results = await searchPersonalContext(
                     authenticated.actor_id,
                     query,
                     limit,
                     selectedSensitivity,
                 );
+                const projected = projectContextResults(results, "search");
                 return {
                     content: [{
                         type: "text",
                         text: JSON.stringify({
                             query,
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             sensitivity: selectedSensitivity,
-                            results,
+                            ...projected,
                         }),
                     }],
                 };
@@ -1340,7 +1401,7 @@ export function createServer() {
     server.registerTool(
         "list_personal_context",
         {
-            description: "List recent private notebook records owned by the authenticated actor.",
+            description: "List compact excerpts of recent private notebook records owned by the authenticated actor. Use get_personal_context for one complete record.",
             annotations: {
                 title: "List Private Notebook",
                 readOnlyHint: true,
@@ -1359,10 +1420,11 @@ export function createServer() {
             try {
                 const authenticated = await authenticateTool("list_personal_context", payload, auth, extra);
                 const results = await listPersonalContext(authenticated.actor_id, limit);
+                const projected = projectContextResults(results, "list");
                 return {
                     content: [{
                         type: "text",
-                        text: JSON.stringify({ limit: limit ?? 20, results }),
+                        text: JSON.stringify({ limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT, ...projected }),
                     }],
                 };
             } catch (error) {

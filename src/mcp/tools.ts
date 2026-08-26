@@ -163,9 +163,9 @@ type PendingPurge = {
     expiresAt: Date;
 };
 
-const DEFAULT_CONTEXT_LIMIT = 20;
+const DEFAULT_CONTEXT_LIMIT = 5;
 const MAX_CONTEXT_LIMIT = 100;
-const DEFAULT_SEARCH_SENSITIVITY: SearchSensitivity = "low";
+const DEFAULT_SEARCH_SENSITIVITY: SearchSensitivity = "high";
 const DEFAULT_CONTEXT_VISIBILITY: WritableContextVisibility = "whiteboard";
 const WHITEBOARD_READ_PREDICATE = "contexts.visibility = 'whiteboard'";
 const PURGE_CONFIRMATION_TTL_MS = 10 * 60 * 1000;
