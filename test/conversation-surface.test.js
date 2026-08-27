@@ -18,8 +18,8 @@ test("conversation surface advertises only the bounded conversational contract",
         const serialized = JSON.stringify(response);
 
         assert.deepEqual(names, [
-            "acknowledge_context",
             "acknowledge_direct_context",
+            "assemble_context",
             "bind_sso_session",
             "get_actor_session_request_status",
             "get_channel_context",
@@ -51,13 +51,14 @@ test("full surface remains available for local administration", async () => {
 
     try {
         const response = await client.listTools();
-        assert.equal(response.tools.length, 67);
+        assert.equal(response.tools.length, 68);
         assert.ok(response.tools.some(({ name }) => name === "vacuum_database"));
         assert.ok(response.tools.some(({ name }) => name === "connect_contexts"));
         assert.ok(response.tools.some(({ name }) => name === "disconnect_contexts"));
         assert.ok(response.tools.some(({ name }) => name === "update_context_lifecycle"));
         assert.ok(response.tools.some(({ name }) => name === "preview_auto_archive"));
         assert.ok(response.tools.some(({ name }) => name === "confirm_auto_archive"));
+        assert.ok(response.tools.some(({ name }) => name === "assemble_context"));
     } finally {
         await client.close();
         await server.close();

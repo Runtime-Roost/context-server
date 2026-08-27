@@ -17,6 +17,7 @@ const {
     acknowledgeContextWithActor,
     actorPurgeConfirm,
     actorPurgePreview,
+    assembleContext,
     connectContexts,
     confirmAutoArchive,
     disconnectContexts,
@@ -912,6 +913,32 @@ test("auto-archive requires a reviewed preview and protects tagged or connected 
     } finally {
         await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[candidate.id, protectedContext.id]]);
         await db.query("DELETE FROM actors WHERE id = $1", [reviewer.id]);
+    }
+});
+
+test("context assembly is actor-bounded, graph-aware, lazily hydrated, and metered", async () => {
+    await initializeDatabase();
+    const owner = (await identifyActor({ external_id: uniqueValue("actor:test:assembly-owner"), name: "Assembly Owner" })).actor;
+    const outsider = (await identifyActor({ external_id: uniqueValue("actor:test:assembly-outsider"), name: "Assembly Outsider" })).actor;
+    const marker = uniqueValue("assembly-marker");
+    const source = await savePersonalContext(owner.id, `${marker} ${"x".repeat(900)}`);
+    const neighbor = await savePersonalContext(owner.id, `graph neighbor ${"y".repeat(900)}`);
+    const hidden = await savePersonalContext(outsider.id, `${marker} hidden outsider`);
+    try {
+        await connectContexts(owner.id, source.id, neighbor.id, "led_to", "assembly graph expansion");
+        const assembly = await assembleContext(owner.id, marker, { limit: 5, hydrateLimit: 1, maxContentChars: 3000 });
+        assert.deepEqual(assembly.items.map((item) => item.context.id), [source.id, neighbor.id]);
+        assert.equal(assembly.items[0].hydrated, true);
+        assert.equal(assembly.items[1].hydrated, false);
+        assert.equal(assembly.items[1].context.content.length, 500);
+        assert.equal(assembly.items[1].via.kind, "connection");
+        assert.ok(!assembly.items.some((item) => item.context.id === hidden.id));
+        const telemetry = await db.query("SELECT retrieval_count, last_retrieved_at FROM contexts WHERE id = ANY($1::bigint[]) ORDER BY id", [[source.id, neighbor.id]]);
+        assert.deepEqual(telemetry.rows.map((row) => Number(row.retrieval_count)), [1, 1]);
+        assert.ok(telemetry.rows.every((row) => row.last_retrieved_at));
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[source.id, neighbor.id, hidden.id]]);
+        await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[owner.id, outsider.id]]);
     }
 });
 

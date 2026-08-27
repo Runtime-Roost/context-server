@@ -298,6 +298,22 @@ the transaction, writes ordinary reversible archive history, and never deletes
 payloads or graph edges. A changed, expired, replayed, foreign, or expanded
 selection fails closed.
 
+### Bounded retrieval assembly
+
+`assemble_context` authenticates the active OpenAI tunnel actor, finds lexical
+seed envelopes only inside that actor's readable Whiteboard, personal, channel,
+and group scopes, and restores one hop of authorized graph topology. Archived
+Whiteboard records are excluded from ordinary seed search and may surface only
+as connected nodes. Direct and system records are never assembled.
+
+Assembly ranks lifecycle importance, returns at most 20 envelopes, hydrates at
+most five payload bodies, limits all remaining nodes to 500-character previews,
+and enforces a total content-character budget. Results explain whether each node
+was a seed or graph expansion and update retrieval counters/timestamps. To keep
+the conversation catalog below 25,000 serialized characters, this tool replaces
+ordinary Whiteboard acknowledgement on that surface; `acknowledge_context`
+remains available on the full administrative surface.
+
 ### Whiteboard visibility
 
 Every context now has a first-class `visibility` classification. Existing rows

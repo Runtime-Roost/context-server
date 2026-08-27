@@ -1770,6 +1770,130 @@ export async function confirmAutoArchive(actorId: number, confirmationToken: str
     }
 }
 
+const AUTHORIZED_CONTEXT_PREDICATE = `(
+    contexts.visibility = 'whiteboard'
+    OR contexts.visibility = 'archived'
+    OR (contexts.visibility = 'personal' AND contexts.actor_id = $1)
+    OR (contexts.visibility = 'channel' AND EXISTS (
+        SELECT 1 FROM channel_memberships
+        WHERE channel_memberships.channel_id = contexts.channel_id
+          AND channel_memberships.actor_id = $1
+          AND channel_memberships.removed_at IS NULL
+          AND channel_memberships.can_read
+    ))
+    OR (contexts.visibility = 'group' AND EXISTS (
+        SELECT 1 FROM access_group_memberships
+        WHERE access_group_memberships.group_id = contexts.group_id
+          AND access_group_memberships.actor_id = $1
+          AND access_group_memberships.removed_at IS NULL
+          AND access_group_memberships.can_read
+    ))
+)`;
+
+export async function assembleContext(
+    actorId: number,
+    query: string,
+    options: { limit?: number; hydrateLimit?: number; maxContentChars?: number } = {},
+) {
+    await initializeDatabase();
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) throw new Error("CONTEXT_ASSEMBLY_QUERY_REQUIRED");
+    const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 8), 20));
+    const hydrateLimit = Math.max(0, Math.min(Math.trunc(options.hydrateLimit ?? 2), 5, limit));
+    const maxContentChars = Math.max(1000, Math.min(Math.trunc(options.maxContentChars ?? 24_000), 48_000));
+
+    const seeds = await db.query<ContextRow>(
+        `SELECT ${CONTEXT_PROJECTION}
+         FROM contexts
+         LEFT JOIN actors ON actors.id = contexts.actor_id
+         WHERE ${AUTHORIZED_CONTEXT_PREDICATE}
+           AND contexts.visibility <> 'archived'
+           AND (
+                contexts.content ILIKE $2 OR contexts.source ILIKE $2 OR contexts.tags::text ILIKE $2
+                OR EXISTS (SELECT 1 FROM subjects WHERE subjects.id = contexts.subject_id
+                    AND (subjects.external_id ILIKE $2 OR subjects.name ILIKE $2
+                         OR subjects.kind ILIKE $2 OR subjects.aliases::text ILIKE $2))
+           )
+         ORDER BY contexts.importance DESC,
+                  CASE contexts.lifecycle_state WHEN 'active' THEN 0 WHEN 'warm' THEN 1 WHEN 'cold' THEN 2 ELSE 3 END,
+                  contexts.updated_at DESC, contexts.id DESC
+         LIMIT $3`,
+        [actorId, `%${normalizedQuery}%`, limit],
+    );
+    const seedRecords = seeds.rows.map(mapContextRow);
+    const seedIds = seedRecords.map((record) => record.id);
+    const expanded = seedIds.length === 0
+        ? { rows: [] as Array<ContextRow & { via_context_id: number | string; via_connection_id: number | string }> }
+        : await db.query<ContextRow & { via_context_id: number | string; via_connection_id: number | string }>(
+            `SELECT ${CONTEXT_PROJECTION}, edge.via_context_id, edge.via_connection_id
+             FROM contexts
+             INNER JOIN (
+                SELECT source_context_id AS via_context_id, target_context_id AS other_context_id, id AS via_connection_id
+                FROM context_connections WHERE source_context_id = ANY($2::bigint[])
+                UNION ALL
+                SELECT target_context_id AS via_context_id, source_context_id AS other_context_id, id AS via_connection_id
+                FROM context_connections WHERE target_context_id = ANY($2::bigint[])
+             ) edge ON edge.other_context_id = contexts.id
+             LEFT JOIN actors ON actors.id = contexts.actor_id
+             WHERE ${AUTHORIZED_CONTEXT_PREDICATE}
+             ORDER BY contexts.importance DESC, contexts.updated_at DESC, contexts.id DESC
+             LIMIT $3`,
+            [actorId, seedIds, limit * 3],
+        );
+
+    const ranked = new Map<number, { context: ContextRecord; via: { kind: "seed" | "connection"; from_context_id?: number; connection_id?: number }; score: number }>();
+    for (const context of seedRecords) {
+        ranked.set(context.id, { context, via: { kind: "seed" }, score: 100 + context.lifecycle.importance });
+    }
+    for (const row of expanded.rows) {
+        const context = mapContextRow(row);
+        if (!ranked.has(context.id)) {
+            ranked.set(context.id, {
+                context,
+                via: { kind: "connection", from_context_id: Number(row.via_context_id), connection_id: Number(row.via_connection_id) },
+                score: 50 + context.lifecycle.importance,
+            });
+        }
+    }
+    const selected = [...ranked.values()].sort((a, b) => b.score - a.score || b.context.updated_at.localeCompare(a.context.updated_at)).slice(0, limit);
+    let usedChars = 0;
+    let truncated = ranked.size > selected.length;
+    const items = [];
+    for (let index = 0; index < selected.length; index += 1) {
+        const entry = selected[index];
+        const hydrated = index < hydrateLimit;
+        const allowed = Math.max(0, maxContentChars - usedChars);
+        const desired = hydrated ? entry.context.content : entry.context.content.slice(0, 500);
+        const content = desired.slice(0, allowed);
+        if (content.length < desired.length) truncated = true;
+        usedChars += content.length;
+        items.push({
+            context: { ...entry.context, content },
+            hydrated,
+            content_truncated: content.length < entry.context.content.length,
+            via: entry.via,
+            score: entry.score,
+        });
+        if (usedChars >= maxContentChars) break;
+    }
+    const retrievedIds = items.map((item) => item.context.id);
+    if (retrievedIds.length > 0) {
+        await db.query(
+            `UPDATE contexts SET retrieval_count = retrieval_count + 1, last_retrieved_at = NOW()
+             WHERE id = ANY($1::bigint[])`,
+            [retrievedIds],
+        );
+    }
+    return {
+        query: normalizedQuery,
+        items,
+        returned_count: items.length,
+        hydrated_count: items.filter((item) => item.hydrated).length,
+        content_chars: usedChars,
+        response_truncated: truncated,
+    };
+}
+
 export async function deleteContext(id: number) {
     await initializeDatabase();
 

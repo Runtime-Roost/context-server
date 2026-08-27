@@ -25,6 +25,7 @@ import {
     acknowledgeDirectContext,
     actorPurgeConfirm,
     actorPurgePreview,
+    assembleContext,
     addAccessGroupMember,
     addChannelMember,
     createChannel,
@@ -213,6 +214,7 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "AUTO_ARCHIVE_SELECTION_INVALID",
         "AUTO_ARCHIVE_PREVIEW_INVALID",
         "AUTO_ARCHIVE_CANDIDATE_CHANGED",
+        "CONTEXT_ASSEMBLY_QUERY_REQUIRED",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -313,8 +315,8 @@ const CONVERSATION_TOOL_NAMES = new Set([
     "get_actor_session_request_status",
     "save_context",
     "search_context",
+    "assemble_context",
     "get_context",
-    "acknowledge_context",
     "save_channel_context",
     "search_channel_context",
     "get_channel_context",
@@ -735,6 +737,32 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 ],
             };
         }
+    );
+
+    server.registerTool(
+        "assemble_context",
+        {
+            description: "Build a bounded authenticated context pack from matching envelopes plus one-hop graph neighbors, hydrating only a few selected payloads.",
+            annotations: { title: "Assemble Context", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+            inputSchema: {
+                query: z.string().min(1).max(2000),
+                limit: z.number().int().min(1).max(20).optional(),
+                hydrate_limit: z.number().int().min(0).max(5).optional(),
+                max_content_chars: z.number().int().min(1000).max(48000).optional(),
+            },
+        },
+        async ({ query, limit, hydrate_limit, max_content_chars }, extra) => {
+            const payload = { query, limit, hydrate_limit, max_content_chars };
+            try {
+                const authenticated = await authenticateTool("assemble_context", payload, undefined, extra);
+                const assembly = await assembleContext(authenticated.actor_id, query, {
+                    limit, hydrateLimit: hydrate_limit, maxContentChars: max_content_chars,
+                });
+                return { content: [{ type: "text", text: JSON.stringify({ assembly }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
     );
 
     server.registerTool(
