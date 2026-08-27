@@ -668,7 +668,7 @@ test("one approved Roost SSO grant binds exactly one Context Server conversation
             name: "request_actor_session",
             arguments: {
                 actor_external_id: actorExternalId,
-                client_label: `roost-sso:${handoff.rows[0].binding_id}`,
+                client_label: "Roost SSO Context binding",
             },
             _meta: contextMeta,
         });

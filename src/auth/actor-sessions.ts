@@ -99,6 +99,68 @@ export async function bindRoostSsoServiceSession(
     }
 }
 
+export async function bindLatestRoostSsoServiceSession(
+    identity: OpenAITunnelIdentity,
+    expectedActorExternalId: string,
+): Promise<AuthenticatedActor> {
+    await initializeDatabase();
+    const subjectHash = hashOpenAIIdentity(identity.subject);
+    const sessionHash = hashOpenAIIdentity(identity.session);
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const result = await client.query<{
+            binding_id: string;
+            actor_id: number | string;
+            actor_external_id: string;
+            actor_name: string;
+        }>(`
+            SELECT bindings.binding_id, bindings.actor_id,
+                actors.external_id AS actor_external_id, actors.name AS actor_name
+            FROM actor_session_service_bindings AS bindings
+            INNER JOIN actor_sessions AS source ON source.session_id = bindings.source_session_id
+            INNER JOIN actors ON actors.id = bindings.actor_id
+            WHERE bindings.issuer = 'roost-sso'
+              AND bindings.audience = 'context-server'
+              AND actors.external_id = $1
+              AND bindings.service_session_hash IS NULL
+              AND bindings.service_subject_hash IS NULL
+              AND bindings.binding_expires_at > NOW()
+              AND bindings.expires_at > NOW()
+              AND bindings.revoked_at IS NULL
+              AND source.revoked_at IS NULL
+              AND source.external_deleted_at IS NULL
+              AND source.lease_expires_at > NOW()
+            ORDER BY bindings.created_at DESC
+            LIMIT 2
+            FOR UPDATE OF bindings
+        `, [expectedActorExternalId]);
+        if (result.rowCount !== 1) throw new Error("SSO_BINDING_INVALID");
+        const binding = result.rows[0];
+        const consumed = await client.query(`
+            UPDATE actor_session_service_bindings
+            SET service_subject_hash = $2, service_session_hash = $3, bound_at = NOW()
+            WHERE binding_id = $1
+              AND service_subject_hash IS NULL
+              AND service_session_hash IS NULL
+            RETURNING binding_id
+        `, [binding.binding_id, subjectHash, sessionHash]);
+        if (consumed.rowCount !== 1) throw new Error("SSO_BINDING_INVALID");
+        await client.query("COMMIT");
+        return {
+            actor_id: Number(binding.actor_id),
+            actor_external_id: binding.actor_external_id,
+            actor_name: binding.actor_name,
+            key_id: binding.binding_id,
+        };
+    } catch (error) {
+        try { await client.query("ROLLBACK"); } catch {}
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 const REQUEST_TTL_MS = 15 * 60 * 1000;
 const MAX_PENDING_REQUESTS_PER_ACTOR = 3;
 const DEFAULT_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;

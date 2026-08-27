@@ -6,6 +6,7 @@ import {
 } from "../auth/request-auth.js";
 import {
     authenticateOpenAITunnelActorSession,
+    bindLatestRoostSsoServiceSession,
     bindRoostSsoServiceSession,
     claimActorSession,
     getActorSessionRequestStatus,
@@ -364,6 +365,27 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 const identity = process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() === "true"
                     ? openAITunnelIdentity(extra)
                     : undefined;
+                if (client_label === "Roost SSO Context binding") {
+                    if (!identity) throw new Error("AUTHENTICATION_REQUIRED");
+                    const authenticated = await bindLatestRoostSsoServiceSession(
+                        identity, actor_external_id,
+                    );
+                    actorSession.activate(authenticated.actor_id);
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({
+                                request: {
+                                    status: "claimed",
+                                    authentication: "roost_sso_service_binding",
+                                    actor_external_id: authenticated.actor_external_id,
+                                    actor_name: authenticated.actor_name,
+                                    next_action: "The current Context Server conversation is authenticated. Retry the intended protected tool without an auth object.",
+                                },
+                            }),
+                        }],
+                    };
+                }
                 const handoff = client_label?.match(/^roost-sso:(asb_[0-9a-f-]{36})$/)?.[1];
                 if (handoff) {
                     if (!identity) throw new Error("AUTHENTICATION_REQUIRED");
