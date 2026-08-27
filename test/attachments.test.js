@@ -8,6 +8,8 @@ import test from "node:test";
 process.env.PGDATABASE ??= "personal_context";
 process.env.EMBEDDINGS_ENABLED = "false";
 process.env.ATTACHMENT_STORAGE_DIR = await mkdtemp(join(tmpdir(), "pcs-attachments-test-"));
+process.env.ATTACHMENT_PERSONAL_QUOTA_BYTES = "64";
+process.env.ATTACHMENT_GROUP_QUOTA_BYTES = "64";
 
 const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
@@ -15,6 +17,7 @@ const { buildRequestSigningMessage, enrollActorKey } = await import("../dist/aut
 const { createServer } = await import("../dist/mcp/server.js");
 const { db } = await import("../dist/storage/db.js");
 const { identifyActor } = await import("../dist/mcp/tools.js");
+const { auditAttachmentStorage } = await import("../dist/storage/attachments.js");
 
 function unique(prefix) {
     return `${prefix}-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -76,6 +79,22 @@ test("group attachments upload through real handlers and revoke with membership"
     let groupId;
 
     try {
+        const reservationBytes = Buffer.alloc(40, 7);
+        const reservationPayload = {
+            scope: "personal", filename: "reservation.bin", media_type: "application/octet-stream",
+            expected_size_bytes: reservationBytes.length,
+            expected_sha256: createHash("sha256").update(reservationBytes).digest("hex"),
+        };
+        const concurrentReservations = await Promise.all([
+            call(client, "begin_attachment_upload", reservationPayload, keys[0], identities[0].privateKey),
+            call(client, "begin_attachment_upload", reservationPayload, keys[0], identities[0].privateKey),
+        ]);
+        assert.equal(concurrentReservations.filter((result) => !result.isError).length, 1);
+        assert.equal(concurrentReservations.filter((result) => result.isError).length, 1);
+        assert.equal(json(concurrentReservations.find((result) => result.isError)).error.code, "ATTACHMENT_QUOTA_EXCEEDED");
+        const reservedUpload = json(concurrentReservations.find((result) => !result.isError)).upload;
+        await call(client, "cancel_attachment_upload", { upload_id: reservedUpload.upload_id }, keys[0], identities[0].privateKey);
+
         groupId = json(await call(client, "create_access_group", {
             slug: group, name: "Attachment Group",
         }, keys[0], identities[0].privateKey)).group.id;
@@ -85,10 +104,12 @@ test("group attachments upload through real handlers and revoke with membership"
 
         const bytes = Buffer.from("immutable journal bytes split across chunks");
         const sha256 = createHash("sha256").update(bytes).digest("hex");
-        const begun = json(await call(client, "begin_attachment_upload", {
+        const begunResult = await call(client, "begin_attachment_upload", {
             scope: "group", group, filename: "../Great Journal.pdf", media_type: "application/pdf",
             expected_size_bytes: bytes.length, expected_sha256: sha256,
-        }, keys[0], identities[0].privateKey)).upload;
+        }, keys[0], identities[0].privateKey);
+        assert.equal(begunResult.isError, undefined, JSON.stringify(json(begunResult)));
+        const begun = json(begunResult).upload;
 
         const badOffset = await call(client, "append_attachment_chunk", {
             upload_id: begun.upload_id, offset: 1, data_base64: bytes.subarray(0, 8).toString("base64"),
@@ -111,6 +132,23 @@ test("group attachments upload through real handlers and revoke with membership"
         assert.equal(finalized.scope, "group");
         assert.equal(finalized.group_id, groupId);
         assert.equal(finalized.original_filename, "../Great Journal.pdf");
+
+        const quota = json(await call(client, "get_attachment_quota", {
+            scope: "group", group,
+        }, keys[0], identities[0].privateKey)).quota;
+        assert.equal(quota.limit_bytes, 64);
+        assert.equal(quota.used_bytes, bytes.length);
+        assert.equal(quota.reserved_bytes, 0);
+        assert.equal(quota.available_bytes, 64 - bytes.length);
+
+        const tooLarge = Buffer.alloc(64, 1);
+        const rejected = await call(client, "begin_attachment_upload", {
+            scope: "group", group, filename: "too-large.bin", media_type: "application/octet-stream",
+            expected_size_bytes: tooLarge.length,
+            expected_sha256: createHash("sha256").update(tooLarge).digest("hex"),
+        }, keys[0], identities[0].privateKey);
+        assert.equal(rejected.isError, true);
+        assert.equal(json(rejected).error.code, "ATTACHMENT_QUOTA_EXCEEDED");
 
         const saved = json(await call(client, "save_group_context", {
             group, text: "Journal source manifest", tags: ["journal", "manifest"],
@@ -140,6 +178,10 @@ test("group attachments upload through real handlers and revoke with membership"
             id: attachmentId,
         }, keys[1], identities[1].privateKey));
         assert.equal(revoked.chunk, null);
+
+        const audit = await auditAttachmentStorage();
+        assert.equal(audit.ok, true);
+        assert.deepEqual(audit.discrepancies, []);
     } finally {
         await client.close();
         await server.close();

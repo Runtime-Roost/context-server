@@ -92,7 +92,7 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
         assert.equal(legacy.rows[0].visibility, "whiteboard");
         assert.equal(legacy.rows[0].channel_id, null);
         assert.equal(legacy.rows[0].group_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
     } finally {
         await isolatedPool.end();
         await adminPool.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -656,6 +656,9 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         const identifySchema = byName.get("identify_actor")?.inputSchema;
         const searchSchema = byName.get("search_context")?.inputSchema;
         const recentSchema = byName.get("list_recent_context")?.inputSchema;
+        const requestActorSessionTool = byName.get("request_actor_session");
+        const requestStatusTool = byName.get("get_actor_session_request_status");
+        const claimActorSessionTool = byName.get("claim_actor_session");
         const getContextSchema = byName.get("get_context")?.inputSchema;
         const acknowledgeTool = byName.get("acknowledge_context");
         const acknowledgeSchema = acknowledgeTool?.inputSchema;
@@ -666,6 +669,43 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         assert.ok(identifySchema.properties.external_id);
         assert.ok(searchSchema.properties.actor_external_id);
         assert.ok(recentSchema.properties.actor_external_id);
+        for (const toolName of [
+            "search_context",
+            "get_user_profile",
+            "list_recent_context",
+            "database_metadata",
+            "get_context",
+        ]) {
+            assert.deepEqual(byName.get(toolName)?.annotations, {
+                title: byName.get(toolName)?.annotations?.title,
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            });
+            assert.ok(byName.get(toolName)?.annotations?.title);
+        }
+        assert.deepEqual(requestActorSessionTool?.annotations, {
+            title: "Request Actor Session Approval",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+        });
+        assert.deepEqual(requestStatusTool?.annotations, {
+            title: "Check Actor Session Request",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        });
+        assert.deepEqual(claimActorSessionTool?.annotations, {
+            title: "Claim Approved Actor Session",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+        });
         assert.deepEqual(getContextSchema.required, ["id"]);
         assert.ok(getContextSchema.properties.id);
         assert.deepEqual(acknowledgeSchema.required, ["context_id"]);

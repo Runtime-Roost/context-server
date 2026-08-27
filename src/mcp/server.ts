@@ -1,4 +1,5 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
     authenticateRequest,
@@ -6,16 +7,21 @@ import {
 } from "../auth/request-auth.js";
 import {
     authenticateOpenAITunnelActorSession,
+    bindLatestRoostSsoServiceSession,
+    bindRoostSsoServiceSession,
     claimActorSession,
     getActorSessionRequestStatus,
+    renewActorSession,
     requestActorSession,
 } from "../auth/actor-sessions.js";
 import {
     ACCESS_GROUP_ROLE_VALUES,
     CHANNEL_ROLE_VALUES,
     SEARCH_SENSITIVITY_VALUES,
+    type ContextRecord,
     WRITABLE_CONTEXT_VISIBILITY_VALUES,
     acknowledgeContextWithActor,
+    acknowledgeDirectContext,
     actorPurgeConfirm,
     actorPurgePreview,
     addAccessGroupMember,
@@ -29,6 +35,7 @@ import {
     contextPurgeConfirm,
     contextPurgePreview,
     getContext,
+    getDirectContext,
     getChannelContext,
     getPersonalContext,
     getGroupContext,
@@ -36,6 +43,7 @@ import {
     getUserProfile,
     identifyActor,
     listRecentContext,
+    listDirectInbox,
     listActorChannels,
     listChannelContext,
     listPersonalContext,
@@ -44,6 +52,7 @@ import {
     removeAccessGroupMember,
     removeChannelMember,
     saveContextWithActor,
+    saveDirectContext,
     saveChannelContext,
     savePersonalContext,
     saveGroupContext,
@@ -66,11 +75,80 @@ import {
     deleteAttachment,
     finalizeAttachmentUpload,
     getAttachment,
+    getAttachmentQuota,
     linkAttachmentToContext,
     listAttachments,
     listContextAttachments,
     readAttachmentChunk,
 } from "../storage/attachments.js";
+
+const DEFAULT_CONTEXT_RESULT_LIMIT = 5;
+const MAX_CONTEXT_RESULT_CONTENT_CHARS = 8_000;
+const MAX_CONTEXT_RESULT_PAYLOAD_CHARS = 24_000;
+const LIST_CONTEXT_EXCERPT_CHARS = 500;
+
+function emitPrivateReadReceipt(
+    receiptId: string,
+    tool: "search_personal_context" | "list_personal_context" | "get_personal_context",
+    stage: "received" | "authenticated" | "completed" | "rejected",
+    details: Record<string, string | number | boolean | null> = {},
+) {
+    console.error(JSON.stringify({
+        event: "context_server_private_read_receipt",
+        receipt_id: receiptId,
+        tool,
+        stage,
+        ...details,
+    }));
+}
+
+type ProjectedContextRecord = ContextRecord & {
+    content_length?: number;
+    content_truncated?: boolean;
+};
+
+export function projectContextResults(
+    records: ContextRecord[],
+    mode: "search" | "list",
+) {
+    const projected: ProjectedContextRecord[] = [];
+    let payloadChars = 0;
+    let responseTruncated = false;
+
+    for (const record of records) {
+        const contentLimit = mode === "list"
+            ? LIST_CONTEXT_EXCERPT_CHARS
+            : MAX_CONTEXT_RESULT_CONTENT_CHARS;
+        const contentTruncated = record.content.length > contentLimit;
+        const candidate: ProjectedContextRecord = {
+            ...record,
+            content: contentTruncated
+                ? record.content.slice(0, contentLimit)
+                : record.content,
+            ...(contentTruncated
+                ? {
+                    content_length: record.content.length,
+                    content_truncated: true,
+                }
+                : {}),
+        };
+        const candidateChars = JSON.stringify(candidate).length;
+
+        if (payloadChars + candidateChars > MAX_CONTEXT_RESULT_PAYLOAD_CHARS) {
+            responseTruncated = true;
+            break;
+        }
+
+        projected.push(candidate);
+        payloadChars += candidateChars;
+    }
+
+    return {
+        results: projected,
+        response_truncated: responseTruncated || projected.length < records.length,
+        returned_count: projected.length,
+    };
+}
 
 const signedRequestAuthSchema = z.object({
     key_id: z.string().min(1).describe("Enrolled actor key identifier."),
@@ -89,7 +167,7 @@ const requestAuthSchema = z.union([
     actorSessionAuthSchema,
 ]);
 
-function authenticationError(error: unknown) {
+function authenticationError(error: unknown, safeDetails?: { actor_external_id?: string }) {
     const candidate = error instanceof Error ? error.message : "AUTHENTICATION_FAILED";
     const exposedCodes = new Set([
         "AUTHENTICATION_FAILED",
@@ -99,15 +177,19 @@ function authenticationError(error: unknown) {
         "ACCESS_GROUP_OWNER_CANNOT_BE_REMOVED",
         "ACTOR_NOT_FOUND",
         "ACTOR_SESSION_REQUEST_NOT_FOUND",
-        "ACTOR_SESSION_REQUEST_REJECTED",
+        "ACTOR_SESSION_PENDING_LIMIT_REACHED",
         "SESSION_REVOKED",
+        "SESSION_RENEWAL_NOT_ALLOWED",
         "AUTHENTICATION_REQUIRED",
+        "SSO_BINDING_INVALID",
         "ATTACHMENT_UPLOAD_NOT_FOUND_OR_NOT_AUTHORIZED",
         "ATTACHMENT_UPLOAD_INCOMPLETE",
         "ATTACHMENT_INTEGRITY_MISMATCH",
         "ATTACHMENT_OFFSET_INVALID",
         "ATTACHMENT_CHUNK_INVALID",
         "ATTACHMENT_SCOPE_INVALID",
+        "ATTACHMENT_QUOTA_EXCEEDED",
+        "ATTACHMENT_QUOTA_CONFIG_INVALID",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -119,12 +201,19 @@ function authenticationError(error: unknown) {
                 text: JSON.stringify({
                     error: {
                         code,
+                        ...(code === "ACTOR_NOT_FOUND" && safeDetails?.actor_external_id
+                            ? { actor_external_id: safeDetails.actor_external_id }
+                            : {}),
                         message: code === "AUTHENTICATION_FAILED"
                             ? "The signed request could not be authenticated."
                             : code === "AUTHENTICATION_REQUIRED"
-                                ? "Authenticate this OpenAI session with an approved one-time PIN, or provide explicit cryptographic authentication."
+                                ? process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() === "true"
+                                    ? "This OpenAI conversation does not have an active local actor-session approval. Call request_actor_session once, ask the operator to approve that exact request in Agent Companion, and wait for approval to activate automatically. Do not use a PIN, call claim_actor_session, or retry protected tools before approval."
+                                    : "Provide explicit cryptographic authentication or request and claim an operator-approved native actor session."
                             : code === "SESSION_REVOKED"
                                 ? "This actor session was revoked because a newer session became the actor's current timeline."
+                            : code === "SSO_BINDING_INVALID"
+                                ? "The Roost SSO handoff is invalid, expired, already consumed, or its approved source session is no longer active."
                             : code === "CHANNEL_NOT_FOUND_OR_NOT_AUTHORIZED"
                                 ? "The channel was not found or the authenticated actor is not authorized."
                                 : code === "ACCESS_GROUP_NOT_FOUND_OR_NOT_AUTHORIZED"
@@ -133,8 +222,10 @@ function authenticationError(error: unknown) {
                                     ? "The request was rejected."
                                     : code === "ACTOR_SESSION_REQUEST_NOT_FOUND"
                                         ? "The actor-session request was not found, was not approved, expired, was already claimed, or the claim code was invalid."
-                                        : code === "ACTOR_SESSION_REQUEST_REJECTED"
-                                            ? "The actor-session request was rejected."
+                                        : code === "ACTOR_NOT_FOUND"
+                                            ? "No durable actor matches the supplied actor_external_id. Use the exact canonical actor identity assigned by the operator; a display name or human name is not an actor identity."
+                                        : code === "ACTOR_SESSION_PENDING_LIMIT_REACHED"
+                                            ? "This actor already has the maximum number of unexpired pending or approved actor-session requests. Complete, deny, or allow those requests to expire before trying again."
                                     : candidate,
                     },
                 }),
@@ -191,7 +282,40 @@ export function requireActorIdentificationEnabled() {
     return process.env.REQUIRE_ACTOR_IDENTIFICATION?.trim().toLowerCase() === "true";
 }
 
-export function createServer() {
+export type ContextServerSurface = "full" | "conversation";
+
+const CONVERSATION_TOOL_NAMES = new Set([
+    "request_actor_session",
+    "bind_sso_session",
+    "get_actor_session_request_status",
+    "save_context",
+    "search_context",
+    "get_context",
+    "acknowledge_context",
+    "save_channel_context",
+    "search_channel_context",
+    "get_channel_context",
+    "save_personal_context",
+    "search_personal_context",
+    "get_personal_context",
+    "send_direct_context",
+    "list_direct_inbox",
+    "acknowledge_direct_context",
+]);
+
+function applyToolSurface(server: McpServer, surface: ContextServerSurface) {
+    if (surface === "full") return;
+
+    const registry = (server as unknown as {
+        _registeredTools: Record<string, RegisteredTool>;
+    })._registeredTools;
+
+    for (const [name, tool] of Object.entries(registry)) {
+        if (!CONVERSATION_TOOL_NAMES.has(name)) tool.disable();
+    }
+}
+
+export function createServer(options: { surface?: ContextServerSurface } = {}) {
     const actorSession = new ActiveActorSession();
     const server = new McpServer({
         name: "personal-context-server",
@@ -245,10 +369,17 @@ export function createServer() {
         "request_actor_session",
         {
             description: process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() === "true"
-                ? "Request local approval for this exact OpenAI conversation. Approval activates the trusted tunnel identity automatically; do not call claim_actor_session or provide an auth object afterward."
-                : "Request an operator-approved expiring actor session for a native client that cannot hold an Ed25519 signing key. Keep the returned claim code private, then use it after local approval with claim_actor_session.",
+                ? "Request local approval for this exact OpenAI conversation. Approval activates a renewable trusted-thread lease automatically; do not call claim_actor_session, renew_actor_session, or provide an auth object afterward."
+                : "Request an operator-approved renewable actor-session lease for a native client that cannot hold an Ed25519 signing key. Keep the returned claim code private, then use it after local approval with claim_actor_session.",
+            annotations: {
+                title: "Request Actor Session Approval",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
             inputSchema: {
-                actor_external_id: z.string().min(1).describe("Durable actor identity the client asks the local operator to approve."),
+                actor_external_id: z.string().min(1).max(200).describe("Exact canonical durable actor identity the client asks the local operator to approve. Display names and human names are not actor identities."),
                 client_label: z.string().min(1).max(200).optional().describe("Human-readable client or conversation label shown to the operator."),
             },
         },
@@ -257,6 +388,50 @@ export function createServer() {
                 const identity = process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() === "true"
                     ? openAITunnelIdentity(extra)
                     : undefined;
+                if (client_label === "Roost SSO Context binding") {
+                    if (!identity) throw new Error("AUTHENTICATION_REQUIRED");
+                    const authenticated = await bindLatestRoostSsoServiceSession(
+                        identity, actor_external_id,
+                    );
+                    actorSession.activate(authenticated.actor_id);
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({
+                                request: {
+                                    status: "claimed",
+                                    authentication: "roost_sso_service_binding",
+                                    actor_external_id: authenticated.actor_external_id,
+                                    actor_name: authenticated.actor_name,
+                                    next_action: "The current Context Server conversation is authenticated. Retry the intended protected tool without an auth object.",
+                                },
+                            }),
+                        }],
+                    };
+                }
+                const handoff = client_label?.match(/^roost-sso:(asb_[0-9a-f-]{36})$/)?.[1];
+                if (handoff) {
+                    if (!identity) throw new Error("AUTHENTICATION_REQUIRED");
+                    const authenticated = await bindRoostSsoServiceSession(identity, handoff);
+                    if (authenticated.actor_external_id !== actor_external_id) {
+                        throw new Error("SSO_BINDING_INVALID");
+                    }
+                    actorSession.activate(authenticated.actor_id);
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({
+                                request: {
+                                    status: "claimed",
+                                    authentication: "roost_sso_service_binding",
+                                    actor_external_id: authenticated.actor_external_id,
+                                    actor_name: authenticated.actor_name,
+                                    next_action: "The current Context Server conversation is authenticated. Retry the intended protected tool without an auth object.",
+                                },
+                            }),
+                        }],
+                    };
+                }
                 const request = await requestActorSession(
                     actor_external_id,
                     client_label,
@@ -269,6 +444,45 @@ export function createServer() {
                     }],
                 };
             } catch (error) {
+                return authenticationError(error, { actor_external_id });
+            }
+        },
+    );
+
+    server.registerTool(
+        "bind_sso_session",
+        {
+            description: "Consume a one-use, Context Server-specific handoff issued by Roost SSO after operator approval. The trusted tunnel supplies this server's actor-session binding; the model cannot select an actor or reuse the handoff.",
+            annotations: {
+                title: "Bind Approved Roost SSO Session",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                binding_handle: z.string().regex(/^asb_[0-9a-f-]{36}$/)
+                    .describe("One-use Context Server handoff returned by Roost SSO."),
+            },
+        },
+        async ({ binding_handle }, extra) => {
+            try {
+                const authenticated = await bindRoostSsoServiceSession(
+                    openAITunnelIdentity(extra), binding_handle,
+                );
+                actorSession.activate(authenticated.actor_id);
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            bound: true,
+                            actor_external_id: authenticated.actor_external_id,
+                            actor_name: authenticated.actor_name,
+                            next_action: "The current Context Server conversation is authenticated. Call the intended protected tool without an auth object.",
+                        }),
+                    }],
+                };
+            } catch (error) {
                 return authenticationError(error);
             }
         },
@@ -278,6 +492,13 @@ export function createServer() {
         "get_actor_session_request_status",
         {
             description: "Native-client flow only: check whether an actor-session request is pending, approved, denied, expired, or claimed using its one-time claim code. Trusted OpenAI tunnel conversations activate during local approval and must not call this tool.",
+            annotations: {
+                title: "Check Actor Session Request",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
             inputSchema: {
                 request_id: z.string().min(1).describe("Request identifier returned by request_actor_session."),
                 claim_code: z.string().min(32).describe("Secret claim code returned with the request."),
@@ -302,6 +523,13 @@ export function createServer() {
         "claim_actor_session",
         {
             description: "Native-client flow only: claim a locally approved actor-session request exactly once and receive an expiring capability for explicit auth. Trusted OpenAI tunnel conversations activate during local approval and must not call this tool or receive the capability.",
+            annotations: {
+                title: "Claim Approved Actor Session",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
             inputSchema: {
                 request_id: z.string().min(1).describe("Approved request identifier."),
                 claim_code: z.string().min(32).describe("Secret claim code returned by request_actor_session."),
@@ -315,6 +543,33 @@ export function createServer() {
                         type: "text",
                         text: JSON.stringify({ session }),
                     }],
+                };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "renew_actor_session",
+        {
+            description: "Native-client flow only: renew the current unrevoked actor-session lease for 30 days and atomically rotate its bearer token. The previous token stops working immediately. Trusted OpenAI conversations renew their bound lease automatically during authenticated use and must not call this tool.",
+            annotations: {
+                title: "Renew Actor Session Lease",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                auth: actorSessionAuthSchema.describe("Current native actor-session capability. A successful renewal returns its replacement token exactly once."),
+            },
+        },
+        async ({ auth }) => {
+            try {
+                const session = await renewActorSession(auth);
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ session }) }],
                 };
             } catch (error) {
                 return authenticationError(error);
@@ -417,17 +672,25 @@ export function createServer() {
     server.registerTool(
         "search_context",
         {
-            description: "Search saved personal context by query. Sensitivity controls semantic filtering strictness: low is broad, medium is balanced, and high is narrow.",
+            description: "Read semantically matching notes from the local shared Whiteboard. Defaults to high sensitivity and five results to avoid injecting unrelated history. Use low or medium only when the user explicitly asks for a broader search.",
+            annotations: {
+                title: "Search Shared Whiteboard",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
             inputSchema: {
                 query: z.string().min(1).describe("The search query."),
                 limit: z.number().int().positive().optional().describe("Maximum number of context items to return."),
-                sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness. Low is broad (default), medium is balanced, and high is narrow and may return no results."),
+                sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness. High is the safe default and may return no results; medium and low progressively broaden retrieval."),
                 actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
             },
         },
         async ({ query, limit, sensitivity, actor_external_id }) => {
-            const selectedSensitivity = sensitivity ?? "low";
+            const selectedSensitivity = sensitivity ?? "high";
             const results = await searchContext(query, limit, selectedSensitivity, actor_external_id);
+            const projected = projectContextResults(results, "search");
 
             return {
                 content: [
@@ -435,10 +698,10 @@ export function createServer() {
                         type: "text",
                         text: JSON.stringify({
                             query,
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             sensitivity: selectedSensitivity,
                             ...(actor_external_id ? { actor_external_id } : {}),
-                            results,
+                            ...projected,
                         }),
                     },
                 ],
@@ -449,7 +712,14 @@ export function createServer() {
     server.registerTool(
         "get_user_profile",
         {
-            description: "Return the active OS username alongside contexts explicitly tagged profile.",
+            description: "Read the local shared Whiteboard notes explicitly tagged profile, plus the local OS username. This does not modify data or contact external services.",
+            annotations: {
+                title: "Read Shared User Profile",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         async () => {
             const profile = await getUserProfile();
@@ -468,7 +738,14 @@ export function createServer() {
     server.registerTool(
         "list_recent_context",
         {
-            description: "List recently saved personal context items.",
+            description: "Read compact excerpts of the newest notes from the local shared Whiteboard. Use get_context for one complete record.",
+            annotations: {
+                title: "List Recent Shared Whiteboard Notes",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
             inputSchema: {
                 limit: z.number().int().positive().optional().describe("Maximum number of recent context items to return."),
                 actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
@@ -476,15 +753,16 @@ export function createServer() {
         },
         async ({ limit, actor_external_id }) => {
             const results = await listRecentContext(limit, actor_external_id);
+            const projected = projectContextResults(results, "list");
 
             return {
                 content: [
                     {
                         type: "text",
                         text: JSON.stringify({
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             ...(actor_external_id ? { actor_external_id } : {}),
-                            results,
+                            ...projected,
                         }),
                     },
                 ],
@@ -666,7 +944,7 @@ export function createServer() {
     server.registerTool(
         "search_channel_context",
         {
-            description: "Search one channel's history after authenticating current read membership.",
+            description: "Search one channel's history after authenticating current read membership. Defaults to high sensitivity and five results to avoid injecting unrelated history.",
             annotations: {
                 title: "Search Channel History",
                 readOnlyHint: true,
@@ -687,7 +965,7 @@ export function createServer() {
 
             try {
                 const authenticated = await authenticateTool("search_channel_context", payload, auth, extra);
-                const selectedSensitivity = sensitivity ?? "low";
+                const selectedSensitivity = sensitivity ?? "high";
                 const results = await searchChannelContext(
                     authenticated.actor_id,
                     channel,
@@ -695,15 +973,16 @@ export function createServer() {
                     limit,
                     selectedSensitivity,
                 );
+                const projected = projectContextResults(results, "search");
                 return {
                     content: [{
                         type: "text",
                         text: JSON.stringify({
                             channel,
                             query,
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             sensitivity: selectedSensitivity,
-                            results,
+                            ...projected,
                         }),
                     }],
                 };
@@ -716,7 +995,7 @@ export function createServer() {
     server.registerTool(
         "list_channel_context",
         {
-            description: "List recent history from one channel after authenticating current read membership.",
+            description: "List compact excerpts of recent channel history after authenticating current read membership. Use get_channel_context for one complete record.",
             annotations: {
                 title: "List Channel History",
                 readOnlyHint: true,
@@ -740,10 +1019,11 @@ export function createServer() {
                     channel,
                     limit,
                 );
+                const projected = projectContextResults(results, "list");
                 return {
                     content: [{
                         type: "text",
-                        text: JSON.stringify({ channel, limit: limit ?? 20, results }),
+                        text: JSON.stringify({ channel, limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT, ...projected }),
                     }],
                 };
             } catch (error) {
@@ -945,6 +1225,83 @@ export function createServer() {
     );
 
     server.registerTool(
+        "send_direct_context",
+        {
+            description: "Send one authenticated direct context envelope to an existing actor. Delivery is deterministic and private; this does not use semantic search.",
+            annotations: { title: "Send Direct Message", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+            inputSchema: {
+                recipient_external_id: z.string().min(3).max(255).describe("Exact registered recipient actor identity."),
+                text: z.string().min(1).describe("Message text."),
+                tags: z.array(z.string()).optional(),
+                source: z.string().optional(),
+                auth: requestAuthSchema.optional().describe("Authenticated sender."),
+            },
+        },
+        async ({ recipient_external_id, text, tags, source, auth }, extra) => {
+            const payload = { recipient_external_id, text, tags, source };
+            try {
+                const authenticated = await authenticateTool("send_direct_context", payload, auth, extra);
+                const sent = await saveDirectContext(authenticated.actor_id, recipient_external_id, text, tags, source);
+                return { content: [{ type: "text", text: JSON.stringify({ sent }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "list_direct_inbox",
+        {
+            description: "List the authenticated actor's newest direct envelopes in deterministic sequence order. Supports unread-only and since-sequence delivery without semantic search.",
+            annotations: { title: "List My Direct Inbox", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: {
+                limit: z.number().int().positive().max(100).optional(),
+                unread_only: z.boolean().optional(),
+                since_sequence: z.number().int().nonnegative().optional(),
+                auth: requestAuthSchema.optional().describe("Authenticated mailbox owner."),
+            },
+        },
+        async ({ limit, unread_only, since_sequence, auth }, extra) => {
+            const payload = { limit, unread_only, since_sequence };
+            try {
+                const authenticated = await authenticateTool("list_direct_inbox", payload, auth, extra);
+                const envelopes = await listDirectInbox(authenticated.actor_id, { limit, unreadOnly: unread_only, sinceSequence: since_sequence });
+                return { content: [{ type: "text", text: JSON.stringify({ envelopes, returned_count: envelopes.length }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "get_direct_context",
+        {
+            description: "Get one exact direct envelope owned by the authenticated recipient. Missing and unauthorized records both return null.",
+            annotations: { title: "Get Direct Message", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: { id: z.number().int().positive(), auth: requestAuthSchema.optional() },
+        },
+        async ({ id, auth }, extra) => {
+            try {
+                const authenticated = await authenticateTool("get_direct_context", { id }, auth, extra);
+                const envelope = await getDirectContext(authenticated.actor_id, id);
+                return { content: [{ type: "text", text: JSON.stringify({ id, envelope }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "acknowledge_direct_context",
+        {
+            description: "Idempotently acknowledge one direct envelope as its authenticated recipient.",
+            annotations: { title: "Acknowledge Direct Message", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: { id: z.number().int().positive(), auth: requestAuthSchema.optional() },
+        },
+        async ({ id, auth }, extra) => {
+            try {
+                const authenticated = await authenticateTool("acknowledge_direct_context", { id }, auth, extra);
+                const result = await acknowledgeDirectContext(authenticated.actor_id, id);
+                return { content: [{ type: "text", text: JSON.stringify({ id, result }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
         "list_access_groups",
         {
             description: "List access groups available to the authenticated actor.",
@@ -1008,7 +1365,7 @@ export function createServer() {
     server.registerTool(
         "search_group_context",
         {
-            description: "Search one access group's records after authenticating current read membership.",
+            description: "Search one access group's records after authenticating current read membership. Defaults to high sensitivity and five results.",
             annotations: {
                 title: "Search Group Context",
                 readOnlyHint: true,
@@ -1029,7 +1386,7 @@ export function createServer() {
 
             try {
                 const authenticated = await authenticateTool("search_group_context", payload, auth, extra);
-                const selectedSensitivity = sensitivity ?? "low";
+                const selectedSensitivity = sensitivity ?? "high";
                 const results = await searchGroupContext(
                     authenticated.actor_id,
                     group,
@@ -1037,15 +1394,16 @@ export function createServer() {
                     limit,
                     selectedSensitivity,
                 );
+                const projected = projectContextResults(results, "search");
                 return {
                     content: [{
                         type: "text",
                         text: JSON.stringify({
                             group,
                             query,
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             sensitivity: selectedSensitivity,
-                            results,
+                            ...projected,
                         }),
                     }],
                 };
@@ -1058,7 +1416,7 @@ export function createServer() {
     server.registerTool(
         "list_group_context",
         {
-            description: "List recent records owned by one access group after authenticating current read membership.",
+            description: "List compact excerpts of recent access-group records after authenticating current read membership. Use get_group_context for one complete record.",
             annotations: {
                 title: "List Group Context",
                 readOnlyHint: true,
@@ -1078,8 +1436,9 @@ export function createServer() {
             try {
                 const authenticated = await authenticateTool("list_group_context", payload, auth, extra);
                 const results = await listGroupContext(authenticated.actor_id, group, limit);
+                const projected = projectContextResults(results, "list");
                 return {
-                    content: [{ type: "text", text: JSON.stringify({ group, limit: limit ?? 20, results }) }],
+                    content: [{ type: "text", text: JSON.stringify({ group, limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT, ...projected }) }],
                 };
             } catch (error) {
                 return authenticationError(error);
@@ -1212,7 +1571,7 @@ export function createServer() {
     server.registerTool(
         "search_personal_context",
         {
-            description: "Search only the authenticated actor's private notebook. Actor ownership is enforced before semantic ranking.",
+            description: "Search only the authenticated actor's private notebook. Actor ownership is enforced before semantic ranking; retrieval defaults to high sensitivity and five results.",
             annotations: {
                 title: "Search Private Notebook",
                 readOnlyHint: true,
@@ -1229,28 +1588,45 @@ export function createServer() {
         },
         async ({ query, limit, sensitivity, auth }, extra) => {
             const payload = { query, limit, sensitivity };
+            const receiptId = randomUUID();
+            emitPrivateReadReceipt(receiptId, "search_personal_context", "received", {
+                limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
+                sensitivity: sensitivity ?? "high",
+            });
 
             try {
                 const authenticated = await authenticateTool("search_personal_context", payload, auth, extra);
-                const selectedSensitivity = sensitivity ?? "low";
+                const selectedSensitivity = sensitivity ?? "high";
+                emitPrivateReadReceipt(receiptId, "search_personal_context", "authenticated", {
+                    actor_id: authenticated.actor_id,
+                });
                 const results = await searchPersonalContext(
                     authenticated.actor_id,
                     query,
                     limit,
                     selectedSensitivity,
                 );
+                const projected = projectContextResults(results, "search");
+                emitPrivateReadReceipt(receiptId, "search_personal_context", "completed", {
+                    actor_id: authenticated.actor_id,
+                    result_count: projected.results.length,
+                    response_truncated: projected.response_truncated,
+                });
                 return {
                     content: [{
                         type: "text",
                         text: JSON.stringify({
                             query,
-                            limit: limit ?? 20,
+                            limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
                             sensitivity: selectedSensitivity,
-                            results,
+                            ...projected,
                         }),
                     }],
                 };
             } catch (error) {
+                emitPrivateReadReceipt(receiptId, "search_personal_context", "rejected", {
+                    error: error instanceof Error ? error.name : "unknown_error",
+                });
                 return authenticationError(error);
             }
         },
@@ -1259,7 +1635,7 @@ export function createServer() {
     server.registerTool(
         "list_personal_context",
         {
-            description: "List recent private notebook records owned by the authenticated actor.",
+            description: "List compact excerpts of recent private notebook records owned by the authenticated actor. Use get_personal_context for one complete record.",
             annotations: {
                 title: "List Private Notebook",
                 readOnlyHint: true,
@@ -1274,17 +1650,33 @@ export function createServer() {
         },
         async ({ limit, auth }, extra) => {
             const payload = { limit };
+            const receiptId = randomUUID();
+            emitPrivateReadReceipt(receiptId, "list_personal_context", "received", {
+                limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
+            });
 
             try {
                 const authenticated = await authenticateTool("list_personal_context", payload, auth, extra);
+                emitPrivateReadReceipt(receiptId, "list_personal_context", "authenticated", {
+                    actor_id: authenticated.actor_id,
+                });
                 const results = await listPersonalContext(authenticated.actor_id, limit);
+                const projected = projectContextResults(results, "list");
+                emitPrivateReadReceipt(receiptId, "list_personal_context", "completed", {
+                    actor_id: authenticated.actor_id,
+                    result_count: projected.results.length,
+                    response_truncated: projected.response_truncated,
+                });
                 return {
                     content: [{
                         type: "text",
-                        text: JSON.stringify({ limit: limit ?? 20, results }),
+                        text: JSON.stringify({ limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT, ...projected }),
                     }],
                 };
             } catch (error) {
+                emitPrivateReadReceipt(receiptId, "list_personal_context", "rejected", {
+                    error: error instanceof Error ? error.name : "unknown_error",
+                });
                 return authenticationError(error);
             }
         },
@@ -1308,10 +1700,19 @@ export function createServer() {
         },
         async ({ id, auth }, extra) => {
             const payload = { id };
+            const receiptId = randomUUID();
+            emitPrivateReadReceipt(receiptId, "get_personal_context", "received");
 
             try {
                 const authenticated = await authenticateTool("get_personal_context", payload, auth, extra);
+                emitPrivateReadReceipt(receiptId, "get_personal_context", "authenticated", {
+                    actor_id: authenticated.actor_id,
+                });
                 const context = await getPersonalContext(authenticated.actor_id, id);
+                emitPrivateReadReceipt(receiptId, "get_personal_context", "completed", {
+                    actor_id: authenticated.actor_id,
+                    found: context !== null,
+                });
                 return {
                     content: [{
                         type: "text",
@@ -1319,6 +1720,9 @@ export function createServer() {
                     }],
                 };
             } catch (error) {
+                emitPrivateReadReceipt(receiptId, "get_personal_context", "rejected", {
+                    error: error instanceof Error ? error.name : "unknown_error",
+                });
                 return authenticationError(error);
             }
         },
@@ -1390,7 +1794,14 @@ export function createServer() {
     server.registerTool(
         "database_metadata",
         {
-            description: "Return simple database metadata, including saved context count and storage sizes.",
+            description: "Read local database counts and storage sizes. This does not return note contents, modify data, or contact external services.",
+            annotations: {
+                title: "Read Local Context Database Metadata",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
         },
         async () => {
             const metadata = await getDatabaseMetadata();
@@ -1409,7 +1820,14 @@ export function createServer() {
     server.registerTool(
         "get_context",
         {
-            description: "Get a saved personal context item by its exact id.",
+            description: "Read one local shared Whiteboard note by its exact ID. Non-Whiteboard records are not accessible. This does not modify data or contact external services.",
+            annotations: {
+                title: "Read Shared Whiteboard Note",
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
             inputSchema: {
                 id: z.number().int().positive().describe("The id of the context item to retrieve."),
             },
@@ -1654,7 +2072,7 @@ export function createServer() {
                 group: z.string().min(3).max(64).optional().describe("Required only for group ownership."),
                 filename: z.string().min(1).max(500),
                 media_type: z.string().min(3).max(200),
-                expected_size_bytes: z.number().int().nonnegative().max(100 * 1024 * 1024),
+                expected_size_bytes: z.number().int().nonnegative(),
                 expected_sha256: z.string().regex(/^[0-9a-fA-F]{64}$/),
                 auth: requestAuthSchema.optional(),
             },
@@ -1665,6 +2083,27 @@ export function createServer() {
                 const authenticated = await authenticateTool("begin_attachment_upload", payload, auth, extra);
                 const upload = await beginAttachmentUpload(authenticated.actor_id, scope, filename, media_type, expected_size_bytes, expected_sha256, group);
                 return { content: [{ type: "text", text: JSON.stringify({ upload }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "get_attachment_quota",
+        {
+            description: "Get strict finalized, reserved, and available attachment bytes for an authorized personal or group scope.",
+            annotations: { title: "Get Attachment Quota", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: {
+                scope: z.enum(ATTACHMENT_SCOPE_VALUES),
+                group: z.string().min(3).max(64).optional(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ scope, group, auth }, extra) => {
+            const payload = { scope, group };
+            try {
+                const authenticated = await authenticateTool("get_attachment_quota", payload, auth, extra);
+                const quota = await getAttachmentQuota(authenticated.actor_id, scope, group);
+                return { content: [{ type: "text", text: JSON.stringify({ quota }) }] };
             } catch (error) { return authenticationError(error); }
         },
     );
@@ -1862,5 +2301,6 @@ export function createServer() {
         }
     );
 
+    applyToolSurface(server, options.surface ?? "full");
     return server;
 }

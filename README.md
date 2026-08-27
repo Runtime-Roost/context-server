@@ -58,7 +58,9 @@ The same command is available in VS Code under **Tasks: Run Task** as
 The generated file is local machine configuration and is automatically added
 to `.gitignore`. Standard `PGHOST`, `PGDATABASE`, `PGUSER`, `AUTO_MANAGE_DB`,
 `REQUIRE_ACTOR_IDENTIFICATION`, `TRUST_OPENAI_TUNNEL_IDENTITY`, and
-`EMBEDDINGS_ENABLED`, and `ATTACHMENT_STORAGE_DIR` environment variables
+`EMBEDDINGS_ENABLED`, `ATTACHMENT_STORAGE_DIR`,
+`ATTACHMENT_PERSONAL_QUOTA_BYTES`, and `ATTACHMENT_GROUP_QUOTA_BYTES`
+environment variables
 override the generated defaults.
 Automatic database management is disabled by default.
 
@@ -141,8 +143,9 @@ participants, sender, timestamps, acknowledgement count, and record ID. Its
 response includes `private_message_contents_exposed: false` as an explicit
 privacy contract.
 
-An optional native Android companion uses a separate TLS gateway on one exact
-RFC1918 address:
+The standalone native Android inspection companion is obsolete and retained
+temporarily for compatibility testing. Agent Companion is the active phone UI.
+The obsolete client uses a separate TLS gateway on one exact RFC1918 address:
 
 ```bash
 npm run inspection:mobile
@@ -259,7 +262,14 @@ the bytes live in a content-addressed filesystem store under
 directory inside a publicly served tree. Back it up together with PostgreSQL:
 neither half is a complete archive by itself.
 
-Uploads are bounded at 100 MiB and use an integrity-checked sequence:
+Personal actors and access groups each have a strict 100 MiB logical attachment
+quota by default. Configure the independent byte limits with
+`ATTACHMENT_PERSONAL_QUOTA_BYTES` and `ATTACHMENT_GROUP_QUOTA_BYTES`. Finalized
+attachments and the full declared size of every active upload both count, so
+parallel uploads cannot over-reserve a scope. Content deduplication saves
+physical disk without bypassing logical quota accounting.
+
+Uploads use an integrity-checked sequence:
 
 1. `begin_attachment_upload` declares personal or group ownership, filename,
    media type, exact byte length, and SHA-256.
@@ -270,6 +280,16 @@ Uploads are bounded at 100 MiB and use an integrity-checked sequence:
 
 Unfinished uploads expire after 24 hours and are pruned when a new upload
 begins. `cancel_attachment_upload` removes one immediately.
+
+`get_attachment_quota` reports finalized, reserved, available, and limit bytes.
+Quota reservation is serialized per actor or group in PostgreSQL. Every upload
+reservation, finalization, cancellation, deletion, and reconciliation result is
+written to the append-only `attachment_audit_events` ledger.
+
+Run `npm run attachments:audit` for a strict reconciliation of database rows,
+stored object sizes and SHA-256 values, partial-upload sizes, and orphan files.
+The command records its result and exits nonzero on any discrepancy. It reports
+orphans for operator review and never deletes or repairs them automatically.
 
 `get_attachment`, `list_attachments`, and `read_attachment_chunk` enforce the
 current personal owner or group membership before returning metadata or bytes.
@@ -424,7 +444,7 @@ tokens and cryptographic proofs out of the model conversation:
    npm run actor-session:approve -- \
      --request-id asr_<id> \
      --actor actor:openai:chatgpt \
-     --ttl-seconds 86400
+     --ttl-seconds 2592000
    ```
 
 3. Approval atomically activates the exact OpenAI conversation that created the
@@ -436,6 +456,17 @@ tokens and cryptographic proofs out of the model conversation:
 The pending request expires after 15 minutes. Its OpenAI identity values are
 stored only as domain-separated hashes. Successful local approval performs the
 same atomic one-actor/one-timeline handoff as bearer-session claims.
+
+The approved conversation receives a 30-day renewable dead-man lease. Whenever
+the exact current trusted conversation authenticates during the final seven
+days, the server extends its lease to 30 days. This does not create another
+timeline or broaden authority. Replacement and operator revocation remain
+immediate. Context Server does not currently receive a trustworthy external
+conversation-deletion event, so it never infers deletion from inactivity.
+The core exposes a local-only, idempotent external lifecycle adapter for a
+future trusted tunnel integration. It hashes the exact subject/thread binding
+and can record `thread_deleted`; it is intentionally not registered as an MCP
+tool or network endpoint until an authoritative event source exists.
 
 Only enable `TRUST_OPENAI_TUNNEL_IDENTITY` when the server's MCP input is
 exclusively controlled by the trusted tunnel process. Direct MCP clients can
@@ -456,6 +487,11 @@ in authenticated channel calls:
    }
    ```
 
+Native clients renew explicitly with `renew_actor_session`. A successful
+renewal preserves `session_id`, extends the lease to 30 days, and returns a new
+`session_token` exactly once. The previous token is invalid immediately. An
+expired, revoked, deleted, or replaced session cannot renew itself.
+
 Operators may deny or revoke the capability without handling its secret:
 
 ```bash
@@ -463,15 +499,22 @@ npm run actor-session:deny -- --request-id asr_<id>
 npm run actor-session:revoke -- --session-id as_<id>
 ```
 
+The compiled `dist/auth/operator-actor-sessions.js` module is the narrow local
+operator adapter used by Agent Runtime. It exports sanitized pending request
+metadata and exact approve/deny decisions bound to request ID, actor external
+ID, and client label. It intentionally returns no claim code, token, identity
+hash, or database row. This module is for a trusted local runtime process, not
+an MCP tool or network endpoint.
+
 Requesting a session does not authenticate the requester and grants nothing.
 Approval is a deliberate local trust decision that checks both request ID and
 expected actor ID. The high-entropy claim code prevents another caller that
 only learns the request ID from claiming the approved capability. Requests
 expire after 15 minutes; approval starts a fresh 15-minute claim window.
 Claiming is one-time, and only token hashes are stored. Actor sessions are
-bearer capabilities protected by the MCP tunnel transport, limited expiry,
-revocation, timestamp checks, and one-use nonces. Ed25519 remains the stronger
-choice for runtimes that can sign locally.
+renewable capabilities protected by the MCP tunnel transport, a 30-day
+dead-man lease, immediate revocation, timestamp checks, and one-use nonces.
+Ed25519 remains the stronger choice for runtimes that can sign locally.
 
 Each durable actor has exactly one current actor-session timeline. Creating a
 replacement request does not disturb the current session. For trusted OpenAI
@@ -577,7 +620,8 @@ This project is licensed under the [MIT License](LICENSE).
 | `acknowledge_context` | Idempotently acknowledge an ordinary Whiteboard context. Arguments: `context_id` and optional explicit `actor`; otherwise the current MCP actor session is used. Other visibility classes are not accessible through this tool. | JSON text containing `{ "context_id", "acknowledged", "context" }`. Context records expose deterministic `acknowledged_by` actor entries without actor metadata. |
 | `request_actor_session` | Request a pending remote actor session for explicit local approval. Trusted OpenAI requests capture the current opaque conversation binding and omit the native claim code. | `{ "request": { "request_id", "status", ... } }` for OpenAI, or `{ "request": { "request_id", "claim_code", "status", ... } }` for native clients |
 | `get_actor_session_request_status` | Check a request using its request ID and secret claim code. | `{ "request": { "status", ... } }` |
-| `claim_actor_session` | Claim an approved request once and receive an expiring bearer capability. | `{ "session": { "session_id", "session_token", "expires_at", ... } }` |
+| `claim_actor_session` | Claim an approved request once and receive a renewable native bearer capability. | `{ "session": { "session_id", "session_token", "expires_at", ... } }` |
+| `renew_actor_session` | Native clients only: authenticate the current session, extend its lease to 30 days, and atomically rotate its bearer token. | `{ "session": { "session_id", "session_token", "expires_at", "credential_generation", "renewal_count", ... } }` |
 | `create_channel` | Create a private channel using an authenticated request. The signing actor becomes owner. | `{ "channel": channel }` |
 | `add_channel_member` | Add or restore a durable actor. Requires an authenticated channel owner/admin. | `{ "membership": membership }` |
 | `remove_channel_member` | Remove a non-owner actor. Requires an authenticated channel owner/admin. | `{ "membership": { "removed": boolean, ... } }` |

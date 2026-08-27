@@ -1,5 +1,9 @@
 # Inspection Android companion
 
+> **Obsolete:** This standalone client is retained temporarily for historical
+> reference and compatibility testing. New phone UI work belongs in Agent
+> Companion, which now provides the Personal Context inspection surface.
+
 This native client is intentionally narrower than Agent Approval. It can:
 
 - list Whiteboard records and actor acknowledgements;

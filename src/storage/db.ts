@@ -597,6 +597,147 @@ const migrations: Migration[] = [
                 ON context_archives(archived_at DESC, id DESC);
         `,
     },
+    {
+        version: 13,
+        name: "attachment_audit_events",
+        sql: `
+            CREATE TABLE IF NOT EXISTS attachment_audit_events (
+                id BIGSERIAL PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                actor_id BIGINT REFERENCES actors(id) ON DELETE SET NULL,
+                owner_actor_id BIGINT REFERENCES actors(id) ON DELETE SET NULL,
+                group_id BIGINT REFERENCES access_groups(id) ON DELETE SET NULL,
+                attachment_id UUID,
+                upload_id UUID,
+                size_bytes BIGINT CHECK (size_bytes IS NULL OR size_bytes >= 0),
+                details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS attachment_audit_events_created_at_idx
+                ON attachment_audit_events(created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS attachment_audit_events_owner_idx
+                ON attachment_audit_events(owner_actor_id, created_at DESC)
+                WHERE owner_actor_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS attachment_audit_events_group_idx
+                ON attachment_audit_events(group_id, created_at DESC)
+                WHERE group_id IS NOT NULL;
+        `,
+    },
+    {
+        version: 14,
+        name: "renewable_actor_session_leases",
+        sql: `
+            ALTER TABLE actor_sessions
+                ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS last_renewed_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS renewal_count INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS credential_generation INTEGER NOT NULL DEFAULT 1,
+                ADD COLUMN IF NOT EXISTS lifecycle_kind TEXT,
+                ADD COLUMN IF NOT EXISTS external_deleted_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS external_lifecycle_event_id TEXT;
+
+            UPDATE actor_sessions
+            SET
+                lease_expires_at = COALESCE(lease_expires_at, expires_at),
+                lifecycle_kind = COALESCE(
+                    lifecycle_kind,
+                    CASE
+                        WHEN openai_subject_hash IS NOT NULL AND openai_session_hash IS NOT NULL
+                            THEN 'trusted_openai_thread'
+                        ELSE 'native_bearer'
+                    END
+                );
+
+            ALTER TABLE actor_sessions
+                ALTER COLUMN lease_expires_at SET NOT NULL,
+                ALTER COLUMN lifecycle_kind SET NOT NULL;
+
+            ALTER TABLE actor_sessions
+                DROP CONSTRAINT IF EXISTS actor_sessions_lifecycle_kind_check;
+            ALTER TABLE actor_sessions
+                ADD CONSTRAINT actor_sessions_lifecycle_kind_check
+                CHECK (lifecycle_kind IN ('trusted_openai_thread', 'native_bearer'));
+
+            CREATE UNIQUE INDEX IF NOT EXISTS actor_sessions_external_lifecycle_event_idx
+                ON actor_sessions(external_lifecycle_event_id)
+                WHERE external_lifecycle_event_id IS NOT NULL;
+        `,
+    },
+    {
+        version: 15,
+        name: "authorize_actor_session_renewal",
+        sql: `
+            ALTER TABLE actor_sessions
+                ADD COLUMN IF NOT EXISTS renewal_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+            CREATE INDEX IF NOT EXISTS actor_sessions_actor_lease_idx
+                ON actor_sessions(actor_id, lease_expires_at)
+                WHERE revoked_at IS NULL;
+        `,
+    },
+    {
+        version: 16,
+        name: "roost_sso_service_bindings",
+        sql: `
+            ALTER TABLE actor_session_requests
+                ADD COLUMN IF NOT EXISTS federation_issuer TEXT,
+                ADD COLUMN IF NOT EXISTS federation_audience TEXT;
+
+            CREATE TABLE IF NOT EXISTS actor_session_service_bindings (
+                binding_id TEXT PRIMARY KEY,
+                source_session_id TEXT NOT NULL REFERENCES actor_sessions(session_id) ON DELETE CASCADE,
+                actor_id BIGINT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+                issuer TEXT NOT NULL,
+                audience TEXT NOT NULL,
+                subject_hash TEXT NOT NULL,
+                service_session_hash TEXT,
+                binding_expires_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                bound_at TIMESTAMPTZ,
+                revoked_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (source_session_id, audience)
+            );
+
+            CREATE INDEX IF NOT EXISTS actor_session_service_bindings_lookup_idx
+                ON actor_session_service_bindings(issuer, audience, subject_hash, service_session_hash)
+                WHERE revoked_at IS NULL;
+        `,
+    },
+    {
+        version: 17,
+        name: "roost_sso_explicit_handoff",
+        sql: `
+            ALTER TABLE actor_session_service_bindings
+                ADD COLUMN IF NOT EXISTS service_subject_hash TEXT;
+
+            CREATE INDEX IF NOT EXISTS actor_session_service_bindings_service_lookup_idx
+                ON actor_session_service_bindings(
+                    issuer, audience, service_subject_hash, service_session_hash
+                )
+                WHERE revoked_at IS NULL
+                  AND service_subject_hash IS NOT NULL
+                  AND service_session_hash IS NOT NULL;
+        `,
+    },
+    {
+        version: 18,
+        name: "direct_context_inbox",
+        sql: `
+            CREATE TABLE IF NOT EXISTS direct_context_envelopes (
+                sequence BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                context_id BIGINT NOT NULL UNIQUE REFERENCES contexts(id) ON DELETE CASCADE,
+                recipient_actor_id BIGINT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS direct_context_envelopes_recipient_sequence_idx
+                ON direct_context_envelopes(recipient_actor_id, sequence DESC);
+
+            CREATE INDEX IF NOT EXISTS direct_context_envelopes_recipient_time_idx
+                ON direct_context_envelopes(recipient_actor_id, created_at DESC, sequence DESC);
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;
