@@ -166,6 +166,12 @@ const requestAuthSchema = z.union([
     signedRequestAuthSchema,
     actorSessionAuthSchema,
 ]);
+const subjectIdentitySchema = z.object({
+    external_id: z.string().regex(/^subject:[a-z0-9][a-z0-9:_-]*$/),
+    name: z.string().min(1).max(500),
+    kind: z.string().min(1).max(100).optional(),
+    aliases: z.array(z.string().min(1).max(500)).max(100).optional(),
+});
 
 function authenticationError(error: unknown, safeDetails?: { actor_external_id?: string }) {
     const candidate = error instanceof Error ? error.message : "AUTHENTICATION_FAILED";
@@ -580,21 +586,22 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
     server.registerTool(
         "save_context",
         {
-            description: "Save personal context for later retrieval. Include actor on every save unless identify_actor succeeded in this same persistent MCP session. If session continuity is uncertain, always include actor. Actor identifies who synthesized the memory; source identifies where the information came from.",
+            description: "Save shared Whiteboard context. Actor is the author, source is provenance, and subject is the optional topic.",
             inputSchema: {
                 text: z.string().min(1).describe("The context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags for grouping or filtering the context."),
                 source: z.string().optional().describe("Optional source describing where the context came from."),
                 visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Visibility classification. Only whiteboard is writable through this general tool; authenticated channel, personal, and access-group records use dedicated tools, while direct and system records remain staged."),
                 actor: z.object({
-                    external_id: z.string().min(1).describe("Stable operational actor ID, such as actor:openai:codex. Required for self-contained saves so reconnecting clients do not create duplicate anonymous actors."),
+                    external_id: z.string().min(1).describe("Stable actor ID, such as actor:openai:codex."),
                     name: z.string().min(1).describe("Actor display name."),
                     kind: z.string().min(1).optional().describe("Optional actor category, such as ai or human."),
-                    metadata: z.record(z.string(), z.unknown()).optional().describe("Optional actor metadata. Model version, client, and execution lineage belong here rather than in external_id."),
-                }).optional().describe("Explicit actor identity for this save. Takes precedence over the session-active actor and survives clients that reconnect between tool calls."),
+                    metadata: z.record(z.string(), z.unknown()).optional().describe("Optional non-identity actor metadata."),
+                }).optional().describe("Explicit author identity; overrides the session actor."),
+                subject: subjectIdentitySchema.optional().describe("Optional topic; never grants access."),
             },
         },
-        async ({ text, tags, source, visibility, actor }) => {
+        async ({ text, tags, source, visibility, actor, subject }) => {
             if (!actor && actorSession.actorId === null && requireActorIdentificationEnabled()) {
                 return {
                     isError: true,
@@ -629,6 +636,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 actor,
                 actorSession.actorId,
                 visibility,
+                subject,
             );
 
             if (saved.context.actor) {
@@ -660,6 +668,9 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                             saved: saved.context,
                             ...(saved.actor_resolution
                                 ? { actor_resolution: saved.actor_resolution }
+                                : {}),
+                            ...(saved.subject_resolution
+                                ? { subject_resolution: saved.subject_resolution }
                                 : {}),
                             ...(warning ? { warning } : {}),
                         }),
@@ -1338,11 +1349,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 text: z.string().min(1).describe("Context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags."),
                 source: z.string().optional().describe("Optional provenance source."),
+                subject: subjectIdentitySchema.optional(),
                 auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
             },
         },
-        async ({ group, text, tags, source, auth }, extra) => {
-            const payload = { group, text, tags, source };
+        async ({ group, text, tags, source, subject, auth }, extra) => {
+            const payload = { group, text, tags, source, subject };
 
             try {
                 const authenticated = await authenticateTool("save_group_context", payload, auth, extra);
@@ -1352,6 +1364,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     text,
                     tags,
                     source,
+                    subject,
                 );
                 return {
                     content: [{ type: "text", text: JSON.stringify({ saved }) }],
@@ -1542,11 +1555,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 text: z.string().min(1).describe("Context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags."),
                 source: z.string().optional().describe("Optional provenance source."),
+                subject: subjectIdentitySchema.optional().describe("Optional topic; actor remains owner."),
                 auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
             },
         },
-        async ({ text, tags, source, auth }, extra) => {
-            const payload = { text, tags, source };
+        async ({ text, tags, source, subject, auth }, extra) => {
+            const payload = { text, tags, source, subject };
 
             try {
                 const authenticated = await authenticateTool("save_personal_context", payload, auth, extra);
@@ -1555,6 +1569,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     text,
                     tags,
                     source,
+                    subject,
                 );
                 return {
                     content: [{
@@ -1737,11 +1752,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 text: z.string().min(1).optional().describe("Optional replacement text."),
                 tags: z.array(z.string()).optional().describe("Optional replacement tags."),
                 source: z.string().optional().describe("Optional replacement source."),
+                subject: subjectIdentitySchema.optional().describe("Optional canonical subject used to classify or backfill this private record. Actor ownership is unchanged."),
                 auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
             },
         },
-        async ({ id, text, tags, source, auth }, extra) => {
-            const payload = { id, text, tags, source };
+        async ({ id, text, tags, source, subject, auth }, extra) => {
+            const payload = { id, text, tags, source, subject };
 
             try {
                 const authenticated = await authenticateTool("update_personal_context", payload, auth, extra);
@@ -1751,6 +1767,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     text,
                     tags,
                     source,
+                    subject,
                 );
                 return {
                     content: [{
@@ -1952,10 +1969,11 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 tags: z.array(z.string()).optional().describe("Optional replacement tags."),
                 source: z.string().optional().describe("Optional replacement source."),
                 visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Optional replacement visibility. Only whiteboard is currently writable."),
+                subject: subjectIdentitySchema.optional().describe("Optional canonical subject used to classify or backfill this record. Actor attribution is unchanged."),
             },
         },
-        async ({ id, text, tags, source, visibility }) => {
-            const updated = await updateContext(id, text, tags, source, visibility);
+        async ({ id, text, tags, source, visibility, subject }) => {
+            const updated = await updateContext(id, text, tags, source, visibility, subject);
 
             return {
                 content: [

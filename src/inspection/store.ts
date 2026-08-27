@@ -106,6 +106,7 @@ type ArchivedContextRow = {
     actor_kind: string | null;
     actor_created_at: string | Date | null;
     actor_last_seen_at: string | Date | null;
+    subject: unknown;
     acknowledged_by: unknown;
     reason: string;
     archived_at: string | Date;
@@ -153,6 +154,7 @@ function acknowledgements(value: unknown): ContextAcknowledgement[] {
 }
 
 function mapArchivedContext(row: ArchivedContextRow): ArchivedWhiteboardContext {
+    const subject = row.subject as Record<string, unknown> | null;
     return {
         id: Number(row.id),
         kind: row.kind,
@@ -172,6 +174,17 @@ function mapArchivedContext(row: ArchivedContextRow): ArchivedWhiteboardContext 
                 created_at: timestamp(row.actor_created_at!),
                 last_seen_at: timestamp(row.actor_last_seen_at!),
             },
+        subject: subject
+            ? {
+                id: Number(subject.id),
+                external_id: String(subject.external_id),
+                name: String(subject.name),
+                kind: typeof subject.kind === "string" ? subject.kind : null,
+                aliases: tags(subject.aliases as string[] | string | null),
+                created_at: timestamp(subject.created_at as string | Date),
+                updated_at: timestamp(subject.updated_at as string | Date),
+            }
+            : null,
         acknowledged_by: acknowledgements(row.acknowledged_by),
         created_at: timestamp(row.created_at),
         updated_at: timestamp(row.updated_at),
@@ -202,6 +215,19 @@ async function listInspectionArchive(limit: number, contextId?: number) {
                 contexts.tags,
                 contexts.created_at,
                 contexts.updated_at,
+                (
+                    SELECT jsonb_build_object(
+                        'id', subjects.id,
+                        'external_id', subjects.external_id,
+                        'name', subjects.name,
+                        'kind', subjects.kind,
+                        'aliases', subjects.aliases,
+                        'created_at', subjects.created_at,
+                        'updated_at', subjects.updated_at
+                    )
+                    FROM subjects
+                    WHERE subjects.id = contexts.subject_id
+                ) AS subject,
                 authors.id AS actor_id,
                 authors.external_id AS actor_external_id,
                 authors.name AS actor_name,

@@ -15,9 +15,27 @@ export type ContextRecord = {
     source: string | null;
     tags: string[];
     actor: ActorRecord | null;
+    subject: SubjectRecord | null;
     acknowledged_by: ContextAcknowledgement[];
     created_at: string;
     updated_at: string;
+};
+
+export type SubjectRecord = {
+    id: number;
+    external_id: string;
+    name: string;
+    kind: string | null;
+    aliases: string[];
+    created_at: string;
+    updated_at: string;
+};
+
+export type SubjectIdentity = {
+    external_id: string;
+    name: string;
+    kind?: string;
+    aliases?: string[];
 };
 
 export type ContextAcknowledgement = {
@@ -47,6 +65,9 @@ export type ActorIdentity = {
 export type SaveContextResult = {
     context: ContextRecord;
     actor_resolution?: {
+        created: boolean;
+    };
+    subject_resolution?: {
         created: boolean;
     };
 };
@@ -97,7 +118,18 @@ type ContextRow = {
     actor_kind: string | null;
     actor_created_at: string | Date | null;
     actor_last_seen_at: string | Date | null;
+    subject: unknown;
     acknowledged_by: unknown;
+    created_at: string | Date;
+    updated_at: string | Date;
+};
+
+type SubjectRow = {
+    id: number | string;
+    external_id: string;
+    name: string;
+    kind: string | null;
+    aliases: string[] | string | null;
     created_at: string | Date;
     updated_at: string | Date;
 };
@@ -317,7 +349,20 @@ function mapContextRow(row: ContextRow): ContextRecord {
                   created_at: normalizeTimestamp(row.actor_created_at!),
                   last_seen_at: normalizeTimestamp(row.actor_last_seen_at!),
               },
+        subject: row.subject ? mapSubjectRow(row.subject as SubjectRow) : null,
         acknowledged_by: parseAcknowledgements(row.acknowledged_by),
+        created_at: normalizeTimestamp(row.created_at),
+        updated_at: normalizeTimestamp(row.updated_at),
+    };
+}
+
+function mapSubjectRow(row: SubjectRow): SubjectRecord {
+    return {
+        id: Number(row.id),
+        external_id: row.external_id,
+        name: row.name,
+        kind: row.kind,
+        aliases: parseTags(row.aliases),
         created_at: normalizeTimestamp(row.created_at),
         updated_at: normalizeTimestamp(row.updated_at),
     };
@@ -345,6 +390,19 @@ const CONTEXT_PROJECTION = `
     contexts.tags,
     contexts.created_at,
     contexts.updated_at,
+    (
+        SELECT jsonb_build_object(
+            'id', subjects.id,
+            'external_id', subjects.external_id,
+            'name', subjects.name,
+            'kind', subjects.kind,
+            'aliases', subjects.aliases,
+            'created_at', subjects.created_at,
+            'updated_at', subjects.updated_at
+        )
+        FROM subjects
+        WHERE subjects.id = contexts.subject_id
+    ) AS subject,
     actors.id AS actor_id,
     actors.external_id AS actor_external_id,
     actors.name AS actor_name,
@@ -368,6 +426,24 @@ const CONTEXT_PROJECTION = `
         WHERE context_acknowledgements.context_id = contexts.id
     ), '[]'::jsonb) AS acknowledged_by
 `;
+
+function subjectProjection(contextAlias: "inserted" | "updated" | "deleted") {
+    return `
+        (
+            SELECT jsonb_build_object(
+                'id', subjects.id,
+                'external_id', subjects.external_id,
+                'name', subjects.name,
+                'kind', subjects.kind,
+                'aliases', subjects.aliases,
+                'created_at', subjects.created_at,
+                'updated_at', subjects.updated_at
+            )
+            FROM subjects
+            WHERE subjects.id = ${contextAlias}.subject_id
+        ) AS subject
+    `;
+}
 
 function parseEmbeddingVector(value: unknown) {
     if (!value) {
@@ -510,6 +586,43 @@ async function resolveActor(identity: ActorIdentity, client: PoolClient) {
     return { actor: mapActorRow(resolved.rows[0]), created: false };
 }
 
+async function resolveSubject(identity: SubjectIdentity, client: PoolClient) {
+    const externalId = identity.external_id.trim();
+    const name = identity.name.trim();
+    const kind = identity.kind?.trim() || null;
+    const aliases = [...new Set((identity.aliases ?? []).map((alias) => alias.trim()).filter(Boolean))];
+
+    if (!/^subject:[a-z0-9][a-z0-9:_-]*$/.test(externalId)) {
+        throw new Error("subject.external_id must use the subject: namespace and lowercase letters, digits, colons, underscores, or hyphens.");
+    }
+    if (!name) {
+        throw new Error("subject.name must contain at least one non-whitespace character.");
+    }
+
+    const inserted = await client.query<SubjectRow>(
+        `
+            INSERT INTO subjects (external_id, name, kind, aliases)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (external_id) DO NOTHING
+            RETURNING id, external_id, name, kind, aliases, created_at, updated_at
+        `,
+        [externalId, name, kind, aliases],
+    );
+    if (inserted.rows[0]) {
+        return { subject: mapSubjectRow(inserted.rows[0]), created: true };
+    }
+
+    const resolved = await client.query<SubjectRow>(
+        `
+            SELECT id, external_id, name, kind, aliases, created_at, updated_at
+            FROM subjects
+            WHERE external_id = $1
+        `,
+        [externalId],
+    );
+    return { subject: mapSubjectRow(resolved.rows[0]), created: false };
+}
+
 export async function identifyActor(identity: ActorIdentity) {
     await initializeDatabase();
     const client = await db.connect();
@@ -527,17 +640,22 @@ export async function saveDirectContext(
     text: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const client = await db.connect();
     try {
         await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         const recipient = await client.query<{ id: number | string }>(
             "SELECT id FROM actors WHERE external_id = $1",
             [recipientExternalId],
         );
         if (!recipient.rows[0]) throw new Error("Recipient actor is not registered.");
-        const context = await insertContext(client, text, tags, source, senderActorId, "direct");
+        const context = await insertContext(
+            client, text, tags, source, senderActorId, "direct",
+            null, null, identifiedSubject?.subject.id ?? null,
+        );
         const envelope = await client.query<{ sequence: number | string }>(
             `INSERT INTO direct_context_envelopes (context_id, recipient_actor_id)
              VALUES ($1, $2) RETURNING sequence`,
@@ -623,6 +741,7 @@ async function insertContext(
     visibility: ContextVisibility | undefined,
     channelId: number | null = null,
     groupId: number | null = null,
+    subjectId: number | null = null,
 ) {
     const now = new Date().toISOString();
     const tagList = tags ?? [];
@@ -639,10 +758,11 @@ async function insertContext(
                     actor_id,
                     channel_id,
                     group_id,
+                    subject_id,
                     created_at,
                     updated_at
                 )
-                VALUES ('note', $1, $2, $3, $4, $5, $6, $7, $8, $8)
+                VALUES ('note', $1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
                 RETURNING *
             )
             SELECT
@@ -656,6 +776,19 @@ async function insertContext(
                 inserted.tags,
                 inserted.created_at,
                 inserted.updated_at,
+                (
+                    SELECT jsonb_build_object(
+                        'id', subjects.id,
+                        'external_id', subjects.external_id,
+                        'name', subjects.name,
+                        'kind', subjects.kind,
+                        'aliases', subjects.aliases,
+                        'created_at', subjects.created_at,
+                        'updated_at', subjects.updated_at
+                    )
+                    FROM subjects
+                    WHERE subjects.id = inserted.subject_id
+                ) AS subject,
                 actors.id AS actor_id,
                 actors.external_id AS actor_external_id,
                 actors.name AS actor_name,
@@ -673,6 +806,7 @@ async function insertContext(
             actorId,
             channelId,
             groupId,
+            subjectId,
             now,
         ]
     );
@@ -686,12 +820,14 @@ export async function saveContext(
     source?: string,
     actorId?: number | null,
     visibility?: WritableContextVisibility,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const client = await db.connect();
     let context: ContextRecord;
 
     try {
+        const resolvedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -699,6 +835,9 @@ export async function saveContext(
             source,
             actorId ?? null,
             visibility,
+            null,
+            null,
+            resolvedSubject?.subject.id ?? null,
         );
     } finally {
         client.release();
@@ -716,21 +855,42 @@ export async function saveContextWithActor(
     actor?: ActorIdentity,
     activeActorId?: number | null,
     visibility?: WritableContextVisibility,
+    subject?: SubjectIdentity,
 ): Promise<SaveContextResult> {
     if (!actor) {
-        return {
-            context: await saveContext(text, tags, source, activeActorId, visibility),
-        };
+        await initializeDatabase();
+        const client = await db.connect();
+        try {
+            await client.query("BEGIN");
+            const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
+            const context = await insertContext(
+                client, text, tags, source, activeActorId ?? null, visibility,
+                null, null, identifiedSubject?.subject.id ?? null,
+            );
+            await client.query("COMMIT");
+            await maybeSaveContextEmbedding(context);
+            return {
+                context,
+                ...(identifiedSubject ? { subject_resolution: { created: identifiedSubject.created } } : {}),
+            };
+        } catch (error) {
+            await client.query("ROLLBACK");
+            throw error;
+        } finally {
+            client.release();
+        }
     }
 
     await initializeDatabase();
     const client = await db.connect();
     let context: ContextRecord;
     let identified: Awaited<ReturnType<typeof resolveActor>>;
+    let identifiedSubject: Awaited<ReturnType<typeof resolveSubject>> | null = null;
 
     try {
         await client.query("BEGIN");
         identified = await resolveActor(actor, client);
+        identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -738,6 +898,9 @@ export async function saveContextWithActor(
             source,
             identified.actor.id,
             visibility,
+            null,
+            null,
+            identifiedSubject?.subject.id ?? null,
         );
         await client.query("COMMIT");
     } catch (error) {
@@ -754,6 +917,7 @@ export async function saveContextWithActor(
         actor_resolution: {
             created: identified.created,
         },
+        ...(identifiedSubject ? { subject_resolution: { created: identifiedSubject.created } } : {}),
     };
 }
 
@@ -845,6 +1009,16 @@ async function searchContextByText(
                 contexts.content ILIKE $1
                 OR contexts.source ILIKE $1
                 OR contexts.tags::text ILIKE $1
+                OR EXISTS (
+                    SELECT 1 FROM subjects
+                    WHERE subjects.id = contexts.subject_id
+                      AND (
+                          subjects.external_id ILIKE $1
+                          OR subjects.name ILIKE $1
+                          OR subjects.kind ILIKE $1
+                          OR subjects.aliases::text ILIKE $1
+                      )
+                )
             )
               AND ${WHITEBOARD_READ_PREDICATE}
               AND ($2::text IS NULL OR actors.external_id = $2)
@@ -1049,7 +1223,8 @@ export async function deleteContext(id: number) {
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -1067,6 +1242,7 @@ export async function updateContext(
     tags?: string[],
     source?: string,
     visibility?: WritableContextVisibility,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
 
@@ -1074,9 +1250,10 @@ export async function updateContext(
     const hasTags = tags !== undefined;
     const hasSource = source !== undefined;
     const hasVisibility = visibility !== undefined;
+    const hasSubject = subject !== undefined;
 
-    if (!hasText && !hasTags && !hasSource && !hasVisibility) {
-        throw new Error("At least one of text, tags, source, or visibility must be provided.");
+    if (!hasText && !hasTags && !hasSource && !hasVisibility && !hasSubject) {
+        throw new Error("At least one of text, tags, source, visibility, or subject must be provided.");
     }
 
     const tagValue = hasTags
@@ -1085,7 +1262,12 @@ export async function updateContext(
             : JSON.stringify(tags)
         : null;
 
-    const result = await db.query<ContextRow>(
+    const client = await db.connect();
+    let result;
+    try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
+        result = await client.query<ContextRow>(
         `
             WITH updated AS (
                 UPDATE contexts
@@ -1094,7 +1276,8 @@ export async function updateContext(
                     tags = CASE WHEN $4 THEN $5 ELSE tags END,
                     source = CASE WHEN $6 THEN $7 ELSE source END,
                     visibility = CASE WHEN $8 THEN $9 ELSE visibility END,
-                    updated_at = $10
+                    subject_id = CASE WHEN $10 THEN $11 ELSE subject_id END,
+                    updated_at = $12
                 WHERE id = $1
                   AND visibility = 'whiteboard'
                 RETURNING *
@@ -1114,9 +1297,17 @@ export async function updateContext(
             source ?? null,
             hasVisibility,
             visibility ?? null,
+            hasSubject,
+            identifiedSubject?.subject.id ?? null,
             new Date().toISOString(),
-        ]
-    );
+        ]);
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
 
     const updatedContext = result.rows[0];
 
@@ -1504,6 +1695,7 @@ export async function saveChannelContext(
     text: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const channel = await requireChannelMembership(actorId, slug, "write");
@@ -1511,6 +1703,8 @@ export async function saveChannelContext(
     let context: ContextRecord;
 
     try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -1519,7 +1713,13 @@ export async function saveChannelContext(
             actorId,
             "channel",
             channel.id,
+            null,
+            identifiedSubject?.subject.id ?? null,
         );
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
     } finally {
         client.release();
     }
@@ -1546,6 +1746,11 @@ async function searchChannelContextByText(
                     contexts.content ILIKE $2
                  OR contexts.source ILIKE $2
                  OR contexts.tags::text ILIKE $2
+                 OR EXISTS (
+                        SELECT 1 FROM subjects
+                        WHERE subjects.id = contexts.subject_id
+                          AND (subjects.external_id ILIKE $2 OR subjects.name ILIKE $2 OR subjects.kind ILIKE $2 OR subjects.aliases::text ILIKE $2)
+                    )
               )
             ORDER BY contexts.created_at DESC, contexts.id DESC
             LIMIT $3
@@ -1709,7 +1914,8 @@ export async function updateChannelContext(
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("updated")}
             FROM updated
             LEFT JOIN actors ON actors.id = updated.actor_id
         `,
@@ -1769,7 +1975,8 @@ export async function deleteChannelContext(actorId: number, id: number) {
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -2092,6 +2299,7 @@ export async function saveGroupContext(
     text: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const group = await requireAccessGroupMembership(actorId, slug, "write");
@@ -2099,6 +2307,8 @@ export async function saveGroupContext(
     let context: ContextRecord;
 
     try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -2108,7 +2318,12 @@ export async function saveGroupContext(
             "group",
             null,
             group.id,
+            identifiedSubject?.subject.id ?? null,
         );
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
     } finally {
         client.release();
     }
@@ -2135,6 +2350,11 @@ async function searchGroupContextByText(
                     contexts.content ILIKE $2
                  OR contexts.source ILIKE $2
                  OR contexts.tags::text ILIKE $2
+                 OR EXISTS (
+                        SELECT 1 FROM subjects
+                        WHERE subjects.id = contexts.subject_id
+                          AND (subjects.external_id ILIKE $2 OR subjects.name ILIKE $2 OR subjects.kind ILIKE $2 OR subjects.aliases::text ILIKE $2)
+                    )
               )
             ORDER BY contexts.created_at DESC, contexts.id DESC
             LIMIT $3
@@ -2287,7 +2507,8 @@ export async function updateGroupContext(
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("updated")}
             FROM updated
             LEFT JOIN actors ON actors.id = updated.actor_id
         `,
@@ -2343,7 +2564,8 @@ export async function deleteGroupContext(actorId: number, id: number) {
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -2358,12 +2580,15 @@ export async function savePersonalContext(
     text: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const client = await db.connect();
     let context: ContextRecord;
 
     try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -2371,7 +2596,14 @@ export async function savePersonalContext(
             source,
             actorId,
             "personal",
+            null,
+            null,
+            identifiedSubject?.subject.id ?? null,
         );
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
     } finally {
         client.release();
     }
@@ -2396,6 +2628,16 @@ async function searchPersonalContextByText(
                     contexts.content ILIKE $2
                  OR contexts.source ILIKE $2
                  OR contexts.tags::text ILIKE $2
+                 OR EXISTS (
+                        SELECT 1 FROM subjects
+                        WHERE subjects.id = contexts.subject_id
+                          AND (
+                              subjects.external_id ILIKE $2
+                              OR subjects.name ILIKE $2
+                              OR subjects.kind ILIKE $2
+                              OR subjects.aliases::text ILIKE $2
+                          )
+                    )
               )
             ORDER BY contexts.created_at DESC, contexts.id DESC
             LIMIT $3
@@ -2497,14 +2739,16 @@ export async function updatePersonalContext(
     text?: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const hasText = text !== undefined;
     const hasTags = tags !== undefined;
     const hasSource = source !== undefined;
+    const hasSubject = subject !== undefined;
 
-    if (!hasText && !hasTags && !hasSource) {
-        throw new Error("At least one of text, tags, or source must be provided.");
+    if (!hasText && !hasTags && !hasSource && !hasSubject) {
+        throw new Error("At least one of text, tags, source, or subject must be provided.");
     }
 
     const tagValue = hasTags
@@ -2512,7 +2756,12 @@ export async function updatePersonalContext(
             ? tags
             : JSON.stringify(tags)
         : null;
-    const result = await db.query<ContextRow>(
+    const client = await db.connect();
+    let result;
+    try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
+        result = await client.query<ContextRow>(
         `
             WITH updated AS (
                 UPDATE contexts
@@ -2520,7 +2769,8 @@ export async function updatePersonalContext(
                     content = CASE WHEN $3 THEN $4 ELSE content END,
                     tags = CASE WHEN $5 THEN $6 ELSE tags END,
                     source = CASE WHEN $7 THEN $8 ELSE source END,
-                    updated_at = $9
+                    subject_id = CASE WHEN $9 THEN $10 ELSE subject_id END,
+                    updated_at = $11
                 WHERE contexts.id = $1
                   AND contexts.visibility = 'personal'
                   AND contexts.actor_id = $2
@@ -2542,7 +2792,8 @@ export async function updatePersonalContext(
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("updated")}
             FROM updated
             LEFT JOIN actors ON actors.id = updated.actor_id
         `,
@@ -2555,9 +2806,17 @@ export async function updatePersonalContext(
             tagValue,
             hasSource,
             source ?? null,
+            hasSubject,
+            identifiedSubject?.subject.id ?? null,
             new Date().toISOString(),
-        ],
-    );
+        ]);
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
     const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
 
     if (context && hasText) {
@@ -2594,7 +2853,8 @@ export async function deletePersonalContext(actorId: number, id: number) {
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -2796,7 +3056,8 @@ export async function contextPurgeConfirm(
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,

@@ -86,13 +86,14 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
 
         await runDatabaseMigrations(isolatedPool);
 
-        const legacy = await isolatedPool.query("SELECT actor_id, visibility, channel_id, group_id FROM contexts");
+        const legacy = await isolatedPool.query("SELECT actor_id, subject_id, visibility, channel_id, group_id FROM contexts");
         const applied = await isolatedPool.query("SELECT version FROM schema_migrations ORDER BY version");
         assert.equal(legacy.rows[0].actor_id, null);
+        assert.equal(legacy.rows[0].subject_id, null);
         assert.equal(legacy.rows[0].visibility, "whiteboard");
         assert.equal(legacy.rows[0].channel_id, null);
         assert.equal(legacy.rows[0].group_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
     } finally {
         await isolatedPool.end();
         await adminPool.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -717,10 +718,12 @@ test("built MCP schemas expose actor identification and stable actor filters", a
             idempotentHint: true,
             openWorldHint: false,
         });
-        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text", "visibility"]);
+        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "subject", "tags", "text", "visibility"]);
         assert.deepEqual(saveSchema.properties.visibility.enum, ["whiteboard"]);
         assert.deepEqual(saveSchema.properties.actor.required, ["external_id", "name"]);
         assert.ok(saveSchema.properties.actor.properties.external_id);
+        assert.deepEqual(saveSchema.properties.subject.required, ["external_id", "name"]);
+        assert.match(saveSchema.properties.subject.properties.external_id.pattern, /^\^subject:/);
         assert.deepEqual(updateSchema.properties.visibility.enum, ["whiteboard"]);
         for (const toolName of [
             "create_channel",

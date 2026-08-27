@@ -186,6 +186,12 @@ every save:
     "external_id": "actor:eden",
     "name": "Eden",
     "kind": "ai"
+  },
+  "subject": {
+    "external_id": "subject:project:context-server",
+    "name": "Context Server",
+    "kind": "project",
+    "aliases": ["personal context server"]
   }
 }
 ```
@@ -205,6 +211,27 @@ requires attribution without choosing the actor for the model.
 
 Existing databases upgrade through the transactional `schema_migrations`
 ledger. Existing contexts are not backfilled and remain `actor: null`.
+
+### Knowledge subjects
+
+Contexts may optionally reference a canonical subject describing what the
+knowledge is about. Subject IDs use a separate lowercase `subject:` namespace,
+for example `subject:project:context-server`. A subject has a stable external
+ID, canonical name, optional kind, and optional retrieval aliases.
+
+Subjects are classification metadata, not principals: they never grant
+ownership, authentication, visibility, or access. The `actor` remains who
+created or owns a record under the applicable visibility contract. OpenAI
+tunnel subject values are authentication-local metadata and must not be copied
+into knowledge-subject IDs.
+
+Migration 19 adds `subjects` and nullable `contexts.subject_id`. Existing rows
+intentionally remain unclassified (`subject: null`); no subject is inferred
+from actor, content, tags, or tunnel identity. New records can supply `subject`
+when saved, and existing Whiteboard or personal records can be explicitly
+backfilled through their existing update tools. Text retrieval matches the
+subject ID, canonical name, kind, and aliases while preserving the original
+visibility and actor-ownership predicates.
 
 ### Whiteboard visibility
 
