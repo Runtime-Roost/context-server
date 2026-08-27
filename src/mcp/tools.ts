@@ -212,6 +212,27 @@ export async function resolveSearchResultsWithFallback(
     return vectorResults === null ? textFallback() : vectorResults;
 }
 
+export function mergeHybridSearchResults(
+    textResults: ContextRecord[],
+    vectorResults: ContextRecord[],
+    limit: number,
+) {
+    const merged: ContextRecord[] = [];
+    const seen = new Set<number>();
+
+    // A literal match in content, source, or tags is strong evidence and also
+    // keeps records without embeddings discoverable. Semantic matches then
+    // broaden recall without duplicating records returned by both paths.
+    for (const context of [...textResults, ...vectorResults]) {
+        if (seen.has(context.id)) continue;
+        seen.add(context.id);
+        merged.push(context);
+        if (merged.length >= limit) break;
+    }
+
+    return merged;
+}
+
 function parseTags(tags: string | string[] | null) {
     if (!tags) {
         return [];
@@ -2400,24 +2421,27 @@ export async function searchPersonalContext(
         return searchPersonalContextByText(actorId, query, resultLimit);
     }
 
-    const result = await db.query<VectorSearchRow>(
-        `
-            SELECT
-                ${CONTEXT_PROJECTION},
-                embeddings.model,
-                embeddings.vector
-            FROM contexts
-            INNER JOIN embeddings ON embeddings.context_id = contexts.id
-            LEFT JOIN actors ON actors.id = contexts.actor_id
-            WHERE contexts.visibility = 'personal'
-              AND contexts.actor_id = $1
-              AND embeddings.model = $2
-              AND embeddings.vector IS NOT NULL
-        `,
-        [actorId, embedding.model],
-    );
+    const [result, textResults] = await Promise.all([
+        db.query<VectorSearchRow>(
+            `
+                SELECT
+                    ${CONTEXT_PROJECTION},
+                    embeddings.model,
+                    embeddings.vector
+                FROM contexts
+                INNER JOIN embeddings ON embeddings.context_id = contexts.id
+                LEFT JOIN actors ON actors.id = contexts.actor_id
+                WHERE contexts.visibility = 'personal'
+                  AND contexts.actor_id = $1
+                  AND embeddings.model = $2
+                  AND embeddings.vector IS NOT NULL
+            `,
+            [actorId, embedding.model],
+        ),
+        searchPersonalContextByText(actorId, query, resultLimit),
+    ]);
 
-    return result.rows
+    const vectorResults = result.rows
         .map((row) => {
             const vector = parseEmbeddingVector(row.vector);
             const similarity = vector ? cosineSimilarity(embedding.vector, vector) : null;
@@ -2428,6 +2452,8 @@ export async function searchPersonalContext(
         .sort((left, right) => right.similarity - left.similarity)
         .slice(0, resultLimit)
         .map((item) => item.context);
+
+    return mergeHybridSearchResults(textResults, vectorResults, resultLimit);
 }
 
 export async function listPersonalContext(actorId: number, limit?: number) {

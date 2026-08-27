@@ -91,6 +91,7 @@ test("personal context is private to the authenticated actor across every operat
     ]);
     let contextId;
     let outsiderContextId;
+    let ownerTextOnlyContextId;
 
     try {
         const unauthenticated = await client.callTool({
@@ -129,6 +130,15 @@ test("personal context is private to the authenticated actor across every operat
         ));
         outsiderContextId = outsiderSaved.saved.id;
 
+        const ownerTextOnly = textResult(await signedCall(
+            client,
+            "save_personal_context",
+            { text: `${marker}-text-only`, tags: ["personal-test", "unembedded"] },
+            ownerKey,
+            ownerIdentity.privateKey,
+        ));
+        ownerTextOnlyContextId = ownerTextOnly.saved.id;
+
         assert.equal(await getContext(contextId), null);
         assert.ok((await listRecentContext(100)).every((context) => context.id !== contextId));
         assert.ok((await searchContext(marker, 100, "low")).every((context) => context.id !== contextId));
@@ -158,7 +168,12 @@ test("personal context is private to the authenticated actor across every operat
             }),
         );
         assert.ok(semanticOwnerResults.some((context) => context.id === contextId));
+        assert.ok(semanticOwnerResults.some((context) => context.id === ownerTextOnlyContextId));
         assert.ok(semanticOwnerResults.every((context) => context.id !== outsiderContextId));
+        assert.equal(
+            semanticOwnerResults.filter((context) => context.id === contextId).length,
+            1,
+        );
 
         const ownerExact = textResult(await signedCall(
             client,
@@ -262,7 +277,7 @@ test("personal context is private to the authenticated actor across every operat
         assert.equal(outsiderDeleted.deleted.id, outsiderContextId);
         outsiderContextId = undefined;
     } finally {
-        const remainingContextIds = [contextId, outsiderContextId].filter(Boolean);
+        const remainingContextIds = [contextId, outsiderContextId, ownerTextOnlyContextId].filter(Boolean);
         if (remainingContextIds.length > 0) {
             await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [remainingContextIds]);
         }

@@ -1,4 +1,5 @@
 import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
     authenticateRequest,
@@ -85,6 +86,21 @@ const DEFAULT_CONTEXT_RESULT_LIMIT = 5;
 const MAX_CONTEXT_RESULT_CONTENT_CHARS = 8_000;
 const MAX_CONTEXT_RESULT_PAYLOAD_CHARS = 24_000;
 const LIST_CONTEXT_EXCERPT_CHARS = 500;
+
+function emitPrivateReadReceipt(
+    receiptId: string,
+    tool: "search_personal_context" | "list_personal_context" | "get_personal_context",
+    stage: "received" | "authenticated" | "completed" | "rejected",
+    details: Record<string, string | number | boolean | null> = {},
+) {
+    console.error(JSON.stringify({
+        event: "context_server_private_read_receipt",
+        receipt_id: receiptId,
+        tool,
+        stage,
+        ...details,
+    }));
+}
 
 type ProjectedContextRecord = ContextRecord & {
     content_length?: number;
@@ -1572,10 +1588,18 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
         },
         async ({ query, limit, sensitivity, auth }, extra) => {
             const payload = { query, limit, sensitivity };
+            const receiptId = randomUUID();
+            emitPrivateReadReceipt(receiptId, "search_personal_context", "received", {
+                limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
+                sensitivity: sensitivity ?? "high",
+            });
 
             try {
                 const authenticated = await authenticateTool("search_personal_context", payload, auth, extra);
                 const selectedSensitivity = sensitivity ?? "high";
+                emitPrivateReadReceipt(receiptId, "search_personal_context", "authenticated", {
+                    actor_id: authenticated.actor_id,
+                });
                 const results = await searchPersonalContext(
                     authenticated.actor_id,
                     query,
@@ -1583,6 +1607,11 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     selectedSensitivity,
                 );
                 const projected = projectContextResults(results, "search");
+                emitPrivateReadReceipt(receiptId, "search_personal_context", "completed", {
+                    actor_id: authenticated.actor_id,
+                    result_count: projected.results.length,
+                    response_truncated: projected.response_truncated,
+                });
                 return {
                     content: [{
                         type: "text",
@@ -1595,6 +1624,9 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     }],
                 };
             } catch (error) {
+                emitPrivateReadReceipt(receiptId, "search_personal_context", "rejected", {
+                    error: error instanceof Error ? error.name : "unknown_error",
+                });
                 return authenticationError(error);
             }
         },
@@ -1618,11 +1650,23 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
         },
         async ({ limit, auth }, extra) => {
             const payload = { limit };
+            const receiptId = randomUUID();
+            emitPrivateReadReceipt(receiptId, "list_personal_context", "received", {
+                limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
+            });
 
             try {
                 const authenticated = await authenticateTool("list_personal_context", payload, auth, extra);
+                emitPrivateReadReceipt(receiptId, "list_personal_context", "authenticated", {
+                    actor_id: authenticated.actor_id,
+                });
                 const results = await listPersonalContext(authenticated.actor_id, limit);
                 const projected = projectContextResults(results, "list");
+                emitPrivateReadReceipt(receiptId, "list_personal_context", "completed", {
+                    actor_id: authenticated.actor_id,
+                    result_count: projected.results.length,
+                    response_truncated: projected.response_truncated,
+                });
                 return {
                     content: [{
                         type: "text",
@@ -1630,6 +1674,9 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     }],
                 };
             } catch (error) {
+                emitPrivateReadReceipt(receiptId, "list_personal_context", "rejected", {
+                    error: error instanceof Error ? error.name : "unknown_error",
+                });
                 return authenticationError(error);
             }
         },
@@ -1653,10 +1700,19 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
         },
         async ({ id, auth }, extra) => {
             const payload = { id };
+            const receiptId = randomUUID();
+            emitPrivateReadReceipt(receiptId, "get_personal_context", "received");
 
             try {
                 const authenticated = await authenticateTool("get_personal_context", payload, auth, extra);
+                emitPrivateReadReceipt(receiptId, "get_personal_context", "authenticated", {
+                    actor_id: authenticated.actor_id,
+                });
                 const context = await getPersonalContext(authenticated.actor_id, id);
+                emitPrivateReadReceipt(receiptId, "get_personal_context", "completed", {
+                    actor_id: authenticated.actor_id,
+                    found: context !== null,
+                });
                 return {
                     content: [{
                         type: "text",
@@ -1664,6 +1720,9 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     }],
                 };
             } catch (error) {
+                emitPrivateReadReceipt(receiptId, "get_personal_context", "rejected", {
+                    error: error instanceof Error ? error.name : "unknown_error",
+                });
                 return authenticationError(error);
             }
         },
