@@ -269,6 +269,20 @@ async function authenticateTool(
     return authenticateOpenAITunnelActorSession(openAITunnelIdentity(extra));
 }
 
+function requireContextAuthentication() {
+    return process.env.REQUIRE_CONTEXT_AUTHENTICATION?.trim().toLowerCase() !== "false";
+}
+
+async function authenticateContextTool(
+    tool: string,
+    payload: Record<string, unknown>,
+    extra?: { _meta?: Record<string, unknown> },
+) {
+    return requireContextAuthentication()
+        ? authenticateTool(tool, payload, undefined, extra)
+        : null;
+}
+
 function openAITunnelIdentity(extra?: { _meta?: Record<string, unknown> }) {
     if (process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() !== "true") {
         throw new Error("AUTHENTICATION_REQUIRED");
@@ -620,8 +634,16 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 subject: subjectIdentitySchema.optional().describe("Optional topic; never grants access."),
             },
         },
-        async ({ text, tags, source, visibility, actor, subject }) => {
-            if (!actor && actorSession.actorId === null && requireActorIdentificationEnabled()) {
+        async ({ text, tags, source, visibility, actor, subject }, extra) => {
+            let authenticated;
+            try {
+                authenticated = await authenticateContextTool("save_context", { text, tags, source, visibility, subject }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
+            const effectiveActor = authenticated ? undefined : actor;
+            const effectiveActorId = authenticated?.actor_id ?? actorSession.actorId;
+            if (!authenticated && !actor && actorSession.actorId === null && requireActorIdentificationEnabled()) {
                 return {
                     isError: true,
                     content: [
@@ -652,8 +674,8 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 text,
                 tags,
                 source,
-                actor,
-                actorSession.actorId,
+                effectiveActor,
+                effectiveActorId,
                 visibility,
                 subject,
             );
@@ -717,7 +739,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
             },
         },
-        async ({ query, limit, sensitivity, actor_external_id }) => {
+        async ({ query, limit, sensitivity, actor_external_id }, extra) => {
+            try {
+                await authenticateContextTool("search_context", { query, limit, sensitivity, actor_external_id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const selectedSensitivity = sensitivity ?? "high";
             const results = await searchContext(query, limit, selectedSensitivity, actor_external_id);
             const projected = projectContextResults(results, "search");
@@ -777,7 +804,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 openWorldHint: false,
             },
         },
-        async () => {
+        async (extra) => {
+            try {
+                await authenticateContextTool("get_user_profile", {}, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const profile = await getUserProfile();
 
             return {
@@ -807,7 +839,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
             },
         },
-        async ({ limit, actor_external_id }) => {
+        async ({ limit, actor_external_id }, extra) => {
+            try {
+                await authenticateContextTool("list_recent_context", { limit, actor_external_id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const results = await listRecentContext(limit, actor_external_id);
             const projected = projectContextResults(results, "list");
 
@@ -1865,7 +1902,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 openWorldHint: false,
             },
         },
-        async () => {
+        async (extra) => {
+            try {
+                await authenticateContextTool("database_metadata", {}, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const metadata = await getDatabaseMetadata();
 
             return {
@@ -1894,7 +1936,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 id: z.number().int().positive().describe("The id of the context item to retrieve."),
             },
         },
-        async ({ id }) => {
+        async ({ id }, extra) => {
+            try {
+                await authenticateContextTool("get_context", { id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const context = await getContext(id);
 
             return {
@@ -2080,8 +2127,14 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 openWorldHint: false,
             },
         },
-        async ({ context_id, actor }) => {
-            if (!actor && actorSession.actorId === null) {
+        async ({ context_id, actor }, extra) => {
+            let authenticated;
+            try {
+                authenticated = await authenticateContextTool("acknowledge_context", { context_id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
+            if (!authenticated && !actor && actorSession.actorId === null) {
                 return {
                     isError: true,
                     content: [{
@@ -2107,8 +2160,8 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
             }
             const result = await acknowledgeContextWithActor(
                 context_id,
-                actor,
-                actorSession.actorId,
+                authenticated ? undefined : actor,
+                authenticated?.actor_id ?? actorSession.actorId,
             );
             if (result.actor) actorSession.activate(result.actor.id);
             return {
@@ -2135,7 +2188,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 id: z.number().int().positive().describe("The id of the context item to delete."),
             },
         },
-        async ({ id }) => {
+        async ({ id }, extra) => {
+            try {
+                await authenticateContextTool("delete_context", { id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const deleted = await deleteContext(id);
 
             return {
@@ -2165,7 +2223,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 subject: subjectIdentitySchema.optional().describe("Optional canonical subject used to classify or backfill this record. Actor attribution is unchanged."),
             },
         },
-        async ({ id, text, tags, source, visibility, subject }) => {
+        async ({ id, text, tags, source, visibility, subject }, extra) => {
+            try {
+                await authenticateContextTool("update_context", { id, text, tags, source, visibility, subject }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const updated = await updateContext(id, text, tags, source, visibility, subject);
 
             return {
@@ -2190,7 +2253,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 before: z.string().min(1).describe("Delete preview cutoff. Context items created before this date or timestamp are counted."),
             },
         },
-        async ({ before }) => {
+        async ({ before }, extra) => {
+            try {
+                await authenticateContextTool("context_purge_preview", { before }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const preview = await contextPurgePreview(before);
 
             return {
@@ -2214,7 +2282,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 expected_count: z.number().int().nonnegative().describe("Matched count returned by context_purge_preview."),
             },
         },
-        async ({ before, confirmation_token, expected_count }) => {
+        async ({ before, confirmation_token, expected_count }, extra) => {
+            try {
+                await authenticateContextTool("context_purge_confirm", { before, confirmation_token, expected_count }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const purge = await contextPurgeConfirm(before, confirmation_token, expected_count);
 
             return {

@@ -4,6 +4,7 @@ import pg from "pg";
 
 process.env.PGDATABASE ??= "personal_context";
 process.env.EMBEDDINGS_ENABLED = "false";
+process.env.REQUIRE_CONTEXT_AUTHENTICATION = "false";
 
 const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");

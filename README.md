@@ -314,6 +314,21 @@ the conversation catalog below 25,000 serialized characters, this tool replaces
 ordinary Whiteboard acknowledgement on that surface; `acknowledge_context`
 remains available on the full administrative surface.
 
+### Actor-only context boundary
+
+Context-bearing MCP operations now require an authenticated actor by default,
+including Whiteboard save/search/exact reads, recent/profile reads, database
+metadata, acknowledgement, update/delete, and purge operations. Authentication
+bootstrap (`request_actor_session`, status/claim/binding flows) remains separate
+and does not read protected context. The trusted OpenAI path derives the author
+from the bound local actor session; any caller-supplied `actor` object is ignored
+for authority and cannot replace the authenticated principal.
+
+`REQUIRE_CONTEXT_AUTHENTICATION=false` exists only for isolated legacy test
+fixtures and should not be set in deployed services. Subjects, mentions,
+connections, lifecycle fields, payload references, and tags remain inert
+metadata: none can authenticate, grant membership, or widen visibility.
+
 ### Whiteboard visibility
 
 Every context now has a first-class `visibility` classification. Existing rows
