@@ -29,6 +29,8 @@ type SessionRequestRow = {
     activation_pin_hash?: string | null;
     openai_subject_hash?: string | null;
     openai_session_hash?: string | null;
+    federation_issuer?: string | null;
+    federation_audience?: string | null;
 };
 
 export type OpenAITunnelIdentity = {
@@ -276,6 +278,8 @@ export async function approveActorSessionRequest(
                 actor_session_requests.activation_pin_hash
                 , actor_session_requests.openai_subject_hash
                 , actor_session_requests.openai_session_hash
+                , actor_session_requests.federation_issuer
+                , actor_session_requests.federation_audience
         `,
         [
             requestId,
@@ -332,6 +336,8 @@ async function activateOpenAITunnelActorSession(requestId: string) {
                     actor_session_requests.activation_pin_hash,
                     actor_session_requests.openai_subject_hash,
                     actor_session_requests.openai_session_hash,
+                    actor_session_requests.federation_issuer,
+                    actor_session_requests.federation_audience,
                     actor_session_requests.status,
                     actor_session_requests.requested_at,
                     actor_session_requests.request_expires_at,
@@ -419,6 +425,26 @@ async function activateOpenAITunnelActorSession(requestId: string) {
                 request.approved_session_ttl_seconds === RENEWED_LEASE_SECONDS,
             ],
         );
+        if (request.federation_issuer && request.federation_audience) {
+            await client.query(
+                `
+                    INSERT INTO actor_session_service_bindings (
+                        binding_id, source_session_id, actor_id, issuer, audience,
+                        subject_hash, binding_expires_at, expires_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '15 minutes', $7)
+                    ON CONFLICT (source_session_id, audience) DO NOTHING
+                `,
+                [
+                    `asb_${randomUUID()}`,
+                    sessionId,
+                    request.actor_id,
+                    request.federation_issuer,
+                    request.federation_audience,
+                    subjectHash,
+                    expiresAt.toISOString(),
+                ],
+            );
+        }
         if (predecessorSessionId) {
             await client.query(
                 "UPDATE actor_sessions SET replaced_by_session_id = $1 WHERE session_id = $2",
@@ -486,7 +512,76 @@ export async function authenticateOpenAITunnelActorSession(
     );
     const session = result.rows[0];
 
-    if (!session) throw new Error("AUTHENTICATION_REQUIRED");
+    if (!session) {
+        const client = await db.connect();
+        try {
+            await client.query("BEGIN");
+            const federated = await client.query<{
+                binding_id: string;
+                source_session_id: string;
+                actor_id: number | string;
+                actor_external_id: string;
+                actor_name: string;
+                service_session_hash: string | null;
+            }>(
+                `
+                    SELECT bindings.binding_id, bindings.source_session_id,
+                        bindings.actor_id, actors.external_id AS actor_external_id,
+                        actors.name AS actor_name, bindings.service_session_hash
+                    FROM actor_session_service_bindings AS bindings
+                    INNER JOIN actor_sessions AS source
+                        ON source.session_id = bindings.source_session_id
+                    INNER JOIN actors ON actors.id = bindings.actor_id
+                    WHERE bindings.issuer = 'roost-sso'
+                      AND bindings.audience = 'context-server'
+                      AND bindings.subject_hash = $1
+                      AND bindings.revoked_at IS NULL
+                      AND bindings.expires_at > NOW()
+                      AND source.revoked_at IS NULL
+                      AND source.external_deleted_at IS NULL
+                      AND source.lease_expires_at > NOW()
+                      AND (
+                          bindings.service_session_hash = $2
+                          OR (bindings.service_session_hash IS NULL
+                              AND bindings.binding_expires_at > NOW())
+                      )
+                    ORDER BY bindings.created_at DESC
+                    LIMIT 1
+                    FOR UPDATE OF bindings
+                `,
+                [subjectHash, openaiSessionHash],
+            );
+            const binding = federated.rows[0];
+            if (!binding) {
+                await client.query("ROLLBACK");
+                throw new Error("AUTHENTICATION_REQUIRED");
+            }
+            if (binding.service_session_hash === null) {
+                await client.query(
+                    `UPDATE actor_session_service_bindings
+                     SET service_session_hash = $2, bound_at = NOW()
+                     WHERE binding_id = $1 AND service_session_hash IS NULL`,
+                    [binding.binding_id, openaiSessionHash],
+                );
+            }
+            await client.query(
+                "UPDATE actor_sessions SET last_used_at = NOW() WHERE session_id = $1",
+                [binding.source_session_id],
+            );
+            await client.query("COMMIT");
+            return {
+                actor_id: Number(binding.actor_id),
+                actor_external_id: binding.actor_external_id,
+                actor_name: binding.actor_name,
+                key_id: binding.binding_id,
+            };
+        } catch (error) {
+            try { await client.query("ROLLBACK"); } catch {}
+            throw error;
+        } finally {
+            client.release();
+        }
+    }
     if (session.revoked_at) throw new Error("SESSION_REVOKED");
     if (new Date(session.expires_at).getTime() <= Date.now()) {
         throw new Error("AUTHENTICATION_REQUIRED");

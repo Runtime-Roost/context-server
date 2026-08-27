@@ -675,6 +675,35 @@ const migrations: Migration[] = [
                 WHERE revoked_at IS NULL;
         `,
     },
+    {
+        version: 16,
+        name: "roost_sso_service_bindings",
+        sql: `
+            ALTER TABLE actor_session_requests
+                ADD COLUMN IF NOT EXISTS federation_issuer TEXT,
+                ADD COLUMN IF NOT EXISTS federation_audience TEXT;
+
+            CREATE TABLE IF NOT EXISTS actor_session_service_bindings (
+                binding_id TEXT PRIMARY KEY,
+                source_session_id TEXT NOT NULL REFERENCES actor_sessions(session_id) ON DELETE CASCADE,
+                actor_id BIGINT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+                issuer TEXT NOT NULL,
+                audience TEXT NOT NULL,
+                subject_hash TEXT NOT NULL,
+                service_session_hash TEXT,
+                binding_expires_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                bound_at TIMESTAMPTZ,
+                revoked_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (source_session_id, audience)
+            );
+
+            CREATE INDEX IF NOT EXISTS actor_session_service_bindings_lookup_idx
+                ON actor_session_service_bindings(issuer, audience, subject_hash, service_session_hash)
+                WHERE revoked_at IS NULL;
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;

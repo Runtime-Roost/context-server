@@ -638,6 +638,64 @@ test("trusted OpenAI use renews only the exact current thread inside the renewal
     }
 });
 
+test("one approved Roost SSO grant binds exactly one Context Server conversation", async () => {
+    const previousTrust = process.env.TRUST_OPENAI_TUNNEL_IDENTITY;
+    process.env.TRUST_OPENAI_TUNNEL_IDENTITY = "true";
+    const actorExternalId = uniqueValue("actor:test:roost-sso-binding");
+    const actor = await identifyActor({ external_id: actorExternalId, name: "Roost SSO Actor", kind: "ai" });
+    const connection = await connectTestClient();
+    const ssoMeta = openAITunnelMeta("shared-sso-subject", uniqueValue("roost-session"));
+    const contextMeta = openAITunnelMeta("shared-sso-subject", uniqueValue("context-session"));
+    const competingMeta = openAITunnelMeta("shared-sso-subject", uniqueValue("competing-context-session"));
+    let requestId;
+    let sessionId;
+    try {
+        const requested = textResult(await connection.client.callTool({
+            name: "request_actor_session",
+            arguments: { actor_external_id: actorExternalId, client_label: "roost-sso" },
+            _meta: ssoMeta,
+        })).request;
+        requestId = requested.request_id;
+        await db.query(`UPDATE actor_session_requests SET federation_issuer = 'roost-sso',
+            federation_audience = 'context-server' WHERE request_id = $1`, [requestId]);
+        const approved = await approveActorSessionRequest(requestId, actorExternalId, 3600);
+        sessionId = approved.activated_session.session_id;
+
+        const firstContextUse = await connection.client.callTool({
+            name: "list_channels", arguments: {}, _meta: contextMeta,
+        });
+        assert.notEqual(firstContextUse.isError, true);
+        const repeatContextUse = await connection.client.callTool({
+            name: "list_channels", arguments: {}, _meta: contextMeta,
+        });
+        assert.notEqual(repeatContextUse.isError, true);
+
+        const competingContext = await connection.client.callTool({
+            name: "list_channels", arguments: {}, _meta: competingMeta,
+        });
+        assert.equal(competingContext.isError, true);
+        assert.equal(textResult(competingContext).error.code, "AUTHENTICATION_REQUIRED");
+        const differentSubject = await connection.client.callTool({
+            name: "list_channels", arguments: {},
+            _meta: openAITunnelMeta("different-sso-subject", "context-session"),
+        });
+        assert.equal(differentSubject.isError, true);
+
+        const binding = await db.query(`SELECT bound_at, service_session_hash
+            FROM actor_session_service_bindings WHERE source_session_id = $1`, [sessionId]);
+        assert.equal(binding.rowCount, 1);
+        assert.ok(binding.rows[0].bound_at);
+        assert.ok(binding.rows[0].service_session_hash);
+    } finally {
+        if (requestId) await db.query("DELETE FROM actor_session_requests WHERE request_id = $1", [requestId]);
+        if (sessionId) await db.query("DELETE FROM actor_sessions WHERE session_id = $1", [sessionId]);
+        await db.query("DELETE FROM actors WHERE id = $1", [actor.actor.id]);
+        await connection.close();
+        if (previousTrust === undefined) delete process.env.TRUST_OPENAI_TUNNEL_IDENTITY;
+        else process.env.TRUST_OPENAI_TUNNEL_IDENTITY = previousTrust;
+    }
+});
+
 test("native renewal preserves session identity and immediately rotates its token", async () => {
     const actorExternalId = uniqueValue("actor:test:native-renewal");
     const actor = await identifyActor({ external_id: actorExternalId, name: "Native Renewal", kind: "ai" });
