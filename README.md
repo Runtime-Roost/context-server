@@ -281,6 +281,23 @@ signals only when the actor has write access to the context. Supersession must
 point to a context in the same visibility/ownership scope, so lifecycle metadata
 cannot reveal or bridge into a hidden journal, channel, or group.
 
+### Reviewed auto-archive
+
+Migration 23 adds durable, expiring archive previews and per-record evaluation
+receipts. `preview_auto_archive` evaluates only cold/candidate Whiteboard notes;
+it never archives by itself. Eligibility conservatively requires explicit
+`archive_candidate` state, low importance, minimum age, completion or a
+same-scope successor, no active inbound reference, no bridge position, no agent
+inbox tag, and no protected tag. Protected tags default to `archive:never`,
+`reference`, `canonical`, and `active-project` and are configurable through
+`AUTO_ARCHIVE_PROTECTED_TAGS`.
+
+`confirm_auto_archive` consumes one actor-bound 15-minute preview and archives
+only an explicitly selected eligible subset. It rechecks candidate state inside
+the transaction, writes ordinary reversible archive history, and never deletes
+payloads or graph edges. A changed, expired, replayed, foreign, or expanded
+selection fails closed.
+
 ### Whiteboard visibility
 
 Every context now has a first-class `visibility` classification. Existing rows

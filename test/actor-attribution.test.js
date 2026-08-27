@@ -18,6 +18,7 @@ const {
     actorPurgeConfirm,
     actorPurgePreview,
     connectContexts,
+    confirmAutoArchive,
     disconnectContexts,
     identifyActor,
     deleteContext,
@@ -25,6 +26,7 @@ const {
     getDatabaseMetadata,
     getUserProfile,
     listRecentContext,
+    previewAutoArchive,
     saveContext,
     savePersonalContext,
     searchContext,
@@ -98,7 +100,7 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
         assert.equal(legacy.rows[0].visibility, "whiteboard");
         assert.equal(legacy.rows[0].channel_id, null);
         assert.equal(legacy.rows[0].group_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
         assert.equal(payload.rows.length, 1);
         assert.equal(payload.rows[0].version, 1);
         assert.equal(payload.rows[0].kind, "text");
@@ -883,6 +885,33 @@ test("context lifecycle metadata is explicit, bounded, and same-scope", async ()
     } finally {
         await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[current.id, successor.id, hidden.id]]);
         await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[owner.id, outsider.id]]);
+    }
+});
+
+test("auto-archive requires a reviewed preview and protects tagged or connected landmarks", async () => {
+    await initializeDatabase();
+    const reviewer = (await identifyActor({ external_id: uniqueValue("actor:test:archive-reviewer"), name: "Archive Reviewer" })).actor;
+    const candidate = await saveContext(uniqueValue("archive-candidate"), [], "archive test", reviewer.id);
+    const protectedContext = await saveContext(uniqueValue("archive-protected"), ["canonical"], "archive test", reviewer.id);
+    try {
+        for (const context of [candidate, protectedContext]) {
+            await updateContextLifecycle(reviewer.id, context.id, { state: "archive_candidate", importance: 5, completed: true });
+        }
+        await db.query("UPDATE contexts SET created_at = NOW() - INTERVAL '90 days' WHERE id = ANY($1::bigint[])", [[candidate.id, protectedContext.id]]);
+        const preview = await previewAutoArchive(reviewer.id, 100, 30);
+        const eligible = preview.evaluations.find((item) => item.context_id === candidate.id);
+        const blocked = preview.evaluations.find((item) => item.context_id === protectedContext.id);
+        assert.equal(eligible.eligible, true);
+        assert.equal(blocked.eligible, false);
+        assert.deepEqual(blocked.protected_tags, ["canonical"]);
+        await assert.rejects(confirmAutoArchive(reviewer.id, preview.confirmation_token, [protectedContext.id]), /AUTO_ARCHIVE_PREVIEW_INVALID/);
+        const confirmed = await confirmAutoArchive(reviewer.id, preview.confirmation_token, [candidate.id]);
+        assert.deepEqual(confirmed.archived_context_ids, [candidate.id]);
+        assert.equal((await db.query("SELECT visibility FROM contexts WHERE id = $1", [candidate.id])).rows[0].visibility, "archived");
+        await assert.rejects(confirmAutoArchive(reviewer.id, preview.confirmation_token, [candidate.id]), /AUTO_ARCHIVE_PREVIEW_INVALID/);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[candidate.id, protectedContext.id]]);
+        await db.query("DELETE FROM actors WHERE id = $1", [reviewer.id]);
     }
 });
 

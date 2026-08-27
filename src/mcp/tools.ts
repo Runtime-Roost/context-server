@@ -1638,6 +1638,138 @@ export async function updateContextLifecycle(
     }
 }
 
+function autoArchiveProtectedTags() {
+    const configured = process.env.AUTO_ARCHIVE_PROTECTED_TAGS
+        ?? "archive:never,reference,canonical,active-project";
+    return [...new Set(configured.split(",").map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
+}
+
+type AutoArchiveEvaluationRow = {
+    id: number | string;
+    tags: string[] | string | null;
+    importance: number | string;
+    lifecycle_state: ContextLifecycleState;
+    completed_at: string | Date | null;
+    superseded_by_context_id: number | string | null;
+    created_at: string | Date;
+    incoming_count: number | string;
+    outgoing_count: number | string;
+    active_incoming_count: number | string;
+};
+
+function evaluateAutoArchiveRow(row: AutoArchiveEvaluationRow, protectedTags: string[], minimumAgeDays: number) {
+    const tags = parseTags(row.tags).map((tag) => tag.toLowerCase());
+    const blockedTags = protectedTags.filter((tag) => tags.includes(tag));
+    const ageDays = (Date.now() - new Date(row.created_at).getTime()) / 86_400_000;
+    const bridge = Number(row.incoming_count) > 0 && Number(row.outgoing_count) > 0;
+    const reasons = {
+        lifecycle_candidate: row.lifecycle_state === "archive_candidate",
+        low_importance: Number(row.importance) <= 25,
+        old_enough: ageDays >= minimumAgeDays,
+        resolved: row.completed_at !== null || row.superseded_by_context_id !== null,
+        no_active_inbound_reference: Number(row.active_incoming_count) === 0,
+        not_bridge: !bridge,
+        protected_tags_absent: blockedTags.length === 0,
+        agent_inbox_absent: !tags.some((tag) => /^message-to-/i.test(tag)),
+    };
+    const eligible = Object.values(reasons).every(Boolean);
+    const score = Object.values(reasons).filter(Boolean).length * 10
+        + Math.max(0, 25 - Number(row.importance));
+    return { context_id: Number(row.id), eligible, score, reasons, protected_tags: blockedTags };
+}
+
+export async function previewAutoArchive(actorId: number, limit = 25, minimumAgeDays = 30) {
+    await initializeDatabase();
+    const boundedLimit = Math.max(1, Math.min(Math.trunc(limit), 100));
+    const boundedAge = Math.max(1, Math.min(Math.trunc(minimumAgeDays), 3650));
+    const protectedTags = autoArchiveProtectedTags();
+    const token = randomUUID();
+    const result = await db.query<AutoArchiveEvaluationRow>(
+        `SELECT contexts.id, contexts.tags, contexts.importance, contexts.lifecycle_state,
+                contexts.completed_at, contexts.superseded_by_context_id, contexts.created_at,
+                (SELECT count(*) FROM context_connections WHERE target_context_id = contexts.id) AS incoming_count,
+                (SELECT count(*) FROM context_connections WHERE source_context_id = contexts.id) AS outgoing_count,
+                (SELECT count(*) FROM context_connections cc
+                 INNER JOIN contexts source ON source.id = cc.source_context_id
+                 WHERE cc.target_context_id = contexts.id AND source.visibility = 'whiteboard'
+                   AND source.lifecycle_state IN ('active', 'warm')) AS active_incoming_count
+         FROM contexts
+         WHERE contexts.visibility = 'whiteboard'
+           AND contexts.lifecycle_state IN ('cold', 'archive_candidate')
+         ORDER BY contexts.importance ASC, contexts.created_at ASC, contexts.id ASC
+         LIMIT $1`,
+        [boundedLimit],
+    );
+    const evaluations = result.rows.map((row) => evaluateAutoArchiveRow(row, protectedTags, boundedAge));
+    const candidateIds = evaluations.filter((item) => item.eligible).map((item) => item.context_id);
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        await client.query(
+            `INSERT INTO auto_archive_previews (token, actor_id, candidate_ids, policy, expires_at)
+             VALUES ($1, $2, $3, $4, NOW() + INTERVAL '15 minutes')`,
+            [token, actorId, candidateIds, JSON.stringify({ protected_tags: protectedTags, minimum_age_days: boundedAge })],
+        );
+        for (const evaluation of evaluations) {
+            await client.query(
+                `INSERT INTO auto_archive_evaluations
+                    (preview_token, context_id, eligible, score, reasons, protected_tags)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [token, evaluation.context_id, evaluation.eligible, evaluation.score,
+                    JSON.stringify(evaluation.reasons), evaluation.protected_tags],
+            );
+        }
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+    return { confirmation_token: token, expires_in_seconds: 900, policy: { protected_tags: protectedTags, minimum_age_days: boundedAge }, evaluations };
+}
+
+export async function confirmAutoArchive(actorId: number, confirmationToken: string, contextIds: number[]) {
+    await initializeDatabase();
+    const selected = [...new Set(contextIds)];
+    if (selected.length < 1 || selected.length > 100) throw new Error("AUTO_ARCHIVE_SELECTION_INVALID");
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const preview = await client.query<{ candidate_ids: Array<number | string> }>(
+            `UPDATE auto_archive_previews SET consumed_at = NOW()
+             WHERE token = $1 AND actor_id = $2 AND consumed_at IS NULL AND expires_at > NOW()
+             RETURNING candidate_ids`,
+            [confirmationToken, actorId],
+        );
+        const candidates = new Set((preview.rows[0]?.candidate_ids ?? []).map(Number));
+        if (!preview.rows[0] || selected.some((id) => !candidates.has(id))) throw new Error("AUTO_ARCHIVE_PREVIEW_INVALID");
+        const archived: number[] = [];
+        for (const id of selected) {
+            const updated = await client.query(
+                `UPDATE contexts SET visibility = 'archived', updated_at = NOW(), lifecycle_updated_at = NOW()
+                 WHERE id = $1 AND visibility = 'whiteboard' AND lifecycle_state = 'archive_candidate'
+                 RETURNING id`,
+                [id],
+            );
+            if (!updated.rows[0]) throw new Error("AUTO_ARCHIVE_CANDIDATE_CHANGED");
+            await client.query(
+                `INSERT INTO context_archives (context_id, reason, archived_by_actor_id)
+                 VALUES ($1, $2, $3)`,
+                [id, `Reviewed auto-archive preview ${confirmationToken}`, actorId],
+            );
+            archived.push(id);
+        }
+        await client.query("COMMIT");
+        return { archived_context_ids: archived };
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 export async function deleteContext(id: number) {
     await initializeDatabase();
 

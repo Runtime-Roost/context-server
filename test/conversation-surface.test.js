@@ -51,11 +51,13 @@ test("full surface remains available for local administration", async () => {
 
     try {
         const response = await client.listTools();
-        assert.equal(response.tools.length, 65);
+        assert.equal(response.tools.length, 67);
         assert.ok(response.tools.some(({ name }) => name === "vacuum_database"));
         assert.ok(response.tools.some(({ name }) => name === "connect_contexts"));
         assert.ok(response.tools.some(({ name }) => name === "disconnect_contexts"));
         assert.ok(response.tools.some(({ name }) => name === "update_context_lifecycle"));
+        assert.ok(response.tools.some(({ name }) => name === "preview_auto_archive"));
+        assert.ok(response.tools.some(({ name }) => name === "confirm_auto_archive"));
     } finally {
         await client.close();
         await server.close();

@@ -30,6 +30,7 @@ import {
     createChannel,
     createAccessGroup,
     connectContexts,
+    confirmAutoArchive,
     deleteContext,
     deleteChannelContext,
     deletePersonalContext,
@@ -52,6 +53,7 @@ import {
     listPersonalContext,
     listActorAccessGroups,
     listGroupContext,
+    previewAutoArchive,
     removeAccessGroupMember,
     removeChannelMember,
     saveContextWithActor,
@@ -208,6 +210,9 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "CONTEXT_LIFECYCLE_UPDATE_REQUIRED",
         "CONTEXT_IMPORTANCE_INVALID",
         "CONTEXT_SUPERSESSION_SELF_REFERENCE",
+        "AUTO_ARCHIVE_SELECTION_INVALID",
+        "AUTO_ARCHIVE_PREVIEW_INVALID",
+        "AUTO_ARCHIVE_CANDIDATE_CHANGED",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -1974,6 +1979,52 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     supersededByContextId: superseded_by_context_id,
                 });
                 return { content: [{ type: "text", text: JSON.stringify({ context }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "preview_auto_archive",
+        {
+            description: "Evaluate cold Whiteboard records under the conservative protected-tag and graph-safety policy. This never archives by itself.",
+            annotations: { title: "Preview Auto Archive", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+            inputSchema: {
+                limit: z.number().int().min(1).max(100).optional(),
+                minimum_age_days: z.number().int().min(1).max(3650).optional(),
+                auth: requestAuthSchema.optional().describe("Authenticated reviewer."),
+            },
+        },
+        async ({ limit, minimum_age_days, auth }, extra) => {
+            const payload = { limit, minimum_age_days };
+            try {
+                const authenticated = await authenticateTool("preview_auto_archive", payload, auth, extra);
+                const preview = await previewAutoArchive(authenticated.actor_id, limit, minimum_age_days);
+                return { content: [{ type: "text", text: JSON.stringify({ preview }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "confirm_auto_archive",
+        {
+            description: "Archive an explicitly selected subset from one unexpired reviewed preview. Archival is reversible and never deletes payloads or graph edges.",
+            annotations: { title: "Confirm Auto Archive", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+            inputSchema: {
+                confirmation_token: z.string().uuid(),
+                context_ids: z.array(z.number().int().positive()).min(1).max(100),
+                auth: requestAuthSchema.optional().describe("Same authenticated reviewer who created the preview."),
+            },
+        },
+        async ({ confirmation_token, context_ids, auth }, extra) => {
+            const payload = { confirmation_token, context_ids };
+            try {
+                const authenticated = await authenticateTool("confirm_auto_archive", payload, auth, extra);
+                const result = await confirmAutoArchive(authenticated.actor_id, confirmation_token, context_ids);
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
             } catch (error) {
                 return authenticationError(error);
             }
