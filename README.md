@@ -267,6 +267,20 @@ boundary as missing contexts. The full administrative MCP surface exposes
 `connect_contexts` and `disconnect_contexts`; the bounded conversation catalog
 does not add new tool definitions in this slice.
 
+### Relevance and lifecycle metadata
+
+Migration 22 gives every context an explicit lifecycle envelope: `active`,
+`warm`, `cold`, or `archive_candidate`; bounded importance from 0–100; retrieval
+count and last-retrieved time; optional completion time; and an optional
+same-scope successor. Existing records start active at neutral importance 50.
+These fields are signals rather than authority and do not themselves archive,
+delete, pin, expose, or hydrate anything.
+
+The authenticated full-surface `update_context_lifecycle` tool may change these
+signals only when the actor has write access to the context. Supersession must
+point to a context in the same visibility/ownership scope, so lifecycle metadata
+cannot reveal or bridge into a hidden journal, channel, or group.
+
 ### Whiteboard visibility
 
 Every context now has a first-class `visibility` classification. Existing rows

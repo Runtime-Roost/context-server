@@ -30,6 +30,7 @@ const {
     searchContext,
     searchContextByVector,
     updateContext,
+    updateContextLifecycle,
 } = await import("../dist/mcp/tools.js");
 
 function uniqueValue(prefix) {
@@ -97,7 +98,7 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
         assert.equal(legacy.rows[0].visibility, "whiteboard");
         assert.equal(legacy.rows[0].channel_id, null);
         assert.equal(legacy.rows[0].group_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
         assert.equal(payload.rows.length, 1);
         assert.equal(payload.rows[0].version, 1);
         assert.equal(payload.rows[0].kind, "text");
@@ -854,6 +855,34 @@ test("context connections preserve directed rationale without crossing visibilit
     } finally {
         await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[source.id, target.id, privateSource.id, privateTarget.id]]);
         await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[creator.id, outsider.id]]);
+    }
+});
+
+test("context lifecycle metadata is explicit, bounded, and same-scope", async () => {
+    await initializeDatabase();
+    const owner = (await identifyActor({ external_id: uniqueValue("actor:test:lifecycle-owner"), name: "Lifecycle Owner" })).actor;
+    const outsider = (await identifyActor({ external_id: uniqueValue("actor:test:lifecycle-outsider"), name: "Lifecycle Outsider" })).actor;
+    const current = await savePersonalContext(owner.id, uniqueValue("lifecycle-current"));
+    const successor = await savePersonalContext(owner.id, uniqueValue("lifecycle-successor"));
+    const hidden = await savePersonalContext(outsider.id, uniqueValue("lifecycle-hidden"));
+    try {
+        assert.equal(current.lifecycle.state, "active");
+        assert.equal(current.lifecycle.importance, 50);
+        const updated = await updateContextLifecycle(owner.id, current.id, {
+            state: "cold", importance: 15, completed: true, supersededByContextId: successor.id,
+        });
+        assert.equal(updated.lifecycle.state, "cold");
+        assert.equal(updated.lifecycle.importance, 15);
+        assert.ok(updated.lifecycle.completed_at);
+        assert.equal(updated.lifecycle.superseded_by_context_id, successor.id);
+        await assert.rejects(
+            updateContextLifecycle(owner.id, current.id, { supersededByContextId: hidden.id }),
+            /CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED/,
+        );
+        await assert.rejects(updateContextLifecycle(outsider.id, current.id, { state: "warm" }), /CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED/);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[current.id, successor.id, hidden.id]]);
+        await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[owner.id, outsider.id]]);
     }
 });
 

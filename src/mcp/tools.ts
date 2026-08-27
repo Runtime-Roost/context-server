@@ -18,8 +18,21 @@ export type ContextRecord = {
     subject: SubjectRecord | null;
     payload_ref: ContextPayloadReference | null;
     connections: ContextConnection[];
+    lifecycle: ContextLifecycle;
     acknowledged_by: ContextAcknowledgement[];
     created_at: string;
+    updated_at: string;
+};
+
+export const CONTEXT_LIFECYCLE_STATE_VALUES = ["active", "warm", "cold", "archive_candidate"] as const;
+export type ContextLifecycleState = (typeof CONTEXT_LIFECYCLE_STATE_VALUES)[number];
+export type ContextLifecycle = {
+    state: ContextLifecycleState;
+    importance: number;
+    retrieval_count: number;
+    last_retrieved_at: string | null;
+    completed_at: string | null;
+    superseded_by_context_id: number | null;
     updated_at: string;
 };
 
@@ -141,6 +154,7 @@ type ContextRow = {
     subject: unknown;
     payload_ref: unknown;
     connections?: unknown;
+    lifecycle?: unknown;
     acknowledged_by: unknown;
     created_at: string | Date;
     updated_at: string | Date;
@@ -374,9 +388,29 @@ function mapContextRow(row: ContextRow): ContextRecord {
         subject: row.subject ? mapSubjectRow(row.subject as SubjectRow) : null,
         payload_ref: mapPayloadReference(row.payload_ref),
         connections: parseContextConnections(row.connections),
+        lifecycle: parseContextLifecycle(row.lifecycle, row.updated_at),
         acknowledged_by: parseAcknowledgements(row.acknowledged_by),
         created_at: normalizeTimestamp(row.created_at),
         updated_at: normalizeTimestamp(row.updated_at),
+    };
+}
+
+function parseContextLifecycle(value: unknown, fallbackUpdatedAt: string | Date): ContextLifecycle {
+    const lifecycle = value as Record<string, unknown> | null;
+    return {
+        state: (lifecycle?.state as ContextLifecycleState | undefined) ?? "active",
+        importance: Number(lifecycle?.importance ?? 50),
+        retrieval_count: Number(lifecycle?.retrieval_count ?? 0),
+        last_retrieved_at: lifecycle?.last_retrieved_at
+            ? new Date(lifecycle.last_retrieved_at as string | Date).toISOString()
+            : null,
+        completed_at: lifecycle?.completed_at
+            ? new Date(lifecycle.completed_at as string | Date).toISOString()
+            : null,
+        superseded_by_context_id: lifecycle?.superseded_by_context_id == null
+            ? null
+            : Number(lifecycle.superseded_by_context_id),
+        updated_at: new Date((lifecycle?.updated_at as string | Date | undefined) ?? fallbackUpdatedAt).toISOString(),
     };
 }
 
@@ -504,6 +538,15 @@ const CONTEXT_PROJECTION = `
         WHERE context_payloads.context_id = contexts.id
           AND context_payloads.version = contexts.payload_version
     ) AS payload_ref,
+    jsonb_build_object(
+        'state', contexts.lifecycle_state,
+        'importance', contexts.importance,
+        'retrieval_count', contexts.retrieval_count,
+        'last_retrieved_at', contexts.last_retrieved_at,
+        'completed_at', contexts.completed_at,
+        'superseded_by_context_id', contexts.superseded_by_context_id,
+        'updated_at', contexts.lifecycle_updated_at
+    ) AS lifecycle,
     COALESCE((
         SELECT jsonb_agg(connection ORDER BY connection.created_at, connection.id)
         FROM (
@@ -1514,6 +1557,79 @@ export async function disconnectContexts(actorId: number, connectionId: number) 
         );
         await client.query("COMMIT");
         return contextResult.rows[0] ? mapContextRow(contextResult.rows[0]) : null;
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function updateContextLifecycle(
+    actorId: number,
+    contextId: number,
+    update: {
+        state?: ContextLifecycleState;
+        importance?: number;
+        completed?: boolean;
+        supersededByContextId?: number | null;
+    },
+) {
+    await initializeDatabase();
+    const hasState = update.state !== undefined;
+    const hasImportance = update.importance !== undefined;
+    const hasCompleted = update.completed !== undefined;
+    const hasSuperseded = update.supersededByContextId !== undefined;
+    if (!hasState && !hasImportance && !hasCompleted && !hasSuperseded) {
+        throw new Error("CONTEXT_LIFECYCLE_UPDATE_REQUIRED");
+    }
+    if (hasImportance && (!Number.isInteger(update.importance) || update.importance! < 0 || update.importance! > 100)) {
+        throw new Error("CONTEXT_IMPORTANCE_INVALID");
+    }
+    if (update.supersededByContextId === contextId) throw new Error("CONTEXT_SUPERSESSION_SELF_REFERENCE");
+
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const ids = [contextId, ...(typeof update.supersededByContextId === "number" ? [update.supersededByContextId] : [])];
+        const endpoints = await client.query<ConnectionEndpointRow>(
+            `SELECT id, visibility, actor_id, channel_id, group_id
+             FROM contexts WHERE id = ANY($1::bigint[]) FOR SHARE`,
+            [ids],
+        );
+        const context = endpoints.rows.find((row) => Number(row.id) === contextId);
+        const successor = typeof update.supersededByContextId === "number"
+            ? endpoints.rows.find((row) => Number(row.id) === update.supersededByContextId)
+            : undefined;
+        if (!context || !await actorCanConnectContext(client, actorId, context)
+            || (typeof update.supersededByContextId === "number"
+                && (!successor || !sameConnectionScope(context, successor)
+                    || !await actorCanConnectContext(client, actorId, successor)))) {
+            throw new Error("CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED");
+        }
+
+        await client.query(
+            `UPDATE contexts SET
+                lifecycle_state = CASE WHEN $2 THEN $3 ELSE lifecycle_state END,
+                importance = CASE WHEN $4 THEN $5 ELSE importance END,
+                completed_at = CASE WHEN $6 THEN CASE WHEN $7 THEN NOW() ELSE NULL END ELSE completed_at END,
+                superseded_by_context_id = CASE WHEN $8 THEN $9 ELSE superseded_by_context_id END,
+                lifecycle_updated_at = NOW()
+             WHERE id = $1`,
+            [
+                contextId,
+                hasState,
+                update.state ?? null,
+                hasImportance,
+                update.importance ?? null,
+                hasCompleted,
+                update.completed ?? false,
+                hasSuperseded,
+                update.supersededByContextId ?? null,
+            ],
+        );
+        await client.query("COMMIT");
+        return loadContextEnvelope(contextId);
     } catch (error) {
         await client.query("ROLLBACK");
         throw error;

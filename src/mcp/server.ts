@@ -17,6 +17,7 @@ import {
 import {
     ACCESS_GROUP_ROLE_VALUES,
     CHANNEL_ROLE_VALUES,
+    CONTEXT_LIFECYCLE_STATE_VALUES,
     SEARCH_SENSITIVITY_VALUES,
     type ContextRecord,
     WRITABLE_CONTEXT_VISIBILITY_VALUES,
@@ -66,6 +67,7 @@ import {
     updateChannelContext,
     updatePersonalContext,
     updateGroupContext,
+    updateContextLifecycle,
     vacuumDatabase,
 } from "./tools.js";
 import {
@@ -203,6 +205,9 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "CONTEXT_CONNECTION_RELATIONSHIP_INVALID",
         "CONTEXT_CONNECTION_RATIONALE_INVALID",
         "CONTEXT_CONNECTION_SELF_REFERENCE",
+        "CONTEXT_LIFECYCLE_UPDATE_REQUIRED",
+        "CONTEXT_IMPORTANCE_INVALID",
+        "CONTEXT_SUPERSESSION_SELF_REFERENCE",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -1932,6 +1937,43 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 const authenticated = await authenticateTool("disconnect_contexts", payload, auth, extra);
                 const context = await disconnectContexts(authenticated.actor_id, connection_id);
                 return { content: [{ type: "text", text: JSON.stringify({ connection_id, disconnected: true, context }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "update_context_lifecycle",
+        {
+            description: "Update authenticated relevance and lifecycle metadata without changing context content or authority.",
+            annotations: {
+                title: "Update Context Lifecycle",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                context_id: z.number().int().positive(),
+                state: z.enum(CONTEXT_LIFECYCLE_STATE_VALUES).optional(),
+                importance: z.number().int().min(0).max(100).optional(),
+                completed: z.boolean().optional().describe("Set or clear the completion timestamp."),
+                superseded_by_context_id: z.number().int().positive().nullable().optional().describe("Same-scope successor context, or null to clear."),
+                auth: requestAuthSchema.optional().describe("Authenticated actor with write access to the context scope."),
+            },
+        },
+        async ({ context_id, state, importance, completed, superseded_by_context_id, auth }, extra) => {
+            const payload = { context_id, state, importance, completed, superseded_by_context_id };
+            try {
+                const authenticated = await authenticateTool("update_context_lifecycle", payload, auth, extra);
+                const context = await updateContextLifecycle(authenticated.actor_id, context_id, {
+                    state,
+                    importance,
+                    completed,
+                    supersededByContextId: superseded_by_context_id,
+                });
+                return { content: [{ type: "text", text: JSON.stringify({ context }) }] };
             } catch (error) {
                 return authenticationError(error);
             }

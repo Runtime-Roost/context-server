@@ -936,6 +936,45 @@ const migrations: Migration[] = [
                 ON context_connections(target_context_id, created_at DESC, id DESC);
         `,
     },
+    {
+        version: 22,
+        name: "context_lifecycle_metadata",
+        sql: `
+            ALTER TABLE contexts
+                ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT 'active'
+                    CHECK (lifecycle_state IN ('active', 'warm', 'cold', 'archive_candidate')),
+                ADD COLUMN IF NOT EXISTS importance SMALLINT NOT NULL DEFAULT 50
+                    CHECK (importance BETWEEN 0 AND 100),
+                ADD COLUMN IF NOT EXISTS retrieval_count BIGINT NOT NULL DEFAULT 0
+                    CHECK (retrieval_count >= 0),
+                ADD COLUMN IF NOT EXISTS last_retrieved_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS superseded_by_context_id BIGINT,
+                ADD COLUMN IF NOT EXISTS lifecycle_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'contexts_superseded_by_context_id_fkey'
+                      AND conrelid = 'contexts'::regclass
+                ) THEN
+                    ALTER TABLE contexts
+                        ADD CONSTRAINT contexts_superseded_by_context_id_fkey
+                        FOREIGN KEY (superseded_by_context_id)
+                        REFERENCES contexts(id)
+                        ON DELETE SET NULL;
+                END IF;
+            END
+            $$;
+
+            CREATE INDEX IF NOT EXISTS contexts_lifecycle_candidates_idx
+                ON contexts(visibility, lifecycle_state, importance, lifecycle_updated_at, id)
+                WHERE lifecycle_state IN ('cold', 'archive_candidate');
+            CREATE INDEX IF NOT EXISTS contexts_last_retrieved_idx
+                ON contexts(last_retrieved_at DESC NULLS LAST);
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;
