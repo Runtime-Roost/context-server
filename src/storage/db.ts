@@ -1004,6 +1004,33 @@ const migrations: Migration[] = [
                 ON auto_archive_evaluations(context_id, evaluated_at DESC, id DESC);
         `,
     },
+    {
+        version: 24,
+        name: "artifact_payload_references",
+        sql: `
+            ALTER TABLE attachments
+                ADD COLUMN IF NOT EXISTS payload_external_id TEXT;
+
+            UPDATE attachments
+            SET payload_external_id = 'payload:artifact:' || id || ':v1'
+            WHERE payload_external_id IS NULL;
+
+            ALTER TABLE attachments
+                ALTER COLUMN payload_external_id SET NOT NULL;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS attachments_payload_external_id_idx
+                ON attachments(payload_external_id);
+
+            ALTER TABLE context_attachments
+                DROP CONSTRAINT IF EXISTS context_attachments_relationship_check;
+            ALTER TABLE context_attachments
+                ADD CONSTRAINT context_attachments_relationship_check
+                CHECK (relationship IN ('canonical', 'source', 'derived', 'reference'));
+            ALTER TABLE context_attachments
+                ADD COLUMN IF NOT EXISTS derived_from_attachment_id UUID
+                    REFERENCES attachments(id) ON DELETE RESTRICT;
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;

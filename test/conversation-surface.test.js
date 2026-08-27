@@ -51,7 +51,7 @@ test("full surface remains available for local administration", async () => {
 
     try {
         const response = await client.listTools();
-        assert.equal(response.tools.length, 68);
+        assert.equal(response.tools.length, 72);
         assert.ok(response.tools.some(({ name }) => name === "vacuum_database"));
         assert.ok(response.tools.some(({ name }) => name === "connect_contexts"));
         assert.ok(response.tools.some(({ name }) => name === "disconnect_contexts"));
@@ -59,6 +59,9 @@ test("full surface remains available for local administration", async () => {
         assert.ok(response.tools.some(({ name }) => name === "preview_auto_archive"));
         assert.ok(response.tools.some(({ name }) => name === "confirm_auto_archive"));
         assert.ok(response.tools.some(({ name }) => name === "assemble_context"));
+        for (const name of ["begin_payload_upload", "append_payload_chunk", "finalize_payload_upload", "attach_payload_to_context"]) {
+            assert.ok(response.tools.some((tool) => tool.name === name));
+        }
     } finally {
         await client.close();
         await server.close();

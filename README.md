@@ -401,6 +401,24 @@ Uploads use an integrity-checked sequence:
 3. `finalize_attachment_upload` verifies length and SHA-256 before atomically
    publishing immutable bytes.
 
+For new integrations, the payload-first aliases keep large artifact transfer
+separate from knowledge metadata:
+
+1. `begin_payload_upload` and `append_payload_chunk` stage bytes without creating
+   or modifying a context envelope.
+2. `finalize_payload_upload` verifies the bytes and returns an immutable
+   `payload:artifact:<uuid>:v1` reference with server-derived media type, size,
+   and SHA-256 metadata.
+3. `attach_payload_to_context` applies that finalized reference afterward with
+   a `canonical`, `source`, `derived`, or `reference` role. Derived payloads must
+   name a distinct, authorized payload in the same personal or group scope;
+   lineage is committed atomically with the link and returned by
+   `list_context_attachments`.
+
+These upload tools deliberately remain on the full administrative surface, not
+the bounded conversation catalog. The established attachment tools remain as
+compatibility APIs and resolve to the same immutable payload records.
+
 Unfinished uploads expire after 24 hours and are pruned when a new upload
 begins. `cancel_attachment_upload` removes one immediately.
 
@@ -422,7 +440,7 @@ them. Missing and unauthorized attachment IDs both return `null`.
 
 `link_attachment_to_context` deliberately permits only exact scope matches:
 personal attachment to the same actor's personal context, or group attachment
-to a context owned by the same group. Links record `source`, `derived`, or
+to a context owned by the same group. Links record `canonical`, `source`, `derived`, or
 `reference` relationships, stable sort order, and optional inclusive page
 ranges. `list_context_attachments` reads those links through the same attachment
 authorization boundary. Original filenames are metadata only; generated UUIDs

@@ -75,6 +75,7 @@ test("group attachments upload through real handlers and revoke with membership"
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     let attachmentId;
+    let derivedAttachmentId;
     let contextId;
     let groupId;
 
@@ -86,8 +87,8 @@ test("group attachments upload through real handlers and revoke with membership"
             expected_sha256: createHash("sha256").update(reservationBytes).digest("hex"),
         };
         const concurrentReservations = await Promise.all([
-            call(client, "begin_attachment_upload", reservationPayload, keys[0], identities[0].privateKey),
-            call(client, "begin_attachment_upload", reservationPayload, keys[0], identities[0].privateKey),
+            call(client, "begin_payload_upload", reservationPayload, keys[0], identities[0].privateKey),
+            call(client, "begin_payload_upload", reservationPayload, keys[0], identities[0].privateKey),
         ]);
         assert.equal(concurrentReservations.filter((result) => !result.isError).length, 1);
         assert.equal(concurrentReservations.filter((result) => result.isError).length, 1);
@@ -104,7 +105,7 @@ test("group attachments upload through real handlers and revoke with membership"
 
         const bytes = Buffer.from("immutable journal bytes split across chunks");
         const sha256 = createHash("sha256").update(bytes).digest("hex");
-        const begunResult = await call(client, "begin_attachment_upload", {
+        const begunResult = await call(client, "begin_payload_upload", {
             scope: "group", group, filename: "../Great Journal.pdf", media_type: "application/pdf",
             expected_size_bytes: bytes.length, expected_sha256: sha256,
         }, keys[0], identities[0].privateKey);
@@ -119,19 +120,21 @@ test("group attachments upload through real handlers and revoke with membership"
 
         let offset = 0;
         for (const chunk of [bytes.subarray(0, 11), bytes.subarray(11)]) {
-            const appended = json(await call(client, "append_attachment_chunk", {
+            const appended = json(await call(client, "append_payload_chunk", {
                 upload_id: begun.upload_id, offset, data_base64: chunk.toString("base64"),
             }, keys[0], identities[0].privateKey)).upload;
             offset = appended.received_size_bytes;
         }
-        const finalized = json(await call(client, "finalize_attachment_upload", {
+        const finalizedPayloadResult = await call(client, "finalize_payload_upload", {
             upload_id: begun.upload_id,
-        }, keys[0], identities[0].privateKey)).attachment;
-        attachmentId = finalized.id;
-        assert.equal(finalized.sha256, sha256);
-        assert.equal(finalized.scope, "group");
-        assert.equal(finalized.group_id, groupId);
-        assert.equal(finalized.original_filename, "../Great Journal.pdf");
+        }, keys[0], identities[0].privateKey);
+        assert.equal(finalizedPayloadResult.isError, undefined, JSON.stringify(json(finalizedPayloadResult)));
+        const payloadRef = json(finalizedPayloadResult).payload_ref;
+        attachmentId = payloadRef.id.split(":")[2];
+        assert.equal(payloadRef.kind, "artifact");
+        assert.equal(payloadRef.sha256, sha256);
+        assert.equal(payloadRef.media_type, "application/pdf");
+        assert.equal(payloadRef.size_bytes, bytes.length);
 
         const quota = json(await call(client, "get_attachment_quota", {
             scope: "group", group,
@@ -154,11 +157,43 @@ test("group attachments upload through real handlers and revoke with membership"
             group, text: "Journal source manifest", tags: ["journal", "manifest"],
         }, keys[0], identities[0].privateKey)).saved;
         contextId = saved.id;
-        const linked = json(await call(client, "link_attachment_to_context", {
-            attachment_id: attachmentId, context_id: contextId, relationship: "source",
-            sort_order: 0, page_start: 1, page_end: 148,
+        const linked = json(await call(client, "attach_payload_to_context", {
+            payload_id: payloadRef.id, context_id: contextId, role: "canonical",
         }, keys[1], identities[1].privateKey)).link;
         assert.equal(Number(linked.context_id), contextId);
+        assert.equal(linked.payload_id, payloadRef.id);
+        assert.equal(linked.role, "canonical");
+
+        const derivedBytes = Buffer.from("OCR text");
+        const derivedUpload = json(await call(client, "begin_payload_upload", {
+            scope: "group", group, filename: "journal.txt", media_type: "text/plain",
+            expected_size_bytes: derivedBytes.length,
+            expected_sha256: createHash("sha256").update(derivedBytes).digest("hex"),
+        }, keys[0], identities[0].privateKey)).upload;
+        await call(client, "append_payload_chunk", {
+            upload_id: derivedUpload.upload_id, offset: 0, data_base64: derivedBytes.toString("base64"),
+        }, keys[0], identities[0].privateKey);
+        const derivedPayload = json(await call(client, "finalize_payload_upload", {
+            upload_id: derivedUpload.upload_id,
+        }, keys[0], identities[0].privateKey)).payload_ref;
+        derivedAttachmentId = derivedPayload.id.split(":")[2];
+
+        const selfDerived = await call(client, "attach_payload_to_context", {
+            payload_id: derivedPayload.id, context_id: contextId, role: "derived",
+            derived_from_payload_id: derivedPayload.id,
+        }, keys[1], identities[1].privateKey);
+        assert.equal(selfDerived.isError, true);
+        assert.equal(json(selfDerived).error.code, "PAYLOAD_DERIVATION_SOURCE_INVALID");
+
+        const derivedLink = json(await call(client, "attach_payload_to_context", {
+            payload_id: derivedPayload.id, context_id: contextId, role: "derived",
+            derived_from_payload_id: payloadRef.id,
+        }, keys[1], identities[1].privateKey)).link;
+        assert.equal(derivedLink.derived_from_payload_id, payloadRef.id);
+        const contextPayloads = json(await call(client, "list_context_attachments", {
+            context_id: contextId,
+        }, keys[1], identities[1].privateKey)).attachments;
+        assert.equal(contextPayloads.find((item) => item.payload_ref.id === derivedPayload.id).derived_from_payload_id, payloadRef.id);
 
         const chunk = json(await call(client, "read_attachment_chunk", {
             id: attachmentId, offset: 0, length: 512,
@@ -186,6 +221,7 @@ test("group attachments upload through real handlers and revoke with membership"
         await client.close();
         await server.close();
         if (contextId) await db.query("DELETE FROM contexts WHERE id = $1", [contextId]);
+        if (derivedAttachmentId) await db.query("DELETE FROM attachments WHERE id = $1", [derivedAttachmentId]);
         if (attachmentId) await db.query("DELETE FROM attachments WHERE id = $1", [attachmentId]);
         if (groupId) await db.query("DELETE FROM access_groups WHERE id = $1", [groupId]);
         for (const actor of actors) await db.query("DELETE FROM actors WHERE id = $1", [actor.actor.id]);

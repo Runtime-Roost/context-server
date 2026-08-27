@@ -84,6 +84,7 @@ import {
     getAttachment,
     getAttachmentQuota,
     linkAttachmentToContext,
+    linkPayloadToContext,
     listAttachments,
     listContextAttachments,
     readAttachmentChunk,
@@ -215,6 +216,10 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "AUTO_ARCHIVE_PREVIEW_INVALID",
         "AUTO_ARCHIVE_CANDIDATE_CHANGED",
         "CONTEXT_ASSEMBLY_QUERY_REQUIRED",
+        "PAYLOAD_REFERENCE_INVALID",
+        "PAYLOAD_DERIVATION_SOURCE_REQUIRED",
+        "PAYLOAD_DERIVATION_SOURCE_INVALID",
+        "PAYLOAD_NOT_FOUND_OR_NOT_AUTHORIZED",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -2345,6 +2350,92 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 ],
             };
         }
+    );
+
+    server.registerTool(
+        "begin_payload_upload",
+        {
+            description: "Reserve an authenticated staged upload and return an expiring upload ID. No context metadata is created yet.",
+            inputSchema: {
+                scope: z.enum(ATTACHMENT_SCOPE_VALUES),
+                group: z.string().min(3).max(64).optional(),
+                filename: z.string().min(1).max(500),
+                media_type: z.string().min(3).max(200),
+                expected_size_bytes: z.number().int().nonnegative(),
+                expected_sha256: z.string().regex(/^[0-9a-fA-F]{64}$/),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ scope, group, filename, media_type, expected_size_bytes, expected_sha256, auth }, extra) => {
+            const payload = { scope, group, filename, media_type, expected_size_bytes, expected_sha256 };
+            try {
+                const actor = await authenticateTool("begin_payload_upload", payload, auth, extra);
+                const upload = await beginAttachmentUpload(actor.actor_id, scope, filename, media_type, expected_size_bytes, expected_sha256, group);
+                return { content: [{ type: "text", text: JSON.stringify({ upload }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "append_payload_chunk",
+        {
+            description: "Append one bounded base64 chunk to a staged payload upload at an exact offset.",
+            inputSchema: {
+                upload_id: z.string().uuid(),
+                offset: z.number().int().nonnegative(),
+                data_base64: z.string().min(1),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ upload_id, offset, data_base64, auth }, extra) => {
+            const payload = { upload_id, offset, data_base64 };
+            try {
+                const actor = await authenticateTool("append_payload_chunk", payload, auth, extra);
+                const upload = await appendAttachmentChunk(actor.actor_id, upload_id, offset, data_base64);
+                return { content: [{ type: "text", text: JSON.stringify({ upload }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "finalize_payload_upload",
+        {
+            description: "Verify a complete staged upload and return its immutable payload reference before any envelope metadata is applied.",
+            inputSchema: {
+                upload_id: z.string().uuid(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ upload_id, auth }, extra) => {
+            const payload = { upload_id };
+            try {
+                const actor = await authenticateTool("finalize_payload_upload", payload, auth, extra);
+                const artifact = await finalizeAttachmentUpload(actor.actor_id, upload_id);
+                return { content: [{ type: "text", text: JSON.stringify({ payload_ref: artifact.payload_ref }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "attach_payload_to_context",
+        {
+            description: "Attach one finalized immutable payload reference to an existing same-scope context with a semantic role and optional derivation lineage.",
+            inputSchema: {
+                context_id: z.number().int().positive(),
+                payload_id: z.string().regex(/^payload:artifact:[0-9a-fA-F-]{36}:v1$/),
+                role: z.enum(ATTACHMENT_RELATIONSHIP_VALUES),
+                derived_from_payload_id: z.string().regex(/^payload:artifact:[0-9a-fA-F-]{36}:v1$/).optional(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ context_id, payload_id, role, derived_from_payload_id, auth }, extra) => {
+            const payload = { context_id, payload_id, role, derived_from_payload_id };
+            try {
+                const actor = await authenticateTool("attach_payload_to_context", payload, auth, extra);
+                const link = await linkPayloadToContext(actor.actor_id, payload_id, context_id, role, derived_from_payload_id);
+                return { content: [{ type: "text", text: JSON.stringify({ link }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
     );
 
     server.registerTool(
