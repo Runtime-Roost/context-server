@@ -95,6 +95,7 @@ test("personal context is private to the authenticated actor across every operat
     let outsiderContextId;
     let ownerTextOnlyContextId;
     let subjectId;
+    let initialPayloadId;
 
     try {
         const unauthenticated = await client.callTool({
@@ -133,6 +134,18 @@ test("personal context is private to the authenticated actor across every operat
         assert.equal(saved.saved.subject.name, "Authenticated journal subject");
         assert.deepEqual(saved.saved.subject.aliases, [subjectAlias]);
         subjectId = saved.saved.subject.id;
+        initialPayloadId = saved.saved.payload_ref.id;
+        assert.equal(saved.saved.payload_ref.version, 1);
+        assert.equal(saved.saved.payload_ref.kind, "text");
+        assert.equal(saved.saved.payload_ref.media_type, "text/plain; charset=utf-8");
+        assert.equal(
+            (await db.query("SELECT text_content FROM context_payloads WHERE id = $1", [initialPayloadId])).rows[0].text_content,
+            marker,
+        );
+        await assert.rejects(
+            db.query("UPDATE context_payloads SET text_content = 'mutated' WHERE id = $1", [initialPayloadId]),
+            /immutable/,
+        );
 
         const outsiderSaved = textResult(await signedCall(
             client,
@@ -307,6 +320,16 @@ test("personal context is private to the authenticated actor across every operat
         ));
         assert.equal(ownerUpdated.updated.content, updatedMarker);
         assert.deepEqual(ownerUpdated.updated.tags, ["personal-test", "updated"]);
+        assert.equal(ownerUpdated.updated.payload_ref.version, 2);
+        assert.notEqual(ownerUpdated.updated.payload_ref.id, initialPayloadId);
+        const payloadVersions = await db.query(
+            "SELECT version, text_content FROM context_payloads WHERE context_id = $1 ORDER BY version",
+            [contextId],
+        );
+        assert.deepEqual(payloadVersions.rows, [
+            { version: 1, text_content: marker },
+            { version: 2, text_content: updatedMarker },
+        ]);
 
         const outsiderDelete = textResult(await signedCall(
             client,
@@ -325,6 +348,10 @@ test("personal context is private to the authenticated actor across every operat
             ownerIdentity.privateKey,
         ));
         assert.equal(ownerDeleted.deleted.id, contextId);
+        assert.equal(
+            Number((await db.query("SELECT count(*) FROM context_payloads WHERE context_id = $1", [contextId])).rows[0].count),
+            0,
+        );
         contextId = undefined;
 
         const outsiderDeleted = textResult(await signedCall(

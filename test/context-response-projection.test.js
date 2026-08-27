@@ -35,8 +35,8 @@ test("search projections enforce per-record and aggregate response budgets", () 
         "search",
     );
 
-    assert.ok(projected.results.length < 10);
-    assert.equal(projected.response_truncated, true);
-    assert.ok(projected.results.every((result) => result.content.length <= 8_000));
+    assert.equal(projected.results.length, 10);
+    assert.equal(projected.response_truncated, false);
+    assert.ok(projected.results.every((result) => result.content.length <= 500));
     assert.ok(JSON.stringify(projected.results).length <= 24_000);
 });

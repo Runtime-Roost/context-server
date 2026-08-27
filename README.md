@@ -233,6 +233,22 @@ backfilled through their existing update tools. Text retrieval matches the
 subject ID, canonical name, kind, and aliases while preserving the original
 visibility and actor-ownership predicates.
 
+### Immutable context payloads
+
+Migration 20 creates versioned `context_payloads` rows for every context. Each
+payload has a stable pointer, type (`text`), media type, byte size, version, and
+immutable body. Existing text becomes payload version 1. Replacing context text
+creates a new version; previous versions remain, direct payload updates are
+rejected, and deleting the context cascades all payload versions.
+
+Context envelopes return `payload_ref` metadata. Search and list responses carry
+at most a 500-character preview so an agent can decide whether an exact read is
+worthwhile; exact `get_*` operations hydrate the complete text behind the same
+visibility and actor-authorization checks. `contexts.content` remains a
+compatibility mirror in this migration slice. These payload records provide the
+indirection point for later image, document, OCR, transcript, and embedding
+storage without changing context-envelope identity.
+
 ### Whiteboard visibility
 
 Every context now has a first-class `visibility` classification. Existing rows

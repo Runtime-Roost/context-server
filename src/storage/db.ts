@@ -783,6 +783,102 @@ const migrations: Migration[] = [
                 WHERE subject_id IS NOT NULL;
         `,
     },
+    {
+        version: 20,
+        name: "immutable_context_payloads",
+        sql: `
+            ALTER TABLE contexts
+                ADD COLUMN IF NOT EXISTS payload_version INTEGER NOT NULL DEFAULT 1
+                    CHECK (payload_version > 0);
+
+            CREATE TABLE IF NOT EXISTS context_payloads (
+                id TEXT PRIMARY KEY,
+                context_id BIGINT NOT NULL REFERENCES contexts(id) ON DELETE CASCADE,
+                version INTEGER NOT NULL CHECK (version > 0),
+                kind TEXT NOT NULL CHECK (kind IN ('text')),
+                media_type TEXT NOT NULL,
+                text_content TEXT NOT NULL,
+                size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (context_id, version)
+            );
+
+            INSERT INTO context_payloads (
+                id, context_id, version, kind, media_type, text_content, size_bytes, created_at
+            )
+            SELECT
+                'payload:context:' || contexts.id || ':v1',
+                contexts.id,
+                1,
+                'text',
+                'text/plain; charset=utf-8',
+                contexts.content,
+                octet_length(contexts.content),
+                contexts.created_at
+            FROM contexts
+            ON CONFLICT (context_id, version) DO NOTHING;
+
+            CREATE OR REPLACE FUNCTION context_payload_before_content_update()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                IF NEW.content IS DISTINCT FROM OLD.content THEN
+                    NEW.payload_version := OLD.payload_version + 1;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE OR REPLACE FUNCTION context_payload_after_write()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                IF TG_OP = 'INSERT' OR NEW.content IS DISTINCT FROM OLD.content THEN
+                    INSERT INTO context_payloads (
+                        id, context_id, version, kind, media_type, text_content, size_bytes
+                    ) VALUES (
+                        'payload:context:' || NEW.id || ':v' || NEW.payload_version,
+                        NEW.id,
+                        NEW.payload_version,
+                        'text',
+                        'text/plain; charset=utf-8',
+                        NEW.content,
+                        octet_length(NEW.content)
+                    );
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE OR REPLACE FUNCTION reject_context_payload_update()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                RAISE EXCEPTION 'context payloads are immutable';
+            END;
+            $$ LANGUAGE plpgsql;
+
+            DROP TRIGGER IF EXISTS contexts_payload_before_update ON contexts;
+            CREATE TRIGGER contexts_payload_before_update
+                BEFORE UPDATE OF content ON contexts
+                FOR EACH ROW EXECUTE FUNCTION context_payload_before_content_update();
+
+            DROP TRIGGER IF EXISTS contexts_payload_after_insert ON contexts;
+            CREATE TRIGGER contexts_payload_after_insert
+                AFTER INSERT ON contexts
+                FOR EACH ROW EXECUTE FUNCTION context_payload_after_write();
+
+            DROP TRIGGER IF EXISTS contexts_payload_after_update ON contexts;
+            CREATE TRIGGER contexts_payload_after_update
+                AFTER UPDATE OF content ON contexts
+                FOR EACH ROW EXECUTE FUNCTION context_payload_after_write();
+
+            DROP TRIGGER IF EXISTS context_payloads_immutable ON context_payloads;
+            CREATE TRIGGER context_payloads_immutable
+                BEFORE UPDATE ON context_payloads
+                FOR EACH ROW EXECUTE FUNCTION reject_context_payload_update();
+
+            CREATE INDEX IF NOT EXISTS context_payloads_context_version_idx
+                ON context_payloads(context_id, version DESC);
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;

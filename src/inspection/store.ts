@@ -107,6 +107,7 @@ type ArchivedContextRow = {
     actor_created_at: string | Date | null;
     actor_last_seen_at: string | Date | null;
     subject: unknown;
+    payload_ref: unknown;
     acknowledged_by: unknown;
     reason: string;
     archived_at: string | Date;
@@ -155,6 +156,7 @@ function acknowledgements(value: unknown): ContextAcknowledgement[] {
 
 function mapArchivedContext(row: ArchivedContextRow): ArchivedWhiteboardContext {
     const subject = row.subject as Record<string, unknown> | null;
+    const payload = row.payload_ref as Record<string, unknown>;
     return {
         id: Number(row.id),
         kind: row.kind,
@@ -185,6 +187,13 @@ function mapArchivedContext(row: ArchivedContextRow): ArchivedWhiteboardContext 
                 updated_at: timestamp(subject.updated_at as string | Date),
             }
             : null,
+        payload_ref: {
+            id: String(payload.id),
+            version: Number(payload.version),
+            kind: "text",
+            media_type: String(payload.media_type),
+            size_bytes: Number(payload.size_bytes),
+        },
         acknowledged_by: acknowledgements(row.acknowledged_by),
         created_at: timestamp(row.created_at),
         updated_at: timestamp(row.updated_at),
@@ -228,6 +237,18 @@ async function listInspectionArchive(limit: number, contextId?: number) {
                     FROM subjects
                     WHERE subjects.id = contexts.subject_id
                 ) AS subject,
+                (
+                    SELECT jsonb_build_object(
+                        'id', context_payloads.id,
+                        'version', context_payloads.version,
+                        'kind', context_payloads.kind,
+                        'media_type', context_payloads.media_type,
+                        'size_bytes', context_payloads.size_bytes
+                    )
+                    FROM context_payloads
+                    WHERE context_payloads.context_id = contexts.id
+                      AND context_payloads.version = contexts.payload_version
+                ) AS payload_ref,
                 authors.id AS actor_id,
                 authors.external_id AS actor_external_id,
                 authors.name AS actor_name,

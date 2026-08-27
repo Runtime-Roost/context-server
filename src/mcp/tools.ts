@@ -16,9 +16,18 @@ export type ContextRecord = {
     tags: string[];
     actor: ActorRecord | null;
     subject: SubjectRecord | null;
+    payload_ref: ContextPayloadReference | null;
     acknowledged_by: ContextAcknowledgement[];
     created_at: string;
     updated_at: string;
+};
+
+export type ContextPayloadReference = {
+    id: string;
+    version: number;
+    kind: "text";
+    media_type: string;
+    size_bytes: number;
 };
 
 export type SubjectRecord = {
@@ -119,6 +128,7 @@ type ContextRow = {
     actor_created_at: string | Date | null;
     actor_last_seen_at: string | Date | null;
     subject: unknown;
+    payload_ref: unknown;
     acknowledged_by: unknown;
     created_at: string | Date;
     updated_at: string | Date;
@@ -350,10 +360,40 @@ function mapContextRow(row: ContextRow): ContextRecord {
                   last_seen_at: normalizeTimestamp(row.actor_last_seen_at!),
               },
         subject: row.subject ? mapSubjectRow(row.subject as SubjectRow) : null,
+        payload_ref: mapPayloadReference(row.payload_ref),
         acknowledged_by: parseAcknowledgements(row.acknowledged_by),
         created_at: normalizeTimestamp(row.created_at),
         updated_at: normalizeTimestamp(row.updated_at),
     };
+}
+
+function mapPayloadReference(value: unknown): ContextPayloadReference | null {
+    const payload = value as Record<string, unknown> | null;
+    if (!payload) return null;
+    return {
+        id: String(payload.id),
+        version: Number(payload.version),
+        kind: "text",
+        media_type: String(payload.media_type),
+        size_bytes: Number(payload.size_bytes),
+    };
+}
+
+async function loadCurrentPayloadReference(row: ContextRow, client: PoolClient | typeof db = db) {
+    if (row.payload_ref) return row;
+    const result = await client.query<{ payload_ref: unknown }>(
+        `SELECT jsonb_build_object(
+            'id', id, 'version', version, 'kind', kind,
+            'media_type', media_type, 'size_bytes', size_bytes
+         ) AS payload_ref
+         FROM context_payloads
+         WHERE context_id = $1
+         ORDER BY version DESC
+         LIMIT 1`,
+        [row.id],
+    );
+    row.payload_ref = result.rows[0]?.payload_ref ?? null;
+    return row;
 }
 
 function mapSubjectRow(row: SubjectRow): SubjectRecord {
@@ -403,6 +443,18 @@ const CONTEXT_PROJECTION = `
         FROM subjects
         WHERE subjects.id = contexts.subject_id
     ) AS subject,
+    (
+        SELECT jsonb_build_object(
+            'id', context_payloads.id,
+            'version', context_payloads.version,
+            'kind', context_payloads.kind,
+            'media_type', context_payloads.media_type,
+            'size_bytes', context_payloads.size_bytes
+        )
+        FROM context_payloads
+        WHERE context_payloads.context_id = contexts.id
+          AND context_payloads.version = contexts.payload_version
+    ) AS payload_ref,
     actors.id AS actor_id,
     actors.external_id AS actor_external_id,
     actors.name AS actor_name,
@@ -442,6 +494,23 @@ function subjectProjection(contextAlias: "inserted" | "updated" | "deleted") {
             FROM subjects
             WHERE subjects.id = ${contextAlias}.subject_id
         ) AS subject
+    `;
+}
+
+function payloadProjection(contextAlias: "inserted" | "updated" | "deleted") {
+    return `
+        (
+            SELECT jsonb_build_object(
+                'id', context_payloads.id,
+                'version', context_payloads.version,
+                'kind', context_payloads.kind,
+                'media_type', context_payloads.media_type,
+                'size_bytes', context_payloads.size_bytes
+            )
+            FROM context_payloads
+            WHERE context_payloads.context_id = ${contextAlias}.id
+              AND context_payloads.version = ${contextAlias}.payload_version
+        ) AS payload_ref
     `;
 }
 
@@ -789,6 +858,7 @@ async function insertContext(
                     FROM subjects
                     WHERE subjects.id = inserted.subject_id
                 ) AS subject,
+                ${payloadProjection("inserted")},
                 actors.id AS actor_id,
                 actors.external_id AS actor_external_id,
                 actors.name AS actor_name,
@@ -811,7 +881,24 @@ async function insertContext(
         ]
     );
 
-    return mapContextRow(result.rows[0]);
+    const row = result.rows[0];
+    if (!row.payload_ref) {
+        const payload = await client.query<{ payload_ref: unknown }>(
+            `SELECT jsonb_build_object(
+                'id', context_payloads.id,
+                'version', context_payloads.version,
+                'kind', context_payloads.kind,
+                'media_type', context_payloads.media_type,
+                'size_bytes', context_payloads.size_bytes
+             ) AS payload_ref
+             FROM context_payloads
+             WHERE context_payloads.context_id = $1
+               AND context_payloads.version = 1`,
+            [row.id],
+        );
+        row.payload_ref = payload.rows[0]?.payload_ref;
+    }
+    return mapContextRow(row);
 }
 
 export async function saveContext(
@@ -1224,7 +1311,8 @@ export async function deleteContext(id: number) {
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
                 actors.last_seen_at AS actor_last_seen_at,
-                ${subjectProjection("deleted")}
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -1315,7 +1403,7 @@ export async function updateContext(
         return null;
     }
 
-    const context = mapContextRow(updatedContext);
+    const context = mapContextRow(await loadCurrentPayloadReference(updatedContext));
 
     if (hasText) {
         await maybeSaveContextEmbedding(context);
@@ -1915,7 +2003,8 @@ export async function updateChannelContext(
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
                 actors.last_seen_at AS actor_last_seen_at,
-                ${subjectProjection("updated")}
+                ${subjectProjection("updated")},
+                ${payloadProjection("updated")}
             FROM updated
             LEFT JOIN actors ON actors.id = updated.actor_id
         `,
@@ -1931,7 +2020,9 @@ export async function updateChannelContext(
             new Date().toISOString(),
         ],
     );
-    const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    const context = result.rows[0]
+        ? mapContextRow(await loadCurrentPayloadReference(result.rows[0]))
+        : null;
 
     if (context && hasText) {
         await maybeSaveContextEmbedding(context);
@@ -1976,7 +2067,8 @@ export async function deleteChannelContext(actorId: number, id: number) {
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
                 actors.last_seen_at AS actor_last_seen_at,
-                ${subjectProjection("deleted")}
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -2508,7 +2600,8 @@ export async function updateGroupContext(
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
                 actors.last_seen_at AS actor_last_seen_at,
-                ${subjectProjection("updated")}
+                ${subjectProjection("updated")},
+                ${payloadProjection("updated")}
             FROM updated
             LEFT JOIN actors ON actors.id = updated.actor_id
         `,
@@ -2524,7 +2617,9 @@ export async function updateGroupContext(
             new Date().toISOString(),
         ],
     );
-    const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    const context = result.rows[0]
+        ? mapContextRow(await loadCurrentPayloadReference(result.rows[0]))
+        : null;
 
     if (context && hasText) {
         await maybeSaveContextEmbedding(context);
@@ -2565,7 +2660,8 @@ export async function deleteGroupContext(actorId: number, id: number) {
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
                 actors.last_seen_at AS actor_last_seen_at,
-                ${subjectProjection("deleted")}
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -2793,7 +2889,8 @@ export async function updatePersonalContext(
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
                 actors.last_seen_at AS actor_last_seen_at,
-                ${subjectProjection("updated")}
+                ${subjectProjection("updated")},
+                ${payloadProjection("updated")}
             FROM updated
             LEFT JOIN actors ON actors.id = updated.actor_id
         `,
@@ -2817,7 +2914,9 @@ export async function updatePersonalContext(
     } finally {
         client.release();
     }
-    const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    const context = result.rows[0]
+        ? mapContextRow(await loadCurrentPayloadReference(result.rows[0]))
+        : null;
 
     if (context && hasText) {
         await maybeSaveContextEmbedding(context);
@@ -2854,7 +2953,8 @@ export async function deletePersonalContext(actorId: number, id: number) {
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
                 actors.last_seen_at AS actor_last_seen_at,
-                ${subjectProjection("deleted")}
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -3057,7 +3157,8 @@ export async function contextPurgeConfirm(
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
                 actors.last_seen_at AS actor_last_seen_at,
-                ${subjectProjection("deleted")}
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
