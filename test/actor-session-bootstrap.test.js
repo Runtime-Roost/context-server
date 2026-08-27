@@ -665,11 +665,15 @@ test("one approved Roost SSO grant binds exactly one Context Server conversation
             FROM actor_session_service_bindings WHERE source_session_id = $1`, [sessionId]);
         assert.equal(handoff.rowCount, 1);
         const bound = await connection.client.callTool({
-            name: "bind_sso_session",
-            arguments: { binding_handle: handoff.rows[0].binding_id },
+            name: "request_actor_session",
+            arguments: {
+                actor_external_id: actorExternalId,
+                client_label: `roost-sso:${handoff.rows[0].binding_id}`,
+            },
             _meta: contextMeta,
         });
         assert.notEqual(bound.isError, true);
+        assert.equal(textResult(bound).request.authentication, "roost_sso_service_binding");
 
         const firstContextUse = await connection.client.callTool({
             name: "list_channels", arguments: {}, _meta: contextMeta,
