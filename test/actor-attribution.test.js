@@ -17,6 +17,8 @@ const {
     acknowledgeContextWithActor,
     actorPurgeConfirm,
     actorPurgePreview,
+    connectContexts,
+    disconnectContexts,
     identifyActor,
     deleteContext,
     getContext,
@@ -24,6 +26,7 @@ const {
     getUserProfile,
     listRecentContext,
     saveContext,
+    savePersonalContext,
     searchContext,
     searchContextByVector,
     updateContext,
@@ -94,7 +97,7 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
         assert.equal(legacy.rows[0].visibility, "whiteboard");
         assert.equal(legacy.rows[0].channel_id, null);
         assert.equal(legacy.rows[0].group_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
         assert.equal(payload.rows.length, 1);
         assert.equal(payload.rows[0].version, 1);
         assert.equal(payload.rows[0].kind, "text");
@@ -792,6 +795,65 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         assert.ok(byName.get("actor_purge_confirm"));
     } finally {
         await connection.close();
+    }
+});
+
+test("context connections preserve directed rationale without crossing visibility scopes", async () => {
+    await initializeDatabase();
+    const creator = (await identifyActor({
+        external_id: uniqueValue("actor:test:connection-creator"),
+        name: "Connection Creator",
+        kind: "ai",
+    })).actor;
+    const outsider = (await identifyActor({
+        external_id: uniqueValue("actor:test:connection-outsider"),
+        name: "Connection Outsider",
+        kind: "ai",
+    })).actor;
+    const source = await saveContext(uniqueValue("connection-source"), [], "connection test", creator.id);
+    const target = await saveContext(uniqueValue("connection-target"), [], "connection test", creator.id);
+    const privateSource = await savePersonalContext(creator.id, uniqueValue("private-source"));
+    const privateTarget = await savePersonalContext(outsider.id, uniqueValue("private-target"));
+
+    try {
+        const connected = await connectContexts(
+            creator.id,
+            source.id,
+            target.id,
+            "led_to",
+            "This intermediate idea explains why the next note followed.",
+        );
+        assert.equal(connected.connections.length, 1);
+        assert.deepEqual(connected.connections[0], {
+            id: connected.connections[0].id,
+            direction: "outgoing",
+            relationship: "led_to",
+            rationale: "This intermediate idea explains why the next note followed.",
+            other_context_id: target.id,
+            created_by: creator,
+            created_at: connected.connections[0].created_at,
+        });
+
+        const incoming = await getContext(target.id);
+        assert.equal(incoming.connections.length, 1);
+        assert.equal(incoming.connections[0].direction, "incoming");
+        assert.equal(incoming.connections[0].other_context_id, source.id);
+
+        const duplicate = await connectContexts(creator.id, source.id, target.id, "led_to", "ignored duplicate");
+        assert.equal(duplicate.connections.length, 1);
+        assert.equal(duplicate.connections[0].rationale, connected.connections[0].rationale);
+
+        await assert.rejects(
+            connectContexts(creator.id, privateSource.id, privateTarget.id, "related"),
+            /CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED/,
+        );
+
+        const disconnected = await disconnectContexts(creator.id, connected.connections[0].id);
+        assert.deepEqual(disconnected.connections, []);
+        assert.deepEqual((await getContext(target.id)).connections, []);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[source.id, target.id, privateSource.id, privateTarget.id]]);
+        await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[creator.id, outsider.id]]);
     }
 });
 

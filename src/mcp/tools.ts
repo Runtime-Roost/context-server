@@ -17,9 +17,20 @@ export type ContextRecord = {
     actor: ActorRecord | null;
     subject: SubjectRecord | null;
     payload_ref: ContextPayloadReference | null;
+    connections: ContextConnection[];
     acknowledged_by: ContextAcknowledgement[];
     created_at: string;
     updated_at: string;
+};
+
+export type ContextConnection = {
+    id: number;
+    direction: "outgoing" | "incoming";
+    relationship: string;
+    rationale: string | null;
+    other_context_id: number;
+    created_by: ActorRecord;
+    created_at: string;
 };
 
 export type ContextPayloadReference = {
@@ -129,6 +140,7 @@ type ContextRow = {
     actor_last_seen_at: string | Date | null;
     subject: unknown;
     payload_ref: unknown;
+    connections?: unknown;
     acknowledged_by: unknown;
     created_at: string | Date;
     updated_at: string | Date;
@@ -361,10 +373,36 @@ function mapContextRow(row: ContextRow): ContextRecord {
               },
         subject: row.subject ? mapSubjectRow(row.subject as SubjectRow) : null,
         payload_ref: mapPayloadReference(row.payload_ref),
+        connections: parseContextConnections(row.connections),
         acknowledged_by: parseAcknowledgements(row.acknowledged_by),
         created_at: normalizeTimestamp(row.created_at),
         updated_at: normalizeTimestamp(row.updated_at),
     };
+}
+
+function parseContextConnections(value: unknown): ContextConnection[] {
+    if (!Array.isArray(value)) return [];
+    return value.flatMap((candidate) => {
+        const item = candidate as Record<string, unknown>;
+        const actor = item.created_by as Record<string, unknown> | null;
+        if (!actor || (item.direction !== "outgoing" && item.direction !== "incoming")) return [];
+        return [{
+            id: Number(item.id),
+            direction: item.direction,
+            relationship: String(item.relationship),
+            rationale: typeof item.rationale === "string" ? item.rationale : null,
+            other_context_id: Number(item.other_context_id),
+            created_by: {
+                id: Number(actor.id),
+                external_id: typeof actor.external_id === "string" ? actor.external_id : null,
+                name: typeof actor.name === "string" ? actor.name : "Unknown actor",
+                kind: typeof actor.kind === "string" ? actor.kind : null,
+                created_at: new Date(actor.created_at as string | Date).toISOString(),
+                last_seen_at: new Date(actor.last_seen_at as string | Date).toISOString(),
+            },
+            created_at: new Date(item.created_at as string | Date).toISOString(),
+        }];
+    });
 }
 
 function mapPayloadReference(value: unknown): ContextPayloadReference | null {
@@ -394,6 +432,17 @@ async function loadCurrentPayloadReference(row: ContextRow, client: PoolClient |
     );
     row.payload_ref = result.rows[0]?.payload_ref ?? null;
     return row;
+}
+
+async function loadContextEnvelope(id: number | string) {
+    const result = await db.query<ContextRow>(
+        `SELECT ${CONTEXT_PROJECTION}
+         FROM contexts
+         LEFT JOIN actors ON actors.id = contexts.actor_id
+         WHERE contexts.id = $1`,
+        [id],
+    );
+    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
 }
 
 function mapSubjectRow(row: SubjectRow): SubjectRecord {
@@ -455,6 +504,58 @@ const CONTEXT_PROJECTION = `
         WHERE context_payloads.context_id = contexts.id
           AND context_payloads.version = contexts.payload_version
     ) AS payload_ref,
+    COALESCE((
+        SELECT jsonb_agg(connection ORDER BY connection.created_at, connection.id)
+        FROM (
+            SELECT
+                context_connections.id,
+                'outgoing'::text AS direction,
+                context_connections.relationship,
+                context_connections.rationale,
+                context_connections.target_context_id AS other_context_id,
+                context_connections.created_at,
+                jsonb_build_object(
+                    'id', connection_actors.id,
+                    'external_id', connection_actors.external_id,
+                    'name', connection_actors.name,
+                    'kind', connection_actors.kind,
+                    'created_at', connection_actors.created_at,
+                    'last_seen_at', connection_actors.last_seen_at
+                ) AS created_by
+            FROM context_connections
+            INNER JOIN contexts AS other_context ON other_context.id = context_connections.target_context_id
+            INNER JOIN actors AS connection_actors ON connection_actors.id = context_connections.created_by_actor_id
+            WHERE context_connections.source_context_id = contexts.id
+              AND other_context.visibility = contexts.visibility
+              AND (contexts.visibility <> 'personal' OR other_context.actor_id = contexts.actor_id)
+              AND (contexts.visibility <> 'channel' OR other_context.channel_id = contexts.channel_id)
+              AND (contexts.visibility <> 'group' OR other_context.group_id = contexts.group_id)
+            UNION ALL
+            SELECT
+                context_connections.id,
+                'incoming'::text AS direction,
+                context_connections.relationship,
+                context_connections.rationale,
+                context_connections.source_context_id AS other_context_id,
+                context_connections.created_at,
+                jsonb_build_object(
+                    'id', connection_actors.id,
+                    'external_id', connection_actors.external_id,
+                    'name', connection_actors.name,
+                    'kind', connection_actors.kind,
+                    'created_at', connection_actors.created_at,
+                    'last_seen_at', connection_actors.last_seen_at
+                ) AS created_by
+            FROM context_connections
+            INNER JOIN contexts AS other_context ON other_context.id = context_connections.source_context_id
+            INNER JOIN actors AS connection_actors ON connection_actors.id = context_connections.created_by_actor_id
+            WHERE context_connections.target_context_id = contexts.id
+              AND other_context.visibility = contexts.visibility
+              AND (contexts.visibility <> 'personal' OR other_context.actor_id = contexts.actor_id)
+              AND (contexts.visibility <> 'channel' OR other_context.channel_id = contexts.channel_id)
+              AND (contexts.visibility <> 'group' OR other_context.group_id = contexts.group_id)
+        ) AS connection
+    ), '[]'::jsonb) AS connections,
     actors.id AS actor_id,
     actors.external_id AS actor_external_id,
     actors.name AS actor_name,
@@ -1283,6 +1384,144 @@ export async function getContext(id: number) {
     return context ? mapContextRow(context) : null;
 }
 
+type ConnectionEndpointRow = {
+    id: number | string;
+    visibility: ContextVisibility;
+    actor_id: number | string | null;
+    channel_id: number | string | null;
+    group_id: number | string | null;
+};
+
+function sameConnectionScope(source: ConnectionEndpointRow, target: ConnectionEndpointRow) {
+    if (source.visibility !== target.visibility) return false;
+    if (source.visibility === "whiteboard") return true;
+    if (source.visibility === "personal") return Number(source.actor_id) === Number(target.actor_id);
+    if (source.visibility === "channel") return Number(source.channel_id) === Number(target.channel_id);
+    if (source.visibility === "group") return Number(source.group_id) === Number(target.group_id);
+    return false;
+}
+
+async function actorCanConnectContext(
+    client: PoolClient,
+    actorId: number,
+    context: ConnectionEndpointRow,
+) {
+    if (context.visibility === "whiteboard") return true;
+    if (context.visibility === "personal") return Number(context.actor_id) === actorId;
+    if (context.visibility === "channel") {
+        const membership = await client.query(
+            `SELECT 1 FROM channel_memberships
+             WHERE channel_id = $1 AND actor_id = $2
+               AND removed_at IS NULL AND can_write`,
+            [context.channel_id, actorId],
+        );
+        return Boolean(membership.rows[0]);
+    }
+    if (context.visibility === "group") {
+        const membership = await client.query(
+            `SELECT 1 FROM access_group_memberships
+             WHERE group_id = $1 AND actor_id = $2
+               AND removed_at IS NULL AND can_write`,
+            [context.group_id, actorId],
+        );
+        return Boolean(membership.rows[0]);
+    }
+    return false;
+}
+
+export async function connectContexts(
+    actorId: number,
+    sourceContextId: number,
+    targetContextId: number,
+    relationship: string,
+    rationale?: string,
+) {
+    await initializeDatabase();
+    const normalizedRelationship = relationship.trim().toLowerCase();
+    if (!/^[a-z][a-z0-9:_-]{0,63}$/.test(normalizedRelationship)) {
+        throw new Error("CONTEXT_CONNECTION_RELATIONSHIP_INVALID");
+    }
+    const normalizedRationale = rationale?.trim();
+    if (normalizedRationale !== undefined && (normalizedRationale.length < 1 || normalizedRationale.length > 2000)) {
+        throw new Error("CONTEXT_CONNECTION_RATIONALE_INVALID");
+    }
+    if (sourceContextId === targetContextId) throw new Error("CONTEXT_CONNECTION_SELF_REFERENCE");
+
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const endpoints = await client.query<ConnectionEndpointRow>(
+            `SELECT id, visibility, actor_id, channel_id, group_id
+             FROM contexts WHERE id = ANY($1::bigint[]) FOR SHARE`,
+            [[sourceContextId, targetContextId]],
+        );
+        const source = endpoints.rows.find((row) => Number(row.id) === sourceContextId);
+        const target = endpoints.rows.find((row) => Number(row.id) === targetContextId);
+        if (!source || !target || !sameConnectionScope(source, target)
+            || !await actorCanConnectContext(client, actorId, source)
+            || !await actorCanConnectContext(client, actorId, target)) {
+            throw new Error("CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED");
+        }
+
+        await client.query(
+            `INSERT INTO context_connections (
+                source_context_id, target_context_id, relationship, rationale, created_by_actor_id
+             ) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (source_context_id, target_context_id, relationship) DO NOTHING`,
+            [sourceContextId, targetContextId, normalizedRelationship, normalizedRationale ?? null, actorId],
+        );
+        const result = await client.query<ContextRow>(
+            `SELECT ${CONTEXT_PROJECTION}
+             FROM contexts
+             LEFT JOIN actors ON actors.id = contexts.actor_id
+             WHERE contexts.id = $1`,
+            [sourceContextId],
+        );
+        await client.query("COMMIT");
+        return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function disconnectContexts(actorId: number, connectionId: number) {
+    await initializeDatabase();
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const result = await client.query<ConnectionEndpointRow & { source_context_id: number | string }>(
+            `SELECT contexts.id, contexts.visibility, contexts.actor_id, contexts.channel_id,
+                    contexts.group_id, context_connections.source_context_id
+             FROM context_connections
+             INNER JOIN contexts ON contexts.id = context_connections.source_context_id
+             WHERE context_connections.id = $1 FOR UPDATE OF context_connections`,
+            [connectionId],
+        );
+        const source = result.rows[0];
+        if (!source || !await actorCanConnectContext(client, actorId, source)) {
+            throw new Error("CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED");
+        }
+        await client.query("DELETE FROM context_connections WHERE id = $1", [connectionId]);
+        const contextResult = await client.query<ContextRow>(
+            `SELECT ${CONTEXT_PROJECTION}
+             FROM contexts
+             LEFT JOIN actors ON actors.id = contexts.actor_id
+             WHERE contexts.id = $1`,
+            [source.source_context_id],
+        );
+        await client.query("COMMIT");
+        return contextResult.rows[0] ? mapContextRow(contextResult.rows[0]) : null;
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
 export async function deleteContext(id: number) {
     await initializeDatabase();
 
@@ -2020,9 +2259,7 @@ export async function updateChannelContext(
             new Date().toISOString(),
         ],
     );
-    const context = result.rows[0]
-        ? mapContextRow(await loadCurrentPayloadReference(result.rows[0]))
-        : null;
+    const context = result.rows[0] ? await loadContextEnvelope(result.rows[0].id) : null;
 
     if (context && hasText) {
         await maybeSaveContextEmbedding(context);
@@ -2617,9 +2854,7 @@ export async function updateGroupContext(
             new Date().toISOString(),
         ],
     );
-    const context = result.rows[0]
-        ? mapContextRow(await loadCurrentPayloadReference(result.rows[0]))
-        : null;
+    const context = result.rows[0] ? await loadContextEnvelope(result.rows[0].id) : null;
 
     if (context && hasText) {
         await maybeSaveContextEmbedding(context);
@@ -2914,9 +3149,7 @@ export async function updatePersonalContext(
     } finally {
         client.release();
     }
-    const context = result.rows[0]
-        ? mapContextRow(await loadCurrentPayloadReference(result.rows[0]))
-        : null;
+    const context = result.rows[0] ? await loadContextEnvelope(result.rows[0].id) : null;
 
     if (context && hasText) {
         await maybeSaveContextEmbedding(context);

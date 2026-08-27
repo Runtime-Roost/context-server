@@ -249,6 +249,24 @@ compatibility mirror in this migration slice. These payload records provide the
 indirection point for later image, document, OCR, transcript, and embedding
 storage without changing context-envelope identity.
 
+### Context connections
+
+Migration 21 adds directed, typed connections between context envelopes. A
+connection records a normalized relationship such as `led_to`, `supports`,
+`contradicts`, or `supersedes`, an optional bounded rationale explaining why the
+edge exists, and the authenticated actor that created it. Exact reads and
+search/list envelopes expose connections from both directions with the other
+context ID; they do not hydrate the other payload automatically.
+
+Connections are semantic metadata, not capabilities. Both endpoints must be in
+the same visibility scope: Whiteboard with Whiteboard, the same personal owner,
+the same channel, or the same access group. The creator must have write access
+to that scope. Direct, system, archived, cross-owner, and cross-scope edges are
+rejected in this slice, and unauthorized callers receive the same not-found
+boundary as missing contexts. The full administrative MCP surface exposes
+`connect_contexts` and `disconnect_contexts`; the bounded conversation catalog
+does not add new tool definitions in this slice.
+
 ### Whiteboard visibility
 
 Every context now has a first-class `visibility` classification. Existing rows

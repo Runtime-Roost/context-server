@@ -28,10 +28,12 @@ import {
     addChannelMember,
     createChannel,
     createAccessGroup,
+    connectContexts,
     deleteContext,
     deleteChannelContext,
     deletePersonalContext,
     deleteGroupContext,
+    disconnectContexts,
     contextPurgeConfirm,
     contextPurgePreview,
     getContext,
@@ -196,6 +198,11 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "ATTACHMENT_SCOPE_INVALID",
         "ATTACHMENT_QUOTA_EXCEEDED",
         "ATTACHMENT_QUOTA_CONFIG_INVALID",
+        "CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED",
+        "CONTEXT_CONNECTION_SCOPE_MISMATCH",
+        "CONTEXT_CONNECTION_RELATIONSHIP_INVALID",
+        "CONTEXT_CONNECTION_RATIONALE_INVALID",
+        "CONTEXT_CONNECTION_SELF_REFERENCE",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -1864,6 +1871,71 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 ],
             };
         }
+    );
+
+    server.registerTool(
+        "connect_contexts",
+        {
+            description: "Create an authenticated directed knowledge edge between two contexts in the same visibility scope. The relationship and rationale describe meaning and grant no access.",
+            annotations: {
+                title: "Connect Contexts",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                source_context_id: z.number().int().positive().describe("Context where the directed relationship starts."),
+                target_context_id: z.number().int().positive().describe("Context where the directed relationship points."),
+                relationship: z.string().regex(/^[a-z][a-z0-9:_-]{0,63}$/).describe("Stable lowercase relationship type, such as led_to, supports, contradicts, or supersedes."),
+                rationale: z.string().min(1).max(2000).optional().describe("Optional bounded explanation of why the contexts are connected."),
+                auth: requestAuthSchema.optional().describe("Authenticated edge creator."),
+            },
+        },
+        async ({ source_context_id, target_context_id, relationship, rationale, auth }, extra) => {
+            const payload = { source_context_id, target_context_id, relationship, rationale };
+            try {
+                const authenticated = await authenticateTool("connect_contexts", payload, auth, extra);
+                const context = await connectContexts(
+                    authenticated.actor_id,
+                    source_context_id,
+                    target_context_id,
+                    relationship,
+                    rationale,
+                );
+                return { content: [{ type: "text", text: JSON.stringify({ context }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "disconnect_contexts",
+        {
+            description: "Remove one authenticated context edge by its exact connection ID without deleting either context.",
+            annotations: {
+                title: "Disconnect Contexts",
+                readOnlyHint: false,
+                destructiveHint: true,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                connection_id: z.number().int().positive().describe("Exact connection ID returned in a context envelope."),
+                auth: requestAuthSchema.optional().describe("Authenticated actor with write access to the connection scope."),
+            },
+        },
+        async ({ connection_id, auth }, extra) => {
+            const payload = { connection_id };
+            try {
+                const authenticated = await authenticateTool("disconnect_contexts", payload, auth, extra);
+                const context = await disconnectContexts(authenticated.actor_id, connection_id);
+                return { content: [{ type: "text", text: JSON.stringify({ connection_id, disconnected: true, context }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
     );
 
     server.registerTool(

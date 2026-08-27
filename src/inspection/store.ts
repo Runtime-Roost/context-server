@@ -194,6 +194,7 @@ function mapArchivedContext(row: ArchivedContextRow): ArchivedWhiteboardContext 
             media_type: String(payload.media_type),
             size_bytes: Number(payload.size_bytes),
         },
+        connections: [],
         acknowledged_by: acknowledgements(row.acknowledged_by),
         created_at: timestamp(row.created_at),
         updated_at: timestamp(row.updated_at),

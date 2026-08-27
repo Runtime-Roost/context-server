@@ -51,8 +51,10 @@ test("full surface remains available for local administration", async () => {
 
     try {
         const response = await client.listTools();
-        assert.equal(response.tools.length, 62);
+        assert.equal(response.tools.length, 64);
         assert.ok(response.tools.some(({ name }) => name === "vacuum_database"));
+        assert.ok(response.tools.some(({ name }) => name === "connect_contexts"));
+        assert.ok(response.tools.some(({ name }) => name === "disconnect_contexts"));
     } finally {
         await client.close();
         await server.close();
