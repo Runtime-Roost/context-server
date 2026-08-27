@@ -20,6 +20,7 @@ import {
     type ContextRecord,
     WRITABLE_CONTEXT_VISIBILITY_VALUES,
     acknowledgeContextWithActor,
+    acknowledgeDirectContext,
     actorPurgeConfirm,
     actorPurgePreview,
     addAccessGroupMember,
@@ -33,6 +34,7 @@ import {
     contextPurgeConfirm,
     contextPurgePreview,
     getContext,
+    getDirectContext,
     getChannelContext,
     getPersonalContext,
     getGroupContext,
@@ -40,6 +42,7 @@ import {
     getUserProfile,
     identifyActor,
     listRecentContext,
+    listDirectInbox,
     listActorChannels,
     listChannelContext,
     listPersonalContext,
@@ -48,6 +51,7 @@ import {
     removeAccessGroupMember,
     removeChannelMember,
     saveContextWithActor,
+    saveDirectContext,
     saveChannelContext,
     savePersonalContext,
     saveGroupContext,
@@ -278,6 +282,9 @@ const CONVERSATION_TOOL_NAMES = new Set([
     "save_personal_context",
     "search_personal_context",
     "get_personal_context",
+    "send_direct_context",
+    "list_direct_inbox",
+    "acknowledge_direct_context",
 ]);
 
 function applyToolSurface(server: McpServer, surface: ContextServerSurface) {
@@ -1198,6 +1205,83 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
             } catch (error) {
                 return authenticationError(error);
             }
+        },
+    );
+
+    server.registerTool(
+        "send_direct_context",
+        {
+            description: "Send one authenticated direct context envelope to an existing actor. Delivery is deterministic and private; this does not use semantic search.",
+            annotations: { title: "Send Direct Message", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+            inputSchema: {
+                recipient_external_id: z.string().min(3).max(255).describe("Exact registered recipient actor identity."),
+                text: z.string().min(1).describe("Message text."),
+                tags: z.array(z.string()).optional(),
+                source: z.string().optional(),
+                auth: requestAuthSchema.optional().describe("Authenticated sender."),
+            },
+        },
+        async ({ recipient_external_id, text, tags, source, auth }, extra) => {
+            const payload = { recipient_external_id, text, tags, source };
+            try {
+                const authenticated = await authenticateTool("send_direct_context", payload, auth, extra);
+                const sent = await saveDirectContext(authenticated.actor_id, recipient_external_id, text, tags, source);
+                return { content: [{ type: "text", text: JSON.stringify({ sent }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "list_direct_inbox",
+        {
+            description: "List the authenticated actor's newest direct envelopes in deterministic sequence order. Supports unread-only and since-sequence delivery without semantic search.",
+            annotations: { title: "List My Direct Inbox", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: {
+                limit: z.number().int().positive().max(100).optional(),
+                unread_only: z.boolean().optional(),
+                since_sequence: z.number().int().nonnegative().optional(),
+                auth: requestAuthSchema.optional().describe("Authenticated mailbox owner."),
+            },
+        },
+        async ({ limit, unread_only, since_sequence, auth }, extra) => {
+            const payload = { limit, unread_only, since_sequence };
+            try {
+                const authenticated = await authenticateTool("list_direct_inbox", payload, auth, extra);
+                const envelopes = await listDirectInbox(authenticated.actor_id, { limit, unreadOnly: unread_only, sinceSequence: since_sequence });
+                return { content: [{ type: "text", text: JSON.stringify({ envelopes, returned_count: envelopes.length }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "get_direct_context",
+        {
+            description: "Get one exact direct envelope owned by the authenticated recipient. Missing and unauthorized records both return null.",
+            annotations: { title: "Get Direct Message", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: { id: z.number().int().positive(), auth: requestAuthSchema.optional() },
+        },
+        async ({ id, auth }, extra) => {
+            try {
+                const authenticated = await authenticateTool("get_direct_context", { id }, auth, extra);
+                const envelope = await getDirectContext(authenticated.actor_id, id);
+                return { content: [{ type: "text", text: JSON.stringify({ id, envelope }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "acknowledge_direct_context",
+        {
+            description: "Idempotently acknowledge one direct envelope as its authenticated recipient.",
+            annotations: { title: "Acknowledge Direct Message", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: { id: z.number().int().positive(), auth: requestAuthSchema.optional() },
+        },
+        async ({ id, auth }, extra) => {
+            try {
+                const authenticated = await authenticateTool("acknowledge_direct_context", { id }, auth, extra);
+                const result = await acknowledgeDirectContext(authenticated.actor_id, id);
+                return { content: [{ type: "text", text: JSON.stringify({ id, result }) }] };
+            } catch (error) { return authenticationError(error); }
         },
     );
 

@@ -60,6 +60,12 @@ export type AcknowledgeContextResult = {
     };
 };
 
+export type DirectInboxEnvelope = {
+    sequence: number;
+    context: ContextRecord;
+    acknowledged_at: string | null;
+};
+
 export const SEARCH_SENSITIVITY_VALUES = ["low", "medium", "high"] as const;
 export type SearchSensitivity = (typeof SEARCH_SENSITIVITY_VALUES)[number];
 export const CONTEXT_VISIBILITY_VALUES = [
@@ -492,6 +498,99 @@ export async function identifyActor(identity: ActorIdentity) {
     } finally {
         client.release();
     }
+}
+
+export async function saveDirectContext(
+    senderActorId: number,
+    recipientExternalId: string,
+    text: string,
+    tags?: string[],
+    source?: string,
+) {
+    await initializeDatabase();
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const recipient = await client.query<{ id: number | string }>(
+            "SELECT id FROM actors WHERE external_id = $1",
+            [recipientExternalId],
+        );
+        if (!recipient.rows[0]) throw new Error("Recipient actor is not registered.");
+        const context = await insertContext(client, text, tags, source, senderActorId, "direct");
+        const envelope = await client.query<{ sequence: number | string }>(
+            `INSERT INTO direct_context_envelopes (context_id, recipient_actor_id)
+             VALUES ($1, $2) RETURNING sequence`,
+            [context.id, recipient.rows[0].id],
+        );
+        await client.query("COMMIT");
+        return { sequence: Number(envelope.rows[0].sequence), context, acknowledged_at: null };
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+type DirectInboxRow = ContextRow & { sequence: number | string; recipient_acknowledged_at: string | Date | null };
+
+export async function listDirectInbox(actorId: number, options: { limit?: number; unreadOnly?: boolean; sinceSequence?: number } = {}) {
+    await initializeDatabase();
+    const result = await db.query<DirectInboxRow>(
+        `SELECT ${CONTEXT_PROJECTION}, direct_context_envelopes.sequence,
+                recipient_ack.acknowledged_at AS recipient_acknowledged_at
+         FROM direct_context_envelopes
+         INNER JOIN contexts ON contexts.id = direct_context_envelopes.context_id
+         LEFT JOIN actors ON actors.id = contexts.actor_id
+         LEFT JOIN context_acknowledgements AS recipient_ack
+           ON recipient_ack.context_id = contexts.id AND recipient_ack.actor_id = $1
+         WHERE direct_context_envelopes.recipient_actor_id = $1
+           AND contexts.visibility = 'direct'
+           AND ($2::boolean = FALSE OR recipient_ack.context_id IS NULL)
+           AND ($3::bigint IS NULL OR direct_context_envelopes.sequence > $3)
+         ORDER BY direct_context_envelopes.sequence DESC
+         LIMIT $4`,
+        [actorId, options.unreadOnly === true, options.sinceSequence ?? null, normalizeLimit(options.limit)],
+    );
+    return result.rows.map((row): DirectInboxEnvelope => ({
+        sequence: Number(row.sequence),
+        context: mapContextRow(row),
+        acknowledged_at: normalizeNullableTimestamp(row.recipient_acknowledged_at),
+    }));
+}
+
+export async function getDirectContext(actorId: number, id: number) {
+    await initializeDatabase();
+    const result = await db.query<DirectInboxRow>(
+        `SELECT ${CONTEXT_PROJECTION}, direct_context_envelopes.sequence,
+                recipient_ack.acknowledged_at AS recipient_acknowledged_at
+         FROM direct_context_envelopes
+         INNER JOIN contexts ON contexts.id = direct_context_envelopes.context_id
+         LEFT JOIN actors ON actors.id = contexts.actor_id
+         LEFT JOIN context_acknowledgements AS recipient_ack
+           ON recipient_ack.context_id = contexts.id AND recipient_ack.actor_id = $1
+         WHERE contexts.id = $2 AND contexts.visibility = 'direct'
+           AND direct_context_envelopes.recipient_actor_id = $1`,
+        [actorId, id],
+    );
+    const row = result.rows[0];
+    return row ? { sequence: Number(row.sequence), context: mapContextRow(row), acknowledged_at: normalizeNullableTimestamp(row.recipient_acknowledged_at) } : null;
+}
+
+export async function acknowledgeDirectContext(actorId: number, id: number) {
+    await initializeDatabase();
+    const result = await db.query<{ acknowledged_at: string | Date }>(
+        `INSERT INTO context_acknowledgements (context_id, actor_id)
+         SELECT contexts.id, $1
+         FROM contexts INNER JOIN direct_context_envelopes ON direct_context_envelopes.context_id = contexts.id
+         WHERE contexts.id = $2 AND contexts.visibility = 'direct'
+           AND direct_context_envelopes.recipient_actor_id = $1
+         ON CONFLICT (context_id, actor_id) DO UPDATE
+           SET acknowledged_at = context_acknowledgements.acknowledged_at
+         RETURNING acknowledged_at`,
+        [actorId, id],
+    );
+    return result.rows[0] ? { acknowledged: true, acknowledged_at: normalizeTimestamp(result.rows[0].acknowledged_at) } : null;
 }
 
 async function insertContext(
@@ -2710,6 +2809,11 @@ async function getActorPurgePreview(before: string) {
                   FROM context_acknowledgements
                   WHERE context_acknowledgements.actor_id = actors.id
               )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM direct_context_envelopes
+                  WHERE direct_context_envelopes.recipient_actor_id = actors.id
+              )
         `,
         [before]
     );
@@ -2793,6 +2897,11 @@ export async function actorPurgeConfirm(
                   SELECT 1
                   FROM context_acknowledgements
                   WHERE context_acknowledgements.actor_id = actors.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM direct_context_envelopes
+                  WHERE direct_context_envelopes.recipient_actor_id = actors.id
               )
             RETURNING id, external_id, name, kind, metadata, created_at, last_seen_at
         `,

@@ -19,11 +19,13 @@ test("conversation surface advertises only the bounded conversational contract",
 
         assert.deepEqual(names, [
             "acknowledge_context",
+            "acknowledge_direct_context",
             "bind_sso_session",
             "get_actor_session_request_status",
             "get_channel_context",
             "get_context",
             "get_personal_context",
+            "list_direct_inbox",
             "request_actor_session",
             "save_channel_context",
             "save_context",
@@ -31,6 +33,7 @@ test("conversation surface advertises only the bounded conversational contract",
             "search_channel_context",
             "search_context",
             "search_personal_context",
+            "send_direct_context",
         ]);
         assert.ok(serialized.length < 25_000, `conversation schema was ${serialized.length} characters`);
     } finally {
@@ -48,7 +51,7 @@ test("full surface remains available for local administration", async () => {
 
     try {
         const response = await client.listTools();
-        assert.equal(response.tools.length, 58);
+        assert.equal(response.tools.length, 62);
         assert.ok(response.tools.some(({ name }) => name === "vacuum_database"));
     } finally {
         await client.close();
