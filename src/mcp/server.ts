@@ -6,6 +6,7 @@ import {
 } from "../auth/request-auth.js";
 import {
     authenticateOpenAITunnelActorSession,
+    bindRoostSsoServiceSession,
     claimActorSession,
     getActorSessionRequestStatus,
     renewActorSession,
@@ -159,6 +160,7 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "SESSION_REVOKED",
         "SESSION_RENEWAL_NOT_ALLOWED",
         "AUTHENTICATION_REQUIRED",
+        "SSO_BINDING_INVALID",
         "ATTACHMENT_UPLOAD_NOT_FOUND_OR_NOT_AUTHORIZED",
         "ATTACHMENT_UPLOAD_INCOMPLETE",
         "ATTACHMENT_INTEGRITY_MISMATCH",
@@ -189,6 +191,8 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
                                     : "Provide explicit cryptographic authentication or request and claim an operator-approved native actor session."
                             : code === "SESSION_REVOKED"
                                 ? "This actor session was revoked because a newer session became the actor's current timeline."
+                            : code === "SSO_BINDING_INVALID"
+                                ? "The Roost SSO handoff is invalid, expired, already consumed, or its approved source session is no longer active."
                             : code === "CHANNEL_NOT_FOUND_OR_NOT_AUTHORIZED"
                                 ? "The channel was not found or the authenticated actor is not authorized."
                                 : code === "ACCESS_GROUP_NOT_FOUND_OR_NOT_AUTHORIZED"
@@ -261,6 +265,7 @@ export type ContextServerSurface = "full" | "conversation";
 
 const CONVERSATION_TOOL_NAMES = new Set([
     "request_actor_session",
+    "bind_sso_session",
     "get_actor_session_request_status",
     "save_context",
     "search_context",
@@ -372,6 +377,45 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 };
             } catch (error) {
                 return authenticationError(error, { actor_external_id });
+            }
+        },
+    );
+
+    server.registerTool(
+        "bind_sso_session",
+        {
+            description: "Consume a one-use, Context Server-specific handoff issued by Roost SSO after operator approval. The trusted tunnel supplies this server's actor-session binding; the model cannot select an actor or reuse the handoff.",
+            annotations: {
+                title: "Bind Approved Roost SSO Session",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                binding_handle: z.string().regex(/^asb_[0-9a-f-]{36}$/)
+                    .describe("One-use Context Server handoff returned by Roost SSO."),
+            },
+        },
+        async ({ binding_handle }, extra) => {
+            try {
+                const authenticated = await bindRoostSsoServiceSession(
+                    openAITunnelIdentity(extra), binding_handle,
+                );
+                actorSession.activate(authenticated.actor_id);
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            bound: true,
+                            actor_external_id: authenticated.actor_external_id,
+                            actor_name: authenticated.actor_name,
+                            next_action: "The current Context Server conversation is authenticated. Call the intended protected tool without an auth object.",
+                        }),
+                    }],
+                };
+            } catch (error) {
+                return authenticationError(error);
             }
         },
     );

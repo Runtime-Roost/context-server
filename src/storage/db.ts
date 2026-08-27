@@ -704,6 +704,22 @@ const migrations: Migration[] = [
                 WHERE revoked_at IS NULL;
         `,
     },
+    {
+        version: 17,
+        name: "roost_sso_explicit_handoff",
+        sql: `
+            ALTER TABLE actor_session_service_bindings
+                ADD COLUMN IF NOT EXISTS service_subject_hash TEXT;
+
+            CREATE INDEX IF NOT EXISTS actor_session_service_bindings_service_lookup_idx
+                ON actor_session_service_bindings(
+                    issuer, audience, service_subject_hash, service_session_hash
+                )
+                WHERE revoked_at IS NULL
+                  AND service_subject_hash IS NOT NULL
+                  AND service_session_hash IS NOT NULL;
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;

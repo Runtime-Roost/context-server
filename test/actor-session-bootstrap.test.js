@@ -661,6 +661,16 @@ test("one approved Roost SSO grant binds exactly one Context Server conversation
         const approved = await approveActorSessionRequest(requestId, actorExternalId, 3600);
         sessionId = approved.activated_session.session_id;
 
+        const handoff = await db.query(`SELECT binding_id
+            FROM actor_session_service_bindings WHERE source_session_id = $1`, [sessionId]);
+        assert.equal(handoff.rowCount, 1);
+        const bound = await connection.client.callTool({
+            name: "bind_sso_session",
+            arguments: { binding_handle: handoff.rows[0].binding_id },
+            _meta: contextMeta,
+        });
+        assert.notEqual(bound.isError, true);
+
         const firstContextUse = await connection.client.callTool({
             name: "list_channels", arguments: {}, _meta: contextMeta,
         });
@@ -681,10 +691,11 @@ test("one approved Roost SSO grant binds exactly one Context Server conversation
         });
         assert.equal(differentSubject.isError, true);
 
-        const binding = await db.query(`SELECT bound_at, service_session_hash
+        const binding = await db.query(`SELECT bound_at, service_subject_hash, service_session_hash
             FROM actor_session_service_bindings WHERE source_session_id = $1`, [sessionId]);
         assert.equal(binding.rowCount, 1);
         assert.ok(binding.rows[0].bound_at);
+        assert.ok(binding.rows[0].service_subject_hash);
         assert.ok(binding.rows[0].service_session_hash);
     } finally {
         if (requestId) await db.query("DELETE FROM actor_session_requests WHERE request_id = $1", [requestId]);

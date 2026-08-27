@@ -19,6 +19,7 @@ test("conversation surface advertises only the bounded conversational contract",
 
         assert.deepEqual(names, [
             "acknowledge_context",
+            "bind_sso_session",
             "get_actor_session_request_status",
             "get_channel_context",
             "get_context",
@@ -47,7 +48,7 @@ test("full surface remains available for local administration", async () => {
 
     try {
         const response = await client.listTools();
-        assert.equal(response.tools.length, 57);
+        assert.equal(response.tools.length, 58);
         assert.ok(response.tools.some(({ name }) => name === "vacuum_database"));
     } finally {
         await client.close();
