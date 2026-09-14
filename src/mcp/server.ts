@@ -361,6 +361,11 @@ function applyToolSurface(server: McpServer, surface: ContextServerSurface) {
 
 export function createServer(options: { surface?: ContextServerSurface } = {}) {
     const actorSession = new ActiveActorSession();
+    const personalAuthSchema = options.surface === "conversation"
+        ? z.never().optional().describe("Authentication is supplied by the trusted conversation binding.")
+        : requestAuthSchema.optional().describe(
+            "Authentication using either an enrolled-key signature or an operator-approved actor session.",
+        );
     const server = new McpServer({
         name: "personal-context-server",
         version: "0.1.0",
@@ -1643,7 +1648,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 tags: z.array(z.string()).optional().describe("Optional tags."),
                 source: z.string().optional().describe("Optional provenance source."),
                 subject: subjectIdentitySchema.optional().describe("Optional topic; actor remains owner."),
-                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+                auth: personalAuthSchema,
             },
         },
         async ({ text, tags, source, subject, auth }, extra) => {
@@ -1685,7 +1690,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 query: z.string().min(1).describe("Search query."),
                 limit: z.number().int().positive().optional().describe("Maximum result count."),
                 sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness."),
-                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+                auth: personalAuthSchema,
             },
         },
         async ({ query, limit, sensitivity, auth }, extra) => {
@@ -1797,7 +1802,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
             },
             inputSchema: {
                 id: z.number().int().positive().describe("Exact context ID."),
-                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+                auth: personalAuthSchema,
             },
         },
         async ({ id, auth }, extra) => {

@@ -36,6 +36,11 @@ test("conversation surface advertises only the bounded conversational contract",
             "send_direct_context",
         ]);
         assert.ok(serialized.length < 25_000, `conversation schema was ${serialized.length} characters`);
+        for (const name of ["save_personal_context", "search_personal_context", "get_personal_context"]) {
+            const tool = response.tools.find((candidate) => candidate.name === name);
+            assert.ok(tool);
+            assert.deepEqual(tool.inputSchema.properties.auth.not, {});
+        }
     } finally {
         await client.close();
         await server.close();
@@ -61,6 +66,10 @@ test("full surface remains available for local administration", async () => {
         assert.ok(response.tools.some(({ name }) => name === "assemble_context"));
         for (const name of ["begin_payload_upload", "append_payload_chunk", "finalize_payload_upload", "attach_payload_to_context"]) {
             assert.ok(response.tools.some((tool) => tool.name === name));
+        }
+        for (const name of ["save_personal_context", "search_personal_context", "get_personal_context"]) {
+            const tool = response.tools.find((candidate) => candidate.name === name);
+            assert.ok(tool?.inputSchema.properties.auth.anyOf);
         }
     } finally {
         await client.close();
