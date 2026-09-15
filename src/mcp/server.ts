@@ -1,4 +1,5 @@
 import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { encode as encodeToon } from "@toon-format/toon";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
@@ -18,6 +19,10 @@ import {
     configuredContextAuthority,
     type ContextAuthority,
 } from "../auth/roost-sso-authority.js";
+import {
+    CONTEXT_OUTPUT_FIELD_VALUES,
+    projectWithFenic,
+} from "../query/fenic.js";
 import {
     ACCESS_GROUP_ROLE_VALUES,
     CHANNEL_ROLE_VALUES,
@@ -230,6 +235,13 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "PAYLOAD_NOT_FOUND_OR_NOT_AUTHORIZED",
         "CONTEXT_QUERY_PREDICATE_INVALID",
         "CONTEXT_QUERY_TOO_COMPLEX",
+        "FENIC_NOT_CONFIGURED",
+        "FENIC_TIMEOUT",
+        "FENIC_UNAVAILABLE",
+        "FENIC_EXECUTION_FAILED",
+        "FENIC_OUTPUT_INVALID",
+        "FENIC_OUTPUT_TOO_LARGE",
+        "FENIC_SELECT_REQUIRES_ENGINE",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -1954,7 +1966,7 @@ export function createServer(options: {
     server.registerTool(
         "get_context",
         {
-            description: "Read actor-authorized context through one bounded deterministic query. Legacy {id} reads remain supported. Use class plus all/any/none predicate groups for lambda-shaped metadata filtering; predicates are data, never executable code.",
+            description: "Read actor-authorized context through one bounded query. Legacy {id} reads remain supported. Use class plus all/any/none predicate groups for lambda-shaped metadata filtering; predicates are data, never executable code. Optionally project the already-authorized bounded results through Fenic and encode the final response as JSON or TOON.",
             annotations: {
                 title: "Read Shared Whiteboard Note",
                 readOnlyHint: true,
@@ -1984,15 +1996,21 @@ export function createServer(options: {
                 }).strict().optional().describe("Bounded lambda-shaped predicate AST. At most 24 predicates total."),
                 order: z.enum(["newest", "oldest"]).optional().describe("Deterministic chronological order. Defaults to newest."),
                 limit: z.number().int().min(1).max(50).optional().describe("Maximum results. Defaults to five."),
+                engine: z.enum(["native", "fenic"]).optional().describe("Post-authorization projection engine. Defaults to native. Fenic receives only the already-authorized bounded result set."),
+                select: z.array(z.enum(CONTEXT_OUTPUT_FIELD_VALUES)).min(1).max(16).optional().describe("Fields retained by the Fenic projection. Valid only with engine=fenic."),
+                output_format: z.enum(["json", "toon"]).optional().describe("Model-facing response encoding. Defaults to JSON."),
             },
         },
-        async ({ id, class: contextClass, where, order, limit }, extra) => {
+        async ({ id, class: contextClass, where, order, limit, engine, select, output_format }, extra) => {
             const selectedClass = contextClass ?? "whiteboard";
             const legacyExactRead = id !== undefined
                 && contextClass === undefined
                 && where === undefined
                 && order === undefined
-                && limit === undefined;
+                && limit === undefined
+                && engine === undefined
+                && select === undefined
+                && output_format === undefined;
             const selectedWhere = id === undefined
                 ? where
                 : {
@@ -2003,7 +2021,8 @@ export function createServer(options: {
                     ],
                 };
             try {
-                const payload = { id, class: contextClass, where, order, limit };
+                if (select && engine !== "fenic") throw new Error("FENIC_SELECT_REQUIRES_ENGINE");
+                const payload = { id, class: contextClass, where, order, limit, engine, select, output_format };
                 const authenticated = await authenticateContextTool("get_context", payload, extra);
                 if (!authenticated && selectedClass !== "whiteboard") {
                     throw new Error("AUTHENTICATION_REQUIRED");
@@ -2021,15 +2040,26 @@ export function createServer(options: {
                     };
                 }
                 const projected = projectContextResults(results, "list");
+                const selectedEngine = engine ?? "native";
+                const selectedFormat = output_format ?? "json";
+                const projectedResults = selectedEngine === "fenic"
+                    ? await projectWithFenic(projected.results, select)
+                    : projected.results;
+                const response = {
+                    class: selectedClass,
+                    order: order ?? "newest",
+                    limit: id === undefined ? (limit ?? DEFAULT_CONTEXT_RESULT_LIMIT) : 1,
+                    engine: selectedEngine,
+                    output_format: selectedFormat,
+                    ...projected,
+                    results: projectedResults,
+                };
                 return {
                     content: [{
                         type: "text",
-                        text: JSON.stringify({
-                            class: selectedClass,
-                            order: order ?? "newest",
-                            limit: id === undefined ? (limit ?? DEFAULT_CONTEXT_RESULT_LIMIT) : 1,
-                            ...projected,
-                        }),
+                        text: selectedFormat === "toon"
+                            ? encodeToon(response)
+                            : JSON.stringify(response),
                     }],
                 };
             } catch (error) {

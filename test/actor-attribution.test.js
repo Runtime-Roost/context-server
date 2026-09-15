@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import pg from "pg";
+import { decode as decodeToon } from "@toon-format/toon";
 
 process.env.PGDATABASE ??= "personal_context";
 process.env.EMBEDDINGS_ENABLED = "false";
 process.env.REQUIRE_CONTEXT_AUTHENTICATION = "false";
+if (process.env.FENIC_TEST_PYTHON) process.env.FENIC_PYTHON = process.env.FENIC_TEST_PYTHON;
 
 const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
@@ -460,6 +462,27 @@ test("unified context predicates query only the selected actor-authorized relati
         assert.equal(unifiedResponse.class, "whiteboard");
         assert.ok(unifiedResponse.results.some(({ id }) => id === whiteboard.id));
 
+        const toonResponse = decodeToon(await textForUnifiedQuery({
+            class: "whiteboard",
+            where: { all: [{ field: "id", operator: "eq", value: whiteboard.id }] },
+            output_format: "toon",
+        }));
+        assert.equal(toonResponse.output_format, "toon");
+        assert.equal(toonResponse.results[0].id, whiteboard.id);
+
+        if (process.env.FENIC_TEST_PYTHON) {
+            const fenicToonResponse = decodeToon(await textForUnifiedQuery({
+                class: "whiteboard",
+                where: { all: [{ field: "id", operator: "eq", value: whiteboard.id }] },
+                engine: "fenic",
+                select: ["id", "content"],
+                output_format: "toon",
+            }));
+            assert.equal(fenicToonResponse.engine, "fenic");
+            assert.deepEqual(Object.keys(fenicToonResponse.results[0]), ["id", "content"]);
+            assert.equal(fenicToonResponse.results[0].id, whiteboard.id);
+        }
+
         const selectedPersonal = await queryContext(owner.actor.id, "personal", {
             all: [{ field: "tags", operator: "contains_any", value: ["unified-query"] }],
         }, "oldest", 10);
@@ -513,20 +536,31 @@ test("unified context predicates query only the selected actor-authorized relati
     }
 
     async function connectionForUnifiedQuery() {
+        return callUnifiedQuery({
+            class: "whiteboard",
+            where: { all: [{ field: "id", operator: "eq", value: whiteboard.id }] },
+            order: "oldest",
+            limit: 5,
+        });
+    }
+
+    async function callUnifiedQuery(arguments_) {
         const connection = await connectTestClient();
         try {
             return await connection.client.callTool({
                 name: "get_context",
-                arguments: {
-                    class: "whiteboard",
-                    where: { all: [{ field: "id", operator: "eq", value: whiteboard.id }] },
-                    order: "oldest",
-                    limit: 5,
-                },
+                arguments: arguments_,
             });
         } finally {
             await connection.close();
         }
+    }
+
+    async function textForUnifiedQuery(arguments_) {
+        const result = await callUnifiedQuery(arguments_);
+        const item = result.content.find((content) => content.type === "text");
+        assert.ok(item);
+        return item.text;
     }
 });
 

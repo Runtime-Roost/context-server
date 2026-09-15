@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc",
+    "fenic:setup": "bash scripts/setup-fenic.sh",
     "actor-key:generate": "node scripts/generate-actor-keypair.mjs",
     "actor-key:enroll": "npm run build && node scripts/enroll-actor-key.mjs",
     "actor-key:revoke": "npm run build && node scripts/revoke-actor-key.mjs",
@@ -36,6 +37,7 @@
   "homepage": "https://github.com/yurei-dll/personal-context-server#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@toon-format/toon": "^4.1.1",
     "pg": "^8.21.0",
     "zod": "^4.4.3"
   },

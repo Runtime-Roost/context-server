@@ -363,11 +363,25 @@ Calling `get_context` without an ID lists the selected authorized relation in
 `newest` or `oldest` order. Existing specialized read tools remain available as
 compatibility surfaces. Their deterministic exact/list implementations now
 delegate to the same query engine, while preserving legacy membership errors,
-result shapes, and limits. Semantic search and Direct inbox envelope metadata
-remain on their specialized paths until their equivalence contracts can be
-represented without losing ranking, delivery sequence, or acknowledgement
-state. Semantic predicates and Fenic execution are deliberately deferred until
-this deterministic authorization boundary is proven.
+result shapes, and limits.
+
+`engine: "fenic"` passes only the already-authorized, response-bounded records
+to a local Fenic DataFrame and applies the allowlisted `select` projection.
+There is no arbitrary callback, Python expression, SQL fragment, semantic
+operator, or model call in this slice. Install its isolated runtime with
+`npm run fenic:setup`; Context Server automatically detects
+`.venv-fenic/bin/python`, while `FENIC_PYTHON` can explicitly select another
+interpreter. A missing or failed runtime fails closed rather than falling back
+silently.
+
+`output_format` selects `json` (default) or `toon`. TOON is produced only after
+authorization, filtering, limiting, response-size projection, and optional
+Fenic projection; canonical JSON remains the internal representation. Semantic
+search and Direct inbox envelope metadata remain on their specialized paths
+until their equivalence contracts can be represented without losing ranking,
+delivery sequence, or acknowledgement state. Semantic Fenic operators remain a
+separate future slice because they require explicit model, privacy, cost, and
+failure-policy configuration.
 
 ### Whiteboard visibility
 
