@@ -14,7 +14,7 @@ import { db, initializeDatabase } from "./db.js";
 
 export const ATTACHMENT_SCOPE_VALUES = ["personal", "group"] as const;
 export type AttachmentScope = (typeof ATTACHMENT_SCOPE_VALUES)[number];
-export const ATTACHMENT_RELATIONSHIP_VALUES = ["source", "derived", "reference"] as const;
+export const ATTACHMENT_RELATIONSHIP_VALUES = ["canonical", "source", "derived", "reference"] as const;
 export type AttachmentRelationship = (typeof ATTACHMENT_RELATIONSHIP_VALUES)[number];
 
 const DEFAULT_ATTACHMENT_QUOTA_BYTES = 100 * 1024 * 1024;
@@ -32,6 +32,7 @@ type AttachmentRow = {
     group_id: string | number | null;
     created_by_actor_id: string | number;
     created_at: string | Date;
+    payload_external_id: string;
 };
 
 type AttachmentOwner = { ownerActorId: number | null; groupId: number | null };
@@ -156,7 +157,51 @@ function mapAttachment(row: AttachmentRow) {
         group_id: row.group_id === null ? null : Number(row.group_id),
         created_by_actor_id: Number(row.created_by_actor_id),
         created_at: normalizeTimestamp(row.created_at),
+        payload_ref: {
+            id: row.payload_external_id,
+            version: 1,
+            kind: "artifact" as const,
+            media_type: row.media_type,
+            size_bytes: Number(row.size_bytes),
+            sha256: row.sha256,
+        },
     };
+}
+
+export function attachmentIdFromPayloadReference(payloadId: string) {
+    const match = /^payload:artifact:([0-9a-f-]{36}):v1$/i.exec(payloadId.trim());
+    if (!match) throw new Error("PAYLOAD_REFERENCE_INVALID");
+    return match[1].toLowerCase();
+}
+
+export async function linkPayloadToContext(
+    actorId: number,
+    payloadId: string,
+    contextId: number,
+    role: AttachmentRelationship,
+    derivedFromPayloadId?: string,
+) {
+    const attachmentId = attachmentIdFromPayloadReference(payloadId);
+    let derivedFromAttachmentId: string | undefined;
+    if (role === "derived") {
+        if (!derivedFromPayloadId) throw new Error("PAYLOAD_DERIVATION_SOURCE_REQUIRED");
+        derivedFromAttachmentId = attachmentIdFromPayloadReference(derivedFromPayloadId);
+        if (derivedFromAttachmentId === attachmentId) throw new Error("PAYLOAD_DERIVATION_SOURCE_INVALID");
+        const [payload, source] = await Promise.all([
+            getAttachment(actorId, attachmentId),
+            getAttachment(actorId, derivedFromAttachmentId),
+        ]);
+        if (!payload || !source
+            || payload.owner_actor_id !== source.owner_actor_id
+            || payload.group_id !== source.group_id) {
+            throw new Error("PAYLOAD_NOT_FOUND_OR_NOT_AUTHORIZED");
+        }
+    } else if (derivedFromPayloadId !== undefined) {
+        throw new Error("PAYLOAD_DERIVATION_SOURCE_INVALID");
+    }
+    const linked = await linkAttachmentToContext(actorId, attachmentId, contextId, role, 0, undefined, undefined, derivedFromAttachmentId);
+    if (!linked) return null;
+    return { ...linked, payload_id: payloadId, role, derived_from_payload_id: derivedFromPayloadId ?? null };
 }
 
 function validateUploadMetadata(filename: string, mediaType: string, size: number, sha256: string) {
@@ -428,8 +473,8 @@ export async function finalizeAttachmentUpload(actorId: number, uploadId: string
         const inserted = await client.query<AttachmentRow>(
             `INSERT INTO attachments (
                 id, original_filename, media_type, size_bytes, sha256, storage_key,
-                owner_actor_id, group_id, created_by_actor_id
-             ) VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$8)
+                owner_actor_id, group_id, created_by_actor_id, payload_external_id
+             ) VALUES ($1::uuid,$2,$3,$4,$5,$5,$6,$7,$8,'payload:artifact:' || $1::text || ':v1')
              RETURNING *`,
             [upload.id, upload.original_filename, upload.media_type, verified.size, verified.sha256,
                 upload.owner_actor_id, upload.group_id, upload.created_by_actor_id],
@@ -492,13 +537,15 @@ export async function linkAttachmentToContext(
     sortOrder = 0,
     pageStart?: number,
     pageEnd?: number,
+    derivedFromAttachmentId?: string,
 ) {
     await initializeDatabase();
     const result = await db.query(
         `INSERT INTO context_attachments (
-            context_id, attachment_id, relationship, sort_order, page_start, page_end, created_by_actor_id
+            context_id, attachment_id, relationship, sort_order, page_start, page_end,
+            created_by_actor_id, derived_from_attachment_id
          )
-         SELECT contexts.id, attachments.id, $4, $5, $6, $7, $2
+         SELECT contexts.id, attachments.id, $4, $5, $6, $7, $2, $8
          FROM contexts, attachments
          WHERE contexts.id = $1 AND attachments.id = $3
            AND (
@@ -515,9 +562,12 @@ export async function linkAttachmentToContext(
                  ))
            )
          ON CONFLICT (context_id, attachment_id, relationship) DO UPDATE
-         SET sort_order = EXCLUDED.sort_order, page_start = EXCLUDED.page_start, page_end = EXCLUDED.page_end
-         RETURNING context_id, attachment_id, relationship, sort_order, page_start, page_end`,
-        [contextId, actorId, attachmentId, relationship, sortOrder, pageStart ?? null, pageEnd ?? null],
+         SET sort_order = EXCLUDED.sort_order, page_start = EXCLUDED.page_start,
+             page_end = EXCLUDED.page_end, derived_from_attachment_id = EXCLUDED.derived_from_attachment_id
+         RETURNING context_id, attachment_id, relationship, sort_order, page_start, page_end,
+                   derived_from_attachment_id`,
+        [contextId, actorId, attachmentId, relationship, sortOrder, pageStart ?? null, pageEnd ?? null,
+            derivedFromAttachmentId ?? null],
     );
     return result.rows[0] ?? null;
 }
@@ -526,11 +576,15 @@ export async function listContextAttachments(actorId: number, contextId: number)
     await initializeDatabase();
     const result = await db.query<AttachmentRow & {
         relationship: AttachmentRelationship; sort_order: number; page_start: number | null; page_end: number | null;
+        derived_from_payload_id: string | null;
     }>(
         `SELECT attachments.*, context_attachments.relationship, context_attachments.sort_order,
-                context_attachments.page_start, context_attachments.page_end
+                context_attachments.page_start, context_attachments.page_end,
+                derived_payload.payload_external_id AS derived_from_payload_id
          FROM context_attachments
          INNER JOIN attachments ON attachments.id = context_attachments.attachment_id
+         LEFT JOIN attachments AS derived_payload
+           ON derived_payload.id = context_attachments.derived_from_attachment_id
          WHERE context_attachments.context_id = $1 AND ${attachmentAccessSql}
          ORDER BY context_attachments.sort_order, attachments.id`,
         [contextId, actorId, "read"],
@@ -541,6 +595,7 @@ export async function listContextAttachments(actorId: number, contextId: number)
         sort_order: row.sort_order,
         page_start: row.page_start,
         page_end: row.page_end,
+        derived_from_payload_id: row.derived_from_payload_id,
     }));
 }
 

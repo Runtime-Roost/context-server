@@ -186,6 +186,12 @@ every save:
     "external_id": "actor:eden",
     "name": "Eden",
     "kind": "ai"
+  },
+  "subject": {
+    "external_id": "subject:project:context-server",
+    "name": "Context Server",
+    "kind": "project",
+    "aliases": ["personal context server"]
   }
 }
 ```
@@ -205,6 +211,123 @@ requires attribution without choosing the actor for the model.
 
 Existing databases upgrade through the transactional `schema_migrations`
 ledger. Existing contexts are not backfilled and remain `actor: null`.
+
+### Knowledge subjects
+
+Contexts may optionally reference a canonical subject describing what the
+knowledge is about. Subject IDs use a separate lowercase `subject:` namespace,
+for example `subject:project:context-server`. A subject has a stable external
+ID, canonical name, optional kind, and optional retrieval aliases.
+
+Subjects are classification metadata, not principals: they never grant
+ownership, authentication, visibility, or access. The `actor` remains who
+created or owns a record under the applicable visibility contract. OpenAI
+tunnel subject values are authentication-local metadata and must not be copied
+into knowledge-subject IDs.
+
+Migration 19 adds `subjects` and nullable `contexts.subject_id`. Existing rows
+intentionally remain unclassified (`subject: null`); no subject is inferred
+from actor, content, tags, or tunnel identity. New records can supply `subject`
+when saved, and existing Whiteboard or personal records can be explicitly
+backfilled through their existing update tools. Text retrieval matches the
+subject ID, canonical name, kind, and aliases while preserving the original
+visibility and actor-ownership predicates.
+
+### Immutable context payloads
+
+Migration 20 creates versioned `context_payloads` rows for every context. Each
+payload has a stable pointer, type (`text`), media type, byte size, version, and
+immutable body. Existing text becomes payload version 1. Replacing context text
+creates a new version; previous versions remain, direct payload updates are
+rejected, and deleting the context cascades all payload versions.
+
+Context envelopes return `payload_ref` metadata. Search and list responses carry
+at most a 500-character preview so an agent can decide whether an exact read is
+worthwhile; exact `get_*` operations hydrate the complete text behind the same
+visibility and actor-authorization checks. `contexts.content` remains a
+compatibility mirror in this migration slice. These payload records provide the
+indirection point for later image, document, OCR, transcript, and embedding
+storage without changing context-envelope identity.
+
+### Context connections
+
+Migration 21 adds directed, typed connections between context envelopes. A
+connection records a normalized relationship such as `led_to`, `supports`,
+`contradicts`, or `supersedes`, an optional bounded rationale explaining why the
+edge exists, and the authenticated actor that created it. Exact reads and
+search/list envelopes expose connections from both directions with the other
+context ID; they do not hydrate the other payload automatically.
+
+Connections are semantic metadata, not capabilities. Both endpoints must be in
+the same visibility scope: Whiteboard with Whiteboard, the same personal owner,
+the same channel, or the same access group. The creator must have write access
+to that scope. Direct, system, archived, cross-owner, and cross-scope edges are
+rejected in this slice, and unauthorized callers receive the same not-found
+boundary as missing contexts. The full administrative MCP surface exposes
+`connect_contexts` and `disconnect_contexts`; the bounded conversation catalog
+does not add new tool definitions in this slice.
+
+### Relevance and lifecycle metadata
+
+Migration 22 gives every context an explicit lifecycle envelope: `active`,
+`warm`, `cold`, or `archive_candidate`; bounded importance from 0–100; retrieval
+count and last-retrieved time; optional completion time; and an optional
+same-scope successor. Existing records start active at neutral importance 50.
+These fields are signals rather than authority and do not themselves archive,
+delete, pin, expose, or hydrate anything.
+
+The authenticated full-surface `update_context_lifecycle` tool may change these
+signals only when the actor has write access to the context. Supersession must
+point to a context in the same visibility/ownership scope, so lifecycle metadata
+cannot reveal or bridge into a hidden journal, channel, or group.
+
+### Reviewed auto-archive
+
+Migration 23 adds durable, expiring archive previews and per-record evaluation
+receipts. `preview_auto_archive` evaluates only cold/candidate Whiteboard notes;
+it never archives by itself. Eligibility conservatively requires explicit
+`archive_candidate` state, low importance, minimum age, completion or a
+same-scope successor, no active inbound reference, no bridge position, no agent
+inbox tag, and no protected tag. Protected tags default to `archive:never`,
+`reference`, `canonical`, and `active-project` and are configurable through
+`AUTO_ARCHIVE_PROTECTED_TAGS`.
+
+`confirm_auto_archive` consumes one actor-bound 15-minute preview and archives
+only an explicitly selected eligible subset. It rechecks candidate state inside
+the transaction, writes ordinary reversible archive history, and never deletes
+payloads or graph edges. A changed, expired, replayed, foreign, or expanded
+selection fails closed.
+
+### Bounded retrieval assembly
+
+`assemble_context` authenticates the active OpenAI tunnel actor, finds lexical
+seed envelopes only inside that actor's readable Whiteboard, personal, channel,
+and group scopes, and restores one hop of authorized graph topology. Archived
+Whiteboard records are excluded from ordinary seed search and may surface only
+as connected nodes. Direct and system records are never assembled.
+
+Assembly ranks lifecycle importance, returns at most 20 envelopes, hydrates at
+most five payload bodies, limits all remaining nodes to 500-character previews,
+and enforces a total content-character budget. Results explain whether each node
+was a seed or graph expansion and update retrieval counters/timestamps. To keep
+the conversation catalog below 25,000 serialized characters, this tool replaces
+ordinary Whiteboard acknowledgement on that surface; `acknowledge_context`
+remains available on the full administrative surface.
+
+### Actor-only context boundary
+
+Context-bearing MCP operations now require an authenticated actor by default,
+including Whiteboard save/search/exact reads, recent/profile reads, database
+metadata, acknowledgement, update/delete, and purge operations. Authentication
+bootstrap (`request_actor_session`, status/claim/binding flows) remains separate
+and does not read protected context. The trusted OpenAI path derives the author
+from the bound local actor session; any caller-supplied `actor` object is ignored
+for authority and cannot replace the authenticated principal.
+
+`REQUIRE_CONTEXT_AUTHENTICATION=false` exists only for isolated legacy test
+fixtures and should not be set in deployed services. Subjects, mentions,
+connections, lifecycle fields, payload references, and tags remain inert
+metadata: none can authenticate, grant membership, or widen visibility.
 
 ### Whiteboard visibility
 
@@ -278,6 +401,24 @@ Uploads use an integrity-checked sequence:
 3. `finalize_attachment_upload` verifies length and SHA-256 before atomically
    publishing immutable bytes.
 
+For new integrations, the payload-first aliases keep large artifact transfer
+separate from knowledge metadata:
+
+1. `begin_payload_upload` and `append_payload_chunk` stage bytes without creating
+   or modifying a context envelope.
+2. `finalize_payload_upload` verifies the bytes and returns an immutable
+   `payload:artifact:<uuid>:v1` reference with server-derived media type, size,
+   and SHA-256 metadata.
+3. `attach_payload_to_context` applies that finalized reference afterward with
+   a `canonical`, `source`, `derived`, or `reference` role. Derived payloads must
+   name a distinct, authorized payload in the same personal or group scope;
+   lineage is committed atomically with the link and returned by
+   `list_context_attachments`.
+
+These upload tools deliberately remain on the full administrative surface, not
+the bounded conversation catalog. The established attachment tools remain as
+compatibility APIs and resolve to the same immutable payload records.
+
 Unfinished uploads expire after 24 hours and are pruned when a new upload
 begins. `cancel_attachment_upload` removes one immediately.
 
@@ -299,7 +440,7 @@ them. Missing and unauthorized attachment IDs both return `null`.
 
 `link_attachment_to_context` deliberately permits only exact scope matches:
 personal attachment to the same actor's personal context, or group attachment
-to a context owned by the same group. Links record `source`, `derived`, or
+to a context owned by the same group. Links record `canonical`, `source`, `derived`, or
 `reference` relationships, stable sort order, and optional inclusive page
 ranges. `list_context_attachments` reads those links through the same attachment
 authorization boundary. Original filenames are metadata only; generated UUIDs

@@ -17,6 +17,7 @@ import {
 import {
     ACCESS_GROUP_ROLE_VALUES,
     CHANNEL_ROLE_VALUES,
+    CONTEXT_LIFECYCLE_STATE_VALUES,
     SEARCH_SENSITIVITY_VALUES,
     type ContextRecord,
     WRITABLE_CONTEXT_VISIBILITY_VALUES,
@@ -24,14 +25,18 @@ import {
     acknowledgeDirectContext,
     actorPurgeConfirm,
     actorPurgePreview,
+    assembleContext,
     addAccessGroupMember,
     addChannelMember,
     createChannel,
     createAccessGroup,
+    connectContexts,
+    confirmAutoArchive,
     deleteContext,
     deleteChannelContext,
     deletePersonalContext,
     deleteGroupContext,
+    disconnectContexts,
     contextPurgeConfirm,
     contextPurgePreview,
     getContext,
@@ -49,6 +54,7 @@ import {
     listPersonalContext,
     listActorAccessGroups,
     listGroupContext,
+    previewAutoArchive,
     removeAccessGroupMember,
     removeChannelMember,
     saveContextWithActor,
@@ -64,6 +70,7 @@ import {
     updateChannelContext,
     updatePersonalContext,
     updateGroupContext,
+    updateContextLifecycle,
     vacuumDatabase,
 } from "./tools.js";
 import {
@@ -77,13 +84,14 @@ import {
     getAttachment,
     getAttachmentQuota,
     linkAttachmentToContext,
+    linkPayloadToContext,
     listAttachments,
     listContextAttachments,
     readAttachmentChunk,
 } from "../storage/attachments.js";
 
 const DEFAULT_CONTEXT_RESULT_LIMIT = 5;
-const MAX_CONTEXT_RESULT_CONTENT_CHARS = 8_000;
+const MAX_CONTEXT_RESULT_CONTENT_CHARS = 500;
 const MAX_CONTEXT_RESULT_PAYLOAD_CHARS = 24_000;
 const LIST_CONTEXT_EXCERPT_CHARS = 500;
 
@@ -166,6 +174,12 @@ const requestAuthSchema = z.union([
     signedRequestAuthSchema,
     actorSessionAuthSchema,
 ]);
+const subjectIdentitySchema = z.object({
+    external_id: z.string().regex(/^subject:[a-z0-9][a-z0-9:_-]*$/),
+    name: z.string().min(1).max(500),
+    kind: z.string().min(1).max(100).optional(),
+    aliases: z.array(z.string().min(1).max(500)).max(100).optional(),
+});
 
 function authenticationError(error: unknown, safeDetails?: { actor_external_id?: string }) {
     const candidate = error instanceof Error ? error.message : "AUTHENTICATION_FAILED";
@@ -190,6 +204,22 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "ATTACHMENT_SCOPE_INVALID",
         "ATTACHMENT_QUOTA_EXCEEDED",
         "ATTACHMENT_QUOTA_CONFIG_INVALID",
+        "CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED",
+        "CONTEXT_CONNECTION_SCOPE_MISMATCH",
+        "CONTEXT_CONNECTION_RELATIONSHIP_INVALID",
+        "CONTEXT_CONNECTION_RATIONALE_INVALID",
+        "CONTEXT_CONNECTION_SELF_REFERENCE",
+        "CONTEXT_LIFECYCLE_UPDATE_REQUIRED",
+        "CONTEXT_IMPORTANCE_INVALID",
+        "CONTEXT_SUPERSESSION_SELF_REFERENCE",
+        "AUTO_ARCHIVE_SELECTION_INVALID",
+        "AUTO_ARCHIVE_PREVIEW_INVALID",
+        "AUTO_ARCHIVE_CANDIDATE_CHANGED",
+        "CONTEXT_ASSEMBLY_QUERY_REQUIRED",
+        "PAYLOAD_REFERENCE_INVALID",
+        "PAYLOAD_DERIVATION_SOURCE_REQUIRED",
+        "PAYLOAD_DERIVATION_SOURCE_INVALID",
+        "PAYLOAD_NOT_FOUND_OR_NOT_AUTHORIZED",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -244,6 +274,20 @@ async function authenticateTool(
     return authenticateOpenAITunnelActorSession(openAITunnelIdentity(extra));
 }
 
+function requireContextAuthentication() {
+    return process.env.REQUIRE_CONTEXT_AUTHENTICATION?.trim().toLowerCase() !== "false";
+}
+
+async function authenticateContextTool(
+    tool: string,
+    payload: Record<string, unknown>,
+    extra?: { _meta?: Record<string, unknown> },
+) {
+    return requireContextAuthentication()
+        ? authenticateTool(tool, payload, undefined, extra)
+        : null;
+}
+
 function openAITunnelIdentity(extra?: { _meta?: Record<string, unknown> }) {
     if (process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() !== "true") {
         throw new Error("AUTHENTICATION_REQUIRED");
@@ -290,8 +334,8 @@ const CONVERSATION_TOOL_NAMES = new Set([
     "get_actor_session_request_status",
     "save_context",
     "search_context",
+    "assemble_context",
     "get_context",
-    "acknowledge_context",
     "save_channel_context",
     "search_channel_context",
     "get_channel_context",
@@ -317,6 +361,11 @@ function applyToolSurface(server: McpServer, surface: ContextServerSurface) {
 
 export function createServer(options: { surface?: ContextServerSurface } = {}) {
     const actorSession = new ActiveActorSession();
+    const personalAuthSchema = options.surface === "conversation"
+        ? z.never().optional().describe("Authentication is supplied by the trusted conversation binding.")
+        : requestAuthSchema.optional().describe(
+            "Authentication using either an enrolled-key signature or an operator-approved actor session.",
+        );
     const server = new McpServer({
         name: "personal-context-server",
         version: "0.1.0",
@@ -580,22 +629,31 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
     server.registerTool(
         "save_context",
         {
-            description: "Save personal context for later retrieval. Include actor on every save unless identify_actor succeeded in this same persistent MCP session. If session continuity is uncertain, always include actor. Actor identifies who synthesized the memory; source identifies where the information came from.",
+            description: "Save shared Whiteboard context. Actor is the author, source is provenance, and subject is the optional topic.",
             inputSchema: {
                 text: z.string().min(1).describe("The context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags for grouping or filtering the context."),
                 source: z.string().optional().describe("Optional source describing where the context came from."),
                 visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Visibility classification. Only whiteboard is writable through this general tool; authenticated channel, personal, and access-group records use dedicated tools, while direct and system records remain staged."),
                 actor: z.object({
-                    external_id: z.string().min(1).describe("Stable operational actor ID, such as actor:openai:codex. Required for self-contained saves so reconnecting clients do not create duplicate anonymous actors."),
+                    external_id: z.string().min(1).describe("Stable actor ID, such as actor:openai:codex."),
                     name: z.string().min(1).describe("Actor display name."),
                     kind: z.string().min(1).optional().describe("Optional actor category, such as ai or human."),
-                    metadata: z.record(z.string(), z.unknown()).optional().describe("Optional actor metadata. Model version, client, and execution lineage belong here rather than in external_id."),
-                }).optional().describe("Explicit actor identity for this save. Takes precedence over the session-active actor and survives clients that reconnect between tool calls."),
+                    metadata: z.record(z.string(), z.unknown()).optional().describe("Optional non-identity actor metadata."),
+                }).optional().describe("Explicit author identity; overrides the session actor."),
+                subject: subjectIdentitySchema.optional().describe("Optional topic; never grants access."),
             },
         },
-        async ({ text, tags, source, visibility, actor }) => {
-            if (!actor && actorSession.actorId === null && requireActorIdentificationEnabled()) {
+        async ({ text, tags, source, visibility, actor, subject }, extra) => {
+            let authenticated;
+            try {
+                authenticated = await authenticateContextTool("save_context", { text, tags, source, visibility, subject }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
+            const effectiveActor = authenticated ? undefined : actor;
+            const effectiveActorId = authenticated?.actor_id ?? actorSession.actorId;
+            if (!authenticated && !actor && actorSession.actorId === null && requireActorIdentificationEnabled()) {
                 return {
                     isError: true,
                     content: [
@@ -626,9 +684,10 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 text,
                 tags,
                 source,
-                actor,
-                actorSession.actorId,
+                effectiveActor,
+                effectiveActorId,
                 visibility,
+                subject,
             );
 
             if (saved.context.actor) {
@@ -661,6 +720,9 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                             ...(saved.actor_resolution
                                 ? { actor_resolution: saved.actor_resolution }
                                 : {}),
+                            ...(saved.subject_resolution
+                                ? { subject_resolution: saved.subject_resolution }
+                                : {}),
                             ...(warning ? { warning } : {}),
                         }),
                     },
@@ -687,7 +749,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
             },
         },
-        async ({ query, limit, sensitivity, actor_external_id }) => {
+        async ({ query, limit, sensitivity, actor_external_id }, extra) => {
+            try {
+                await authenticateContextTool("search_context", { query, limit, sensitivity, actor_external_id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const selectedSensitivity = sensitivity ?? "high";
             const results = await searchContext(query, limit, selectedSensitivity, actor_external_id);
             const projected = projectContextResults(results, "search");
@@ -710,6 +777,32 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
     );
 
     server.registerTool(
+        "assemble_context",
+        {
+            description: "Build a bounded authenticated context pack from matching envelopes plus one-hop graph neighbors, hydrating only a few selected payloads.",
+            annotations: { title: "Assemble Context", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+            inputSchema: {
+                query: z.string().min(1).max(2000),
+                limit: z.number().int().min(1).max(20).optional(),
+                hydrate_limit: z.number().int().min(0).max(5).optional(),
+                max_content_chars: z.number().int().min(1000).max(48000).optional(),
+            },
+        },
+        async ({ query, limit, hydrate_limit, max_content_chars }, extra) => {
+            const payload = { query, limit, hydrate_limit, max_content_chars };
+            try {
+                const authenticated = await authenticateTool("assemble_context", payload, undefined, extra);
+                const assembly = await assembleContext(authenticated.actor_id, query, {
+                    limit, hydrateLimit: hydrate_limit, maxContentChars: max_content_chars,
+                });
+                return { content: [{ type: "text", text: JSON.stringify({ assembly }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
         "get_user_profile",
         {
             description: "Read the local shared Whiteboard notes explicitly tagged profile, plus the local OS username. This does not modify data or contact external services.",
@@ -721,7 +814,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 openWorldHint: false,
             },
         },
-        async () => {
+        async (extra) => {
+            try {
+                await authenticateContextTool("get_user_profile", {}, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const profile = await getUserProfile();
 
             return {
@@ -751,7 +849,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
             },
         },
-        async ({ limit, actor_external_id }) => {
+        async ({ limit, actor_external_id }, extra) => {
+            try {
+                await authenticateContextTool("list_recent_context", { limit, actor_external_id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const results = await listRecentContext(limit, actor_external_id);
             const projected = projectContextResults(results, "list");
 
@@ -1338,11 +1441,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 text: z.string().min(1).describe("Context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags."),
                 source: z.string().optional().describe("Optional provenance source."),
+                subject: subjectIdentitySchema.optional(),
                 auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
             },
         },
-        async ({ group, text, tags, source, auth }, extra) => {
-            const payload = { group, text, tags, source };
+        async ({ group, text, tags, source, subject, auth }, extra) => {
+            const payload = { group, text, tags, source, subject };
 
             try {
                 const authenticated = await authenticateTool("save_group_context", payload, auth, extra);
@@ -1352,6 +1456,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     text,
                     tags,
                     source,
+                    subject,
                 );
                 return {
                     content: [{ type: "text", text: JSON.stringify({ saved }) }],
@@ -1542,11 +1647,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 text: z.string().min(1).describe("Context text to save."),
                 tags: z.array(z.string()).optional().describe("Optional tags."),
                 source: z.string().optional().describe("Optional provenance source."),
-                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+                subject: subjectIdentitySchema.optional().describe("Optional topic; actor remains owner."),
+                auth: personalAuthSchema,
             },
         },
-        async ({ text, tags, source, auth }, extra) => {
-            const payload = { text, tags, source };
+        async ({ text, tags, source, subject, auth }, extra) => {
+            const payload = { text, tags, source, subject };
 
             try {
                 const authenticated = await authenticateTool("save_personal_context", payload, auth, extra);
@@ -1555,6 +1661,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     text,
                     tags,
                     source,
+                    subject,
                 );
                 return {
                     content: [{
@@ -1583,7 +1690,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 query: z.string().min(1).describe("Search query."),
                 limit: z.number().int().positive().optional().describe("Maximum result count."),
                 sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness."),
-                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+                auth: personalAuthSchema,
             },
         },
         async ({ query, limit, sensitivity, auth }, extra) => {
@@ -1695,7 +1802,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
             },
             inputSchema: {
                 id: z.number().int().positive().describe("Exact context ID."),
-                auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
+                auth: personalAuthSchema,
             },
         },
         async ({ id, auth }, extra) => {
@@ -1737,11 +1844,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 text: z.string().min(1).optional().describe("Optional replacement text."),
                 tags: z.array(z.string()).optional().describe("Optional replacement tags."),
                 source: z.string().optional().describe("Optional replacement source."),
+                subject: subjectIdentitySchema.optional().describe("Optional canonical subject used to classify or backfill this private record. Actor ownership is unchanged."),
                 auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
             },
         },
-        async ({ id, text, tags, source, auth }, extra) => {
-            const payload = { id, text, tags, source };
+        async ({ id, text, tags, source, subject, auth }, extra) => {
+            const payload = { id, text, tags, source, subject };
 
             try {
                 const authenticated = await authenticateTool("update_personal_context", payload, auth, extra);
@@ -1751,6 +1859,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                     text,
                     tags,
                     source,
+                    subject,
                 );
                 return {
                     content: [{
@@ -1803,7 +1912,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 openWorldHint: false,
             },
         },
-        async () => {
+        async (extra) => {
+            try {
+                await authenticateContextTool("database_metadata", {}, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const metadata = await getDatabaseMetadata();
 
             return {
@@ -1832,7 +1946,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 id: z.number().int().positive().describe("The id of the context item to retrieve."),
             },
         },
-        async ({ id }) => {
+        async ({ id }, extra) => {
+            try {
+                await authenticateContextTool("get_context", { id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const context = await getContext(id);
 
             return {
@@ -1847,6 +1966,154 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 ],
             };
         }
+    );
+
+    server.registerTool(
+        "connect_contexts",
+        {
+            description: "Create an authenticated directed knowledge edge between two contexts in the same visibility scope. The relationship and rationale describe meaning and grant no access.",
+            annotations: {
+                title: "Connect Contexts",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                source_context_id: z.number().int().positive().describe("Context where the directed relationship starts."),
+                target_context_id: z.number().int().positive().describe("Context where the directed relationship points."),
+                relationship: z.string().regex(/^[a-z][a-z0-9:_-]{0,63}$/).describe("Stable lowercase relationship type, such as led_to, supports, contradicts, or supersedes."),
+                rationale: z.string().min(1).max(2000).optional().describe("Optional bounded explanation of why the contexts are connected."),
+                auth: requestAuthSchema.optional().describe("Authenticated edge creator."),
+            },
+        },
+        async ({ source_context_id, target_context_id, relationship, rationale, auth }, extra) => {
+            const payload = { source_context_id, target_context_id, relationship, rationale };
+            try {
+                const authenticated = await authenticateTool("connect_contexts", payload, auth, extra);
+                const context = await connectContexts(
+                    authenticated.actor_id,
+                    source_context_id,
+                    target_context_id,
+                    relationship,
+                    rationale,
+                );
+                return { content: [{ type: "text", text: JSON.stringify({ context }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "disconnect_contexts",
+        {
+            description: "Remove one authenticated context edge by its exact connection ID without deleting either context.",
+            annotations: {
+                title: "Disconnect Contexts",
+                readOnlyHint: false,
+                destructiveHint: true,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                connection_id: z.number().int().positive().describe("Exact connection ID returned in a context envelope."),
+                auth: requestAuthSchema.optional().describe("Authenticated actor with write access to the connection scope."),
+            },
+        },
+        async ({ connection_id, auth }, extra) => {
+            const payload = { connection_id };
+            try {
+                const authenticated = await authenticateTool("disconnect_contexts", payload, auth, extra);
+                const context = await disconnectContexts(authenticated.actor_id, connection_id);
+                return { content: [{ type: "text", text: JSON.stringify({ connection_id, disconnected: true, context }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "update_context_lifecycle",
+        {
+            description: "Update authenticated relevance and lifecycle metadata without changing context content or authority.",
+            annotations: {
+                title: "Update Context Lifecycle",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+            },
+            inputSchema: {
+                context_id: z.number().int().positive(),
+                state: z.enum(CONTEXT_LIFECYCLE_STATE_VALUES).optional(),
+                importance: z.number().int().min(0).max(100).optional(),
+                completed: z.boolean().optional().describe("Set or clear the completion timestamp."),
+                superseded_by_context_id: z.number().int().positive().nullable().optional().describe("Same-scope successor context, or null to clear."),
+                auth: requestAuthSchema.optional().describe("Authenticated actor with write access to the context scope."),
+            },
+        },
+        async ({ context_id, state, importance, completed, superseded_by_context_id, auth }, extra) => {
+            const payload = { context_id, state, importance, completed, superseded_by_context_id };
+            try {
+                const authenticated = await authenticateTool("update_context_lifecycle", payload, auth, extra);
+                const context = await updateContextLifecycle(authenticated.actor_id, context_id, {
+                    state,
+                    importance,
+                    completed,
+                    supersededByContextId: superseded_by_context_id,
+                });
+                return { content: [{ type: "text", text: JSON.stringify({ context }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "preview_auto_archive",
+        {
+            description: "Evaluate cold Whiteboard records under the conservative protected-tag and graph-safety policy. This never archives by itself.",
+            annotations: { title: "Preview Auto Archive", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+            inputSchema: {
+                limit: z.number().int().min(1).max(100).optional(),
+                minimum_age_days: z.number().int().min(1).max(3650).optional(),
+                auth: requestAuthSchema.optional().describe("Authenticated reviewer."),
+            },
+        },
+        async ({ limit, minimum_age_days, auth }, extra) => {
+            const payload = { limit, minimum_age_days };
+            try {
+                const authenticated = await authenticateTool("preview_auto_archive", payload, auth, extra);
+                const preview = await previewAutoArchive(authenticated.actor_id, limit, minimum_age_days);
+                return { content: [{ type: "text", text: JSON.stringify({ preview }) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
+    );
+
+    server.registerTool(
+        "confirm_auto_archive",
+        {
+            description: "Archive an explicitly selected subset from one unexpired reviewed preview. Archival is reversible and never deletes payloads or graph edges.",
+            annotations: { title: "Confirm Auto Archive", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+            inputSchema: {
+                confirmation_token: z.string().uuid(),
+                context_ids: z.array(z.number().int().positive()).min(1).max(100),
+                auth: requestAuthSchema.optional().describe("Same authenticated reviewer who created the preview."),
+            },
+        },
+        async ({ confirmation_token, context_ids, auth }, extra) => {
+            const payload = { confirmation_token, context_ids };
+            try {
+                const authenticated = await authenticateTool("confirm_auto_archive", payload, auth, extra);
+                const result = await confirmAutoArchive(authenticated.actor_id, confirmation_token, context_ids);
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            } catch (error) {
+                return authenticationError(error);
+            }
+        },
     );
 
     server.registerTool(
@@ -1870,8 +2137,14 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 openWorldHint: false,
             },
         },
-        async ({ context_id, actor }) => {
-            if (!actor && actorSession.actorId === null) {
+        async ({ context_id, actor }, extra) => {
+            let authenticated;
+            try {
+                authenticated = await authenticateContextTool("acknowledge_context", { context_id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
+            if (!authenticated && !actor && actorSession.actorId === null) {
                 return {
                     isError: true,
                     content: [{
@@ -1897,8 +2170,8 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
             }
             const result = await acknowledgeContextWithActor(
                 context_id,
-                actor,
-                actorSession.actorId,
+                authenticated ? undefined : actor,
+                authenticated?.actor_id ?? actorSession.actorId,
             );
             if (result.actor) actorSession.activate(result.actor.id);
             return {
@@ -1925,7 +2198,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 id: z.number().int().positive().describe("The id of the context item to delete."),
             },
         },
-        async ({ id }) => {
+        async ({ id }, extra) => {
+            try {
+                await authenticateContextTool("delete_context", { id }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const deleted = await deleteContext(id);
 
             return {
@@ -1952,10 +2230,16 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 tags: z.array(z.string()).optional().describe("Optional replacement tags."),
                 source: z.string().optional().describe("Optional replacement source."),
                 visibility: z.enum(WRITABLE_CONTEXT_VISIBILITY_VALUES).optional().describe("Optional replacement visibility. Only whiteboard is currently writable."),
+                subject: subjectIdentitySchema.optional().describe("Optional canonical subject used to classify or backfill this record. Actor attribution is unchanged."),
             },
         },
-        async ({ id, text, tags, source, visibility }) => {
-            const updated = await updateContext(id, text, tags, source, visibility);
+        async ({ id, text, tags, source, visibility, subject }, extra) => {
+            try {
+                await authenticateContextTool("update_context", { id, text, tags, source, visibility, subject }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
+            const updated = await updateContext(id, text, tags, source, visibility, subject);
 
             return {
                 content: [
@@ -1979,7 +2263,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 before: z.string().min(1).describe("Delete preview cutoff. Context items created before this date or timestamp are counted."),
             },
         },
-        async ({ before }) => {
+        async ({ before }, extra) => {
+            try {
+                await authenticateContextTool("context_purge_preview", { before }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const preview = await contextPurgePreview(before);
 
             return {
@@ -2003,7 +2292,12 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 expected_count: z.number().int().nonnegative().describe("Matched count returned by context_purge_preview."),
             },
         },
-        async ({ before, confirmation_token, expected_count }) => {
+        async ({ before, confirmation_token, expected_count }, extra) => {
+            try {
+                await authenticateContextTool("context_purge_confirm", { before, confirmation_token, expected_count }, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const purge = await contextPurgeConfirm(before, confirmation_token, expected_count);
 
             return {
@@ -2061,6 +2355,92 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 ],
             };
         }
+    );
+
+    server.registerTool(
+        "begin_payload_upload",
+        {
+            description: "Reserve an authenticated staged upload and return an expiring upload ID. No context metadata is created yet.",
+            inputSchema: {
+                scope: z.enum(ATTACHMENT_SCOPE_VALUES),
+                group: z.string().min(3).max(64).optional(),
+                filename: z.string().min(1).max(500),
+                media_type: z.string().min(3).max(200),
+                expected_size_bytes: z.number().int().nonnegative(),
+                expected_sha256: z.string().regex(/^[0-9a-fA-F]{64}$/),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ scope, group, filename, media_type, expected_size_bytes, expected_sha256, auth }, extra) => {
+            const payload = { scope, group, filename, media_type, expected_size_bytes, expected_sha256 };
+            try {
+                const actor = await authenticateTool("begin_payload_upload", payload, auth, extra);
+                const upload = await beginAttachmentUpload(actor.actor_id, scope, filename, media_type, expected_size_bytes, expected_sha256, group);
+                return { content: [{ type: "text", text: JSON.stringify({ upload }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "append_payload_chunk",
+        {
+            description: "Append one bounded base64 chunk to a staged payload upload at an exact offset.",
+            inputSchema: {
+                upload_id: z.string().uuid(),
+                offset: z.number().int().nonnegative(),
+                data_base64: z.string().min(1),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ upload_id, offset, data_base64, auth }, extra) => {
+            const payload = { upload_id, offset, data_base64 };
+            try {
+                const actor = await authenticateTool("append_payload_chunk", payload, auth, extra);
+                const upload = await appendAttachmentChunk(actor.actor_id, upload_id, offset, data_base64);
+                return { content: [{ type: "text", text: JSON.stringify({ upload }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "finalize_payload_upload",
+        {
+            description: "Verify a complete staged upload and return its immutable payload reference before any envelope metadata is applied.",
+            inputSchema: {
+                upload_id: z.string().uuid(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ upload_id, auth }, extra) => {
+            const payload = { upload_id };
+            try {
+                const actor = await authenticateTool("finalize_payload_upload", payload, auth, extra);
+                const artifact = await finalizeAttachmentUpload(actor.actor_id, upload_id);
+                return { content: [{ type: "text", text: JSON.stringify({ payload_ref: artifact.payload_ref }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "attach_payload_to_context",
+        {
+            description: "Attach one finalized immutable payload reference to an existing same-scope context with a semantic role and optional derivation lineage.",
+            inputSchema: {
+                context_id: z.number().int().positive(),
+                payload_id: z.string().regex(/^payload:artifact:[0-9a-fA-F-]{36}:v1$/),
+                role: z.enum(ATTACHMENT_RELATIONSHIP_VALUES),
+                derived_from_payload_id: z.string().regex(/^payload:artifact:[0-9a-fA-F-]{36}:v1$/).optional(),
+                auth: requestAuthSchema.optional(),
+            },
+        },
+        async ({ context_id, payload_id, role, derived_from_payload_id, auth }, extra) => {
+            const payload = { context_id, payload_id, role, derived_from_payload_id };
+            try {
+                const actor = await authenticateTool("attach_payload_to_context", payload, auth, extra);
+                const link = await linkPayloadToContext(actor.actor_id, payload_id, context_id, role, derived_from_payload_id);
+                return { content: [{ type: "text", text: JSON.stringify({ link }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
     );
 
     server.registerTool(

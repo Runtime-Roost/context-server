@@ -15,9 +15,60 @@ export type ContextRecord = {
     source: string | null;
     tags: string[];
     actor: ActorRecord | null;
+    subject: SubjectRecord | null;
+    payload_ref: ContextPayloadReference | null;
+    connections: ContextConnection[];
+    lifecycle: ContextLifecycle;
     acknowledged_by: ContextAcknowledgement[];
     created_at: string;
     updated_at: string;
+};
+
+export const CONTEXT_LIFECYCLE_STATE_VALUES = ["active", "warm", "cold", "archive_candidate"] as const;
+export type ContextLifecycleState = (typeof CONTEXT_LIFECYCLE_STATE_VALUES)[number];
+export type ContextLifecycle = {
+    state: ContextLifecycleState;
+    importance: number;
+    retrieval_count: number;
+    last_retrieved_at: string | null;
+    completed_at: string | null;
+    superseded_by_context_id: number | null;
+    updated_at: string;
+};
+
+export type ContextConnection = {
+    id: number;
+    direction: "outgoing" | "incoming";
+    relationship: string;
+    rationale: string | null;
+    other_context_id: number;
+    created_by: ActorRecord;
+    created_at: string;
+};
+
+export type ContextPayloadReference = {
+    id: string;
+    version: number;
+    kind: "text";
+    media_type: string;
+    size_bytes: number;
+};
+
+export type SubjectRecord = {
+    id: number;
+    external_id: string;
+    name: string;
+    kind: string | null;
+    aliases: string[];
+    created_at: string;
+    updated_at: string;
+};
+
+export type SubjectIdentity = {
+    external_id: string;
+    name: string;
+    kind?: string;
+    aliases?: string[];
 };
 
 export type ContextAcknowledgement = {
@@ -47,6 +98,9 @@ export type ActorIdentity = {
 export type SaveContextResult = {
     context: ContextRecord;
     actor_resolution?: {
+        created: boolean;
+    };
+    subject_resolution?: {
         created: boolean;
     };
 };
@@ -97,7 +151,21 @@ type ContextRow = {
     actor_kind: string | null;
     actor_created_at: string | Date | null;
     actor_last_seen_at: string | Date | null;
+    subject: unknown;
+    payload_ref: unknown;
+    connections?: unknown;
+    lifecycle?: unknown;
     acknowledged_by: unknown;
+    created_at: string | Date;
+    updated_at: string | Date;
+};
+
+type SubjectRow = {
+    id: number | string;
+    external_id: string;
+    name: string;
+    kind: string | null;
+    aliases: string[] | string | null;
     created_at: string | Date;
     updated_at: string | Date;
 };
@@ -317,7 +385,107 @@ function mapContextRow(row: ContextRow): ContextRecord {
                   created_at: normalizeTimestamp(row.actor_created_at!),
                   last_seen_at: normalizeTimestamp(row.actor_last_seen_at!),
               },
+        subject: row.subject ? mapSubjectRow(row.subject as SubjectRow) : null,
+        payload_ref: mapPayloadReference(row.payload_ref),
+        connections: parseContextConnections(row.connections),
+        lifecycle: parseContextLifecycle(row.lifecycle, row.updated_at),
         acknowledged_by: parseAcknowledgements(row.acknowledged_by),
+        created_at: normalizeTimestamp(row.created_at),
+        updated_at: normalizeTimestamp(row.updated_at),
+    };
+}
+
+function parseContextLifecycle(value: unknown, fallbackUpdatedAt: string | Date): ContextLifecycle {
+    const lifecycle = value as Record<string, unknown> | null;
+    return {
+        state: (lifecycle?.state as ContextLifecycleState | undefined) ?? "active",
+        importance: Number(lifecycle?.importance ?? 50),
+        retrieval_count: Number(lifecycle?.retrieval_count ?? 0),
+        last_retrieved_at: lifecycle?.last_retrieved_at
+            ? new Date(lifecycle.last_retrieved_at as string | Date).toISOString()
+            : null,
+        completed_at: lifecycle?.completed_at
+            ? new Date(lifecycle.completed_at as string | Date).toISOString()
+            : null,
+        superseded_by_context_id: lifecycle?.superseded_by_context_id == null
+            ? null
+            : Number(lifecycle.superseded_by_context_id),
+        updated_at: new Date((lifecycle?.updated_at as string | Date | undefined) ?? fallbackUpdatedAt).toISOString(),
+    };
+}
+
+function parseContextConnections(value: unknown): ContextConnection[] {
+    if (!Array.isArray(value)) return [];
+    return value.flatMap((candidate) => {
+        const item = candidate as Record<string, unknown>;
+        const actor = item.created_by as Record<string, unknown> | null;
+        if (!actor || (item.direction !== "outgoing" && item.direction !== "incoming")) return [];
+        return [{
+            id: Number(item.id),
+            direction: item.direction,
+            relationship: String(item.relationship),
+            rationale: typeof item.rationale === "string" ? item.rationale : null,
+            other_context_id: Number(item.other_context_id),
+            created_by: {
+                id: Number(actor.id),
+                external_id: typeof actor.external_id === "string" ? actor.external_id : null,
+                name: typeof actor.name === "string" ? actor.name : "Unknown actor",
+                kind: typeof actor.kind === "string" ? actor.kind : null,
+                created_at: new Date(actor.created_at as string | Date).toISOString(),
+                last_seen_at: new Date(actor.last_seen_at as string | Date).toISOString(),
+            },
+            created_at: new Date(item.created_at as string | Date).toISOString(),
+        }];
+    });
+}
+
+function mapPayloadReference(value: unknown): ContextPayloadReference | null {
+    const payload = value as Record<string, unknown> | null;
+    if (!payload) return null;
+    return {
+        id: String(payload.id),
+        version: Number(payload.version),
+        kind: "text",
+        media_type: String(payload.media_type),
+        size_bytes: Number(payload.size_bytes),
+    };
+}
+
+async function loadCurrentPayloadReference(row: ContextRow, client: PoolClient | typeof db = db) {
+    if (row.payload_ref) return row;
+    const result = await client.query<{ payload_ref: unknown }>(
+        `SELECT jsonb_build_object(
+            'id', id, 'version', version, 'kind', kind,
+            'media_type', media_type, 'size_bytes', size_bytes
+         ) AS payload_ref
+         FROM context_payloads
+         WHERE context_id = $1
+         ORDER BY version DESC
+         LIMIT 1`,
+        [row.id],
+    );
+    row.payload_ref = result.rows[0]?.payload_ref ?? null;
+    return row;
+}
+
+async function loadContextEnvelope(id: number | string) {
+    const result = await db.query<ContextRow>(
+        `SELECT ${CONTEXT_PROJECTION}
+         FROM contexts
+         LEFT JOIN actors ON actors.id = contexts.actor_id
+         WHERE contexts.id = $1`,
+        [id],
+    );
+    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+}
+
+function mapSubjectRow(row: SubjectRow): SubjectRecord {
+    return {
+        id: Number(row.id),
+        external_id: row.external_id,
+        name: row.name,
+        kind: row.kind,
+        aliases: parseTags(row.aliases),
         created_at: normalizeTimestamp(row.created_at),
         updated_at: normalizeTimestamp(row.updated_at),
     };
@@ -345,6 +513,92 @@ const CONTEXT_PROJECTION = `
     contexts.tags,
     contexts.created_at,
     contexts.updated_at,
+    (
+        SELECT jsonb_build_object(
+            'id', subjects.id,
+            'external_id', subjects.external_id,
+            'name', subjects.name,
+            'kind', subjects.kind,
+            'aliases', subjects.aliases,
+            'created_at', subjects.created_at,
+            'updated_at', subjects.updated_at
+        )
+        FROM subjects
+        WHERE subjects.id = contexts.subject_id
+    ) AS subject,
+    (
+        SELECT jsonb_build_object(
+            'id', context_payloads.id,
+            'version', context_payloads.version,
+            'kind', context_payloads.kind,
+            'media_type', context_payloads.media_type,
+            'size_bytes', context_payloads.size_bytes
+        )
+        FROM context_payloads
+        WHERE context_payloads.context_id = contexts.id
+          AND context_payloads.version = contexts.payload_version
+    ) AS payload_ref,
+    jsonb_build_object(
+        'state', contexts.lifecycle_state,
+        'importance', contexts.importance,
+        'retrieval_count', contexts.retrieval_count,
+        'last_retrieved_at', contexts.last_retrieved_at,
+        'completed_at', contexts.completed_at,
+        'superseded_by_context_id', contexts.superseded_by_context_id,
+        'updated_at', contexts.lifecycle_updated_at
+    ) AS lifecycle,
+    COALESCE((
+        SELECT jsonb_agg(connection ORDER BY connection.created_at, connection.id)
+        FROM (
+            SELECT
+                context_connections.id,
+                'outgoing'::text AS direction,
+                context_connections.relationship,
+                context_connections.rationale,
+                context_connections.target_context_id AS other_context_id,
+                context_connections.created_at,
+                jsonb_build_object(
+                    'id', connection_actors.id,
+                    'external_id', connection_actors.external_id,
+                    'name', connection_actors.name,
+                    'kind', connection_actors.kind,
+                    'created_at', connection_actors.created_at,
+                    'last_seen_at', connection_actors.last_seen_at
+                ) AS created_by
+            FROM context_connections
+            INNER JOIN contexts AS other_context ON other_context.id = context_connections.target_context_id
+            INNER JOIN actors AS connection_actors ON connection_actors.id = context_connections.created_by_actor_id
+            WHERE context_connections.source_context_id = contexts.id
+              AND other_context.visibility = contexts.visibility
+              AND (contexts.visibility <> 'personal' OR other_context.actor_id = contexts.actor_id)
+              AND (contexts.visibility <> 'channel' OR other_context.channel_id = contexts.channel_id)
+              AND (contexts.visibility <> 'group' OR other_context.group_id = contexts.group_id)
+            UNION ALL
+            SELECT
+                context_connections.id,
+                'incoming'::text AS direction,
+                context_connections.relationship,
+                context_connections.rationale,
+                context_connections.source_context_id AS other_context_id,
+                context_connections.created_at,
+                jsonb_build_object(
+                    'id', connection_actors.id,
+                    'external_id', connection_actors.external_id,
+                    'name', connection_actors.name,
+                    'kind', connection_actors.kind,
+                    'created_at', connection_actors.created_at,
+                    'last_seen_at', connection_actors.last_seen_at
+                ) AS created_by
+            FROM context_connections
+            INNER JOIN contexts AS other_context ON other_context.id = context_connections.source_context_id
+            INNER JOIN actors AS connection_actors ON connection_actors.id = context_connections.created_by_actor_id
+            WHERE context_connections.target_context_id = contexts.id
+              AND other_context.visibility = contexts.visibility
+              AND (contexts.visibility <> 'personal' OR other_context.actor_id = contexts.actor_id)
+              AND (contexts.visibility <> 'channel' OR other_context.channel_id = contexts.channel_id)
+              AND (contexts.visibility <> 'group' OR other_context.group_id = contexts.group_id)
+        ) AS connection
+    ), '[]'::jsonb) AS connections,
     actors.id AS actor_id,
     actors.external_id AS actor_external_id,
     actors.name AS actor_name,
@@ -368,6 +622,41 @@ const CONTEXT_PROJECTION = `
         WHERE context_acknowledgements.context_id = contexts.id
     ), '[]'::jsonb) AS acknowledged_by
 `;
+
+function subjectProjection(contextAlias: "inserted" | "updated" | "deleted") {
+    return `
+        (
+            SELECT jsonb_build_object(
+                'id', subjects.id,
+                'external_id', subjects.external_id,
+                'name', subjects.name,
+                'kind', subjects.kind,
+                'aliases', subjects.aliases,
+                'created_at', subjects.created_at,
+                'updated_at', subjects.updated_at
+            )
+            FROM subjects
+            WHERE subjects.id = ${contextAlias}.subject_id
+        ) AS subject
+    `;
+}
+
+function payloadProjection(contextAlias: "inserted" | "updated" | "deleted") {
+    return `
+        (
+            SELECT jsonb_build_object(
+                'id', context_payloads.id,
+                'version', context_payloads.version,
+                'kind', context_payloads.kind,
+                'media_type', context_payloads.media_type,
+                'size_bytes', context_payloads.size_bytes
+            )
+            FROM context_payloads
+            WHERE context_payloads.context_id = ${contextAlias}.id
+              AND context_payloads.version = ${contextAlias}.payload_version
+        ) AS payload_ref
+    `;
+}
 
 function parseEmbeddingVector(value: unknown) {
     if (!value) {
@@ -510,6 +799,43 @@ async function resolveActor(identity: ActorIdentity, client: PoolClient) {
     return { actor: mapActorRow(resolved.rows[0]), created: false };
 }
 
+async function resolveSubject(identity: SubjectIdentity, client: PoolClient) {
+    const externalId = identity.external_id.trim();
+    const name = identity.name.trim();
+    const kind = identity.kind?.trim() || null;
+    const aliases = [...new Set((identity.aliases ?? []).map((alias) => alias.trim()).filter(Boolean))];
+
+    if (!/^subject:[a-z0-9][a-z0-9:_-]*$/.test(externalId)) {
+        throw new Error("subject.external_id must use the subject: namespace and lowercase letters, digits, colons, underscores, or hyphens.");
+    }
+    if (!name) {
+        throw new Error("subject.name must contain at least one non-whitespace character.");
+    }
+
+    const inserted = await client.query<SubjectRow>(
+        `
+            INSERT INTO subjects (external_id, name, kind, aliases)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (external_id) DO NOTHING
+            RETURNING id, external_id, name, kind, aliases, created_at, updated_at
+        `,
+        [externalId, name, kind, aliases],
+    );
+    if (inserted.rows[0]) {
+        return { subject: mapSubjectRow(inserted.rows[0]), created: true };
+    }
+
+    const resolved = await client.query<SubjectRow>(
+        `
+            SELECT id, external_id, name, kind, aliases, created_at, updated_at
+            FROM subjects
+            WHERE external_id = $1
+        `,
+        [externalId],
+    );
+    return { subject: mapSubjectRow(resolved.rows[0]), created: false };
+}
+
 export async function identifyActor(identity: ActorIdentity) {
     await initializeDatabase();
     const client = await db.connect();
@@ -527,17 +853,22 @@ export async function saveDirectContext(
     text: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const client = await db.connect();
     try {
         await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         const recipient = await client.query<{ id: number | string }>(
             "SELECT id FROM actors WHERE external_id = $1",
             [recipientExternalId],
         );
         if (!recipient.rows[0]) throw new Error("Recipient actor is not registered.");
-        const context = await insertContext(client, text, tags, source, senderActorId, "direct");
+        const context = await insertContext(
+            client, text, tags, source, senderActorId, "direct",
+            null, null, identifiedSubject?.subject.id ?? null,
+        );
         const envelope = await client.query<{ sequence: number | string }>(
             `INSERT INTO direct_context_envelopes (context_id, recipient_actor_id)
              VALUES ($1, $2) RETURNING sequence`,
@@ -623,6 +954,7 @@ async function insertContext(
     visibility: ContextVisibility | undefined,
     channelId: number | null = null,
     groupId: number | null = null,
+    subjectId: number | null = null,
 ) {
     const now = new Date().toISOString();
     const tagList = tags ?? [];
@@ -639,10 +971,11 @@ async function insertContext(
                     actor_id,
                     channel_id,
                     group_id,
+                    subject_id,
                     created_at,
                     updated_at
                 )
-                VALUES ('note', $1, $2, $3, $4, $5, $6, $7, $8, $8)
+                VALUES ('note', $1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
                 RETURNING *
             )
             SELECT
@@ -656,6 +989,20 @@ async function insertContext(
                 inserted.tags,
                 inserted.created_at,
                 inserted.updated_at,
+                (
+                    SELECT jsonb_build_object(
+                        'id', subjects.id,
+                        'external_id', subjects.external_id,
+                        'name', subjects.name,
+                        'kind', subjects.kind,
+                        'aliases', subjects.aliases,
+                        'created_at', subjects.created_at,
+                        'updated_at', subjects.updated_at
+                    )
+                    FROM subjects
+                    WHERE subjects.id = inserted.subject_id
+                ) AS subject,
+                ${payloadProjection("inserted")},
                 actors.id AS actor_id,
                 actors.external_id AS actor_external_id,
                 actors.name AS actor_name,
@@ -673,11 +1020,29 @@ async function insertContext(
             actorId,
             channelId,
             groupId,
+            subjectId,
             now,
         ]
     );
 
-    return mapContextRow(result.rows[0]);
+    const row = result.rows[0];
+    if (!row.payload_ref) {
+        const payload = await client.query<{ payload_ref: unknown }>(
+            `SELECT jsonb_build_object(
+                'id', context_payloads.id,
+                'version', context_payloads.version,
+                'kind', context_payloads.kind,
+                'media_type', context_payloads.media_type,
+                'size_bytes', context_payloads.size_bytes
+             ) AS payload_ref
+             FROM context_payloads
+             WHERE context_payloads.context_id = $1
+               AND context_payloads.version = 1`,
+            [row.id],
+        );
+        row.payload_ref = payload.rows[0]?.payload_ref;
+    }
+    return mapContextRow(row);
 }
 
 export async function saveContext(
@@ -686,12 +1051,14 @@ export async function saveContext(
     source?: string,
     actorId?: number | null,
     visibility?: WritableContextVisibility,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const client = await db.connect();
     let context: ContextRecord;
 
     try {
+        const resolvedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -699,6 +1066,9 @@ export async function saveContext(
             source,
             actorId ?? null,
             visibility,
+            null,
+            null,
+            resolvedSubject?.subject.id ?? null,
         );
     } finally {
         client.release();
@@ -716,21 +1086,42 @@ export async function saveContextWithActor(
     actor?: ActorIdentity,
     activeActorId?: number | null,
     visibility?: WritableContextVisibility,
+    subject?: SubjectIdentity,
 ): Promise<SaveContextResult> {
     if (!actor) {
-        return {
-            context: await saveContext(text, tags, source, activeActorId, visibility),
-        };
+        await initializeDatabase();
+        const client = await db.connect();
+        try {
+            await client.query("BEGIN");
+            const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
+            const context = await insertContext(
+                client, text, tags, source, activeActorId ?? null, visibility,
+                null, null, identifiedSubject?.subject.id ?? null,
+            );
+            await client.query("COMMIT");
+            await maybeSaveContextEmbedding(context);
+            return {
+                context,
+                ...(identifiedSubject ? { subject_resolution: { created: identifiedSubject.created } } : {}),
+            };
+        } catch (error) {
+            await client.query("ROLLBACK");
+            throw error;
+        } finally {
+            client.release();
+        }
     }
 
     await initializeDatabase();
     const client = await db.connect();
     let context: ContextRecord;
     let identified: Awaited<ReturnType<typeof resolveActor>>;
+    let identifiedSubject: Awaited<ReturnType<typeof resolveSubject>> | null = null;
 
     try {
         await client.query("BEGIN");
         identified = await resolveActor(actor, client);
+        identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -738,6 +1129,9 @@ export async function saveContextWithActor(
             source,
             identified.actor.id,
             visibility,
+            null,
+            null,
+            identifiedSubject?.subject.id ?? null,
         );
         await client.query("COMMIT");
     } catch (error) {
@@ -754,6 +1148,7 @@ export async function saveContextWithActor(
         actor_resolution: {
             created: identified.created,
         },
+        ...(identifiedSubject ? { subject_resolution: { created: identifiedSubject.created } } : {}),
     };
 }
 
@@ -845,6 +1240,16 @@ async function searchContextByText(
                 contexts.content ILIKE $1
                 OR contexts.source ILIKE $1
                 OR contexts.tags::text ILIKE $1
+                OR EXISTS (
+                    SELECT 1 FROM subjects
+                    WHERE subjects.id = contexts.subject_id
+                      AND (
+                          subjects.external_id ILIKE $1
+                          OR subjects.name ILIKE $1
+                          OR subjects.kind ILIKE $1
+                          OR subjects.aliases::text ILIKE $1
+                      )
+                )
             )
               AND ${WHITEBOARD_READ_PREDICATE}
               AND ($2::text IS NULL OR actors.external_id = $2)
@@ -1022,6 +1427,473 @@ export async function getContext(id: number) {
     return context ? mapContextRow(context) : null;
 }
 
+type ConnectionEndpointRow = {
+    id: number | string;
+    visibility: ContextVisibility;
+    actor_id: number | string | null;
+    channel_id: number | string | null;
+    group_id: number | string | null;
+};
+
+function sameConnectionScope(source: ConnectionEndpointRow, target: ConnectionEndpointRow) {
+    if (source.visibility !== target.visibility) return false;
+    if (source.visibility === "whiteboard") return true;
+    if (source.visibility === "personal") return Number(source.actor_id) === Number(target.actor_id);
+    if (source.visibility === "channel") return Number(source.channel_id) === Number(target.channel_id);
+    if (source.visibility === "group") return Number(source.group_id) === Number(target.group_id);
+    return false;
+}
+
+async function actorCanConnectContext(
+    client: PoolClient,
+    actorId: number,
+    context: ConnectionEndpointRow,
+) {
+    if (context.visibility === "whiteboard") return true;
+    if (context.visibility === "personal") return Number(context.actor_id) === actorId;
+    if (context.visibility === "channel") {
+        const membership = await client.query(
+            `SELECT 1 FROM channel_memberships
+             WHERE channel_id = $1 AND actor_id = $2
+               AND removed_at IS NULL AND can_write`,
+            [context.channel_id, actorId],
+        );
+        return Boolean(membership.rows[0]);
+    }
+    if (context.visibility === "group") {
+        const membership = await client.query(
+            `SELECT 1 FROM access_group_memberships
+             WHERE group_id = $1 AND actor_id = $2
+               AND removed_at IS NULL AND can_write`,
+            [context.group_id, actorId],
+        );
+        return Boolean(membership.rows[0]);
+    }
+    return false;
+}
+
+export async function connectContexts(
+    actorId: number,
+    sourceContextId: number,
+    targetContextId: number,
+    relationship: string,
+    rationale?: string,
+) {
+    await initializeDatabase();
+    const normalizedRelationship = relationship.trim().toLowerCase();
+    if (!/^[a-z][a-z0-9:_-]{0,63}$/.test(normalizedRelationship)) {
+        throw new Error("CONTEXT_CONNECTION_RELATIONSHIP_INVALID");
+    }
+    const normalizedRationale = rationale?.trim();
+    if (normalizedRationale !== undefined && (normalizedRationale.length < 1 || normalizedRationale.length > 2000)) {
+        throw new Error("CONTEXT_CONNECTION_RATIONALE_INVALID");
+    }
+    if (sourceContextId === targetContextId) throw new Error("CONTEXT_CONNECTION_SELF_REFERENCE");
+
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const endpoints = await client.query<ConnectionEndpointRow>(
+            `SELECT id, visibility, actor_id, channel_id, group_id
+             FROM contexts WHERE id = ANY($1::bigint[]) FOR SHARE`,
+            [[sourceContextId, targetContextId]],
+        );
+        const source = endpoints.rows.find((row) => Number(row.id) === sourceContextId);
+        const target = endpoints.rows.find((row) => Number(row.id) === targetContextId);
+        if (!source || !target || !sameConnectionScope(source, target)
+            || !await actorCanConnectContext(client, actorId, source)
+            || !await actorCanConnectContext(client, actorId, target)) {
+            throw new Error("CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED");
+        }
+
+        await client.query(
+            `INSERT INTO context_connections (
+                source_context_id, target_context_id, relationship, rationale, created_by_actor_id
+             ) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (source_context_id, target_context_id, relationship) DO NOTHING`,
+            [sourceContextId, targetContextId, normalizedRelationship, normalizedRationale ?? null, actorId],
+        );
+        const result = await client.query<ContextRow>(
+            `SELECT ${CONTEXT_PROJECTION}
+             FROM contexts
+             LEFT JOIN actors ON actors.id = contexts.actor_id
+             WHERE contexts.id = $1`,
+            [sourceContextId],
+        );
+        await client.query("COMMIT");
+        return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function disconnectContexts(actorId: number, connectionId: number) {
+    await initializeDatabase();
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const result = await client.query<ConnectionEndpointRow & { source_context_id: number | string }>(
+            `SELECT contexts.id, contexts.visibility, contexts.actor_id, contexts.channel_id,
+                    contexts.group_id, context_connections.source_context_id
+             FROM context_connections
+             INNER JOIN contexts ON contexts.id = context_connections.source_context_id
+             WHERE context_connections.id = $1 FOR UPDATE OF context_connections`,
+            [connectionId],
+        );
+        const source = result.rows[0];
+        if (!source || !await actorCanConnectContext(client, actorId, source)) {
+            throw new Error("CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED");
+        }
+        await client.query("DELETE FROM context_connections WHERE id = $1", [connectionId]);
+        const contextResult = await client.query<ContextRow>(
+            `SELECT ${CONTEXT_PROJECTION}
+             FROM contexts
+             LEFT JOIN actors ON actors.id = contexts.actor_id
+             WHERE contexts.id = $1`,
+            [source.source_context_id],
+        );
+        await client.query("COMMIT");
+        return contextResult.rows[0] ? mapContextRow(contextResult.rows[0]) : null;
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function updateContextLifecycle(
+    actorId: number,
+    contextId: number,
+    update: {
+        state?: ContextLifecycleState;
+        importance?: number;
+        completed?: boolean;
+        supersededByContextId?: number | null;
+    },
+) {
+    await initializeDatabase();
+    const hasState = update.state !== undefined;
+    const hasImportance = update.importance !== undefined;
+    const hasCompleted = update.completed !== undefined;
+    const hasSuperseded = update.supersededByContextId !== undefined;
+    if (!hasState && !hasImportance && !hasCompleted && !hasSuperseded) {
+        throw new Error("CONTEXT_LIFECYCLE_UPDATE_REQUIRED");
+    }
+    if (hasImportance && (!Number.isInteger(update.importance) || update.importance! < 0 || update.importance! > 100)) {
+        throw new Error("CONTEXT_IMPORTANCE_INVALID");
+    }
+    if (update.supersededByContextId === contextId) throw new Error("CONTEXT_SUPERSESSION_SELF_REFERENCE");
+
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const ids = [contextId, ...(typeof update.supersededByContextId === "number" ? [update.supersededByContextId] : [])];
+        const endpoints = await client.query<ConnectionEndpointRow>(
+            `SELECT id, visibility, actor_id, channel_id, group_id
+             FROM contexts WHERE id = ANY($1::bigint[]) FOR SHARE`,
+            [ids],
+        );
+        const context = endpoints.rows.find((row) => Number(row.id) === contextId);
+        const successor = typeof update.supersededByContextId === "number"
+            ? endpoints.rows.find((row) => Number(row.id) === update.supersededByContextId)
+            : undefined;
+        if (!context || !await actorCanConnectContext(client, actorId, context)
+            || (typeof update.supersededByContextId === "number"
+                && (!successor || !sameConnectionScope(context, successor)
+                    || !await actorCanConnectContext(client, actorId, successor)))) {
+            throw new Error("CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED");
+        }
+
+        await client.query(
+            `UPDATE contexts SET
+                lifecycle_state = CASE WHEN $2 THEN $3 ELSE lifecycle_state END,
+                importance = CASE WHEN $4 THEN $5 ELSE importance END,
+                completed_at = CASE WHEN $6 THEN CASE WHEN $7 THEN NOW() ELSE NULL END ELSE completed_at END,
+                superseded_by_context_id = CASE WHEN $8 THEN $9 ELSE superseded_by_context_id END,
+                lifecycle_updated_at = NOW()
+             WHERE id = $1`,
+            [
+                contextId,
+                hasState,
+                update.state ?? null,
+                hasImportance,
+                update.importance ?? null,
+                hasCompleted,
+                update.completed ?? false,
+                hasSuperseded,
+                update.supersededByContextId ?? null,
+            ],
+        );
+        await client.query("COMMIT");
+        return loadContextEnvelope(contextId);
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+function autoArchiveProtectedTags() {
+    const configured = process.env.AUTO_ARCHIVE_PROTECTED_TAGS
+        ?? "archive:never,reference,canonical,active-project";
+    return [...new Set(configured.split(",").map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
+}
+
+type AutoArchiveEvaluationRow = {
+    id: number | string;
+    tags: string[] | string | null;
+    importance: number | string;
+    lifecycle_state: ContextLifecycleState;
+    completed_at: string | Date | null;
+    superseded_by_context_id: number | string | null;
+    created_at: string | Date;
+    incoming_count: number | string;
+    outgoing_count: number | string;
+    active_incoming_count: number | string;
+};
+
+function evaluateAutoArchiveRow(row: AutoArchiveEvaluationRow, protectedTags: string[], minimumAgeDays: number) {
+    const tags = parseTags(row.tags).map((tag) => tag.toLowerCase());
+    const blockedTags = protectedTags.filter((tag) => tags.includes(tag));
+    const ageDays = (Date.now() - new Date(row.created_at).getTime()) / 86_400_000;
+    const bridge = Number(row.incoming_count) > 0 && Number(row.outgoing_count) > 0;
+    const reasons = {
+        lifecycle_candidate: row.lifecycle_state === "archive_candidate",
+        low_importance: Number(row.importance) <= 25,
+        old_enough: ageDays >= minimumAgeDays,
+        resolved: row.completed_at !== null || row.superseded_by_context_id !== null,
+        no_active_inbound_reference: Number(row.active_incoming_count) === 0,
+        not_bridge: !bridge,
+        protected_tags_absent: blockedTags.length === 0,
+        agent_inbox_absent: !tags.some((tag) => /^message-to-/i.test(tag)),
+    };
+    const eligible = Object.values(reasons).every(Boolean);
+    const score = Object.values(reasons).filter(Boolean).length * 10
+        + Math.max(0, 25 - Number(row.importance));
+    return { context_id: Number(row.id), eligible, score, reasons, protected_tags: blockedTags };
+}
+
+export async function previewAutoArchive(actorId: number, limit = 25, minimumAgeDays = 30) {
+    await initializeDatabase();
+    const boundedLimit = Math.max(1, Math.min(Math.trunc(limit), 100));
+    const boundedAge = Math.max(1, Math.min(Math.trunc(minimumAgeDays), 3650));
+    const protectedTags = autoArchiveProtectedTags();
+    const token = randomUUID();
+    const result = await db.query<AutoArchiveEvaluationRow>(
+        `SELECT contexts.id, contexts.tags, contexts.importance, contexts.lifecycle_state,
+                contexts.completed_at, contexts.superseded_by_context_id, contexts.created_at,
+                (SELECT count(*) FROM context_connections WHERE target_context_id = contexts.id) AS incoming_count,
+                (SELECT count(*) FROM context_connections WHERE source_context_id = contexts.id) AS outgoing_count,
+                (SELECT count(*) FROM context_connections cc
+                 INNER JOIN contexts source ON source.id = cc.source_context_id
+                 WHERE cc.target_context_id = contexts.id AND source.visibility = 'whiteboard'
+                   AND source.lifecycle_state IN ('active', 'warm')) AS active_incoming_count
+         FROM contexts
+         WHERE contexts.visibility = 'whiteboard'
+           AND contexts.lifecycle_state IN ('cold', 'archive_candidate')
+         ORDER BY contexts.importance ASC, contexts.created_at ASC, contexts.id ASC
+         LIMIT $1`,
+        [boundedLimit],
+    );
+    const evaluations = result.rows.map((row) => evaluateAutoArchiveRow(row, protectedTags, boundedAge));
+    const candidateIds = evaluations.filter((item) => item.eligible).map((item) => item.context_id);
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        await client.query(
+            `INSERT INTO auto_archive_previews (token, actor_id, candidate_ids, policy, expires_at)
+             VALUES ($1, $2, $3, $4, NOW() + INTERVAL '15 minutes')`,
+            [token, actorId, candidateIds, JSON.stringify({ protected_tags: protectedTags, minimum_age_days: boundedAge })],
+        );
+        for (const evaluation of evaluations) {
+            await client.query(
+                `INSERT INTO auto_archive_evaluations
+                    (preview_token, context_id, eligible, score, reasons, protected_tags)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [token, evaluation.context_id, evaluation.eligible, evaluation.score,
+                    JSON.stringify(evaluation.reasons), evaluation.protected_tags],
+            );
+        }
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+    return { confirmation_token: token, expires_in_seconds: 900, policy: { protected_tags: protectedTags, minimum_age_days: boundedAge }, evaluations };
+}
+
+export async function confirmAutoArchive(actorId: number, confirmationToken: string, contextIds: number[]) {
+    await initializeDatabase();
+    const selected = [...new Set(contextIds)];
+    if (selected.length < 1 || selected.length > 100) throw new Error("AUTO_ARCHIVE_SELECTION_INVALID");
+    const client = await db.connect();
+    try {
+        await client.query("BEGIN");
+        const preview = await client.query<{ candidate_ids: Array<number | string> }>(
+            `UPDATE auto_archive_previews SET consumed_at = NOW()
+             WHERE token = $1 AND actor_id = $2 AND consumed_at IS NULL AND expires_at > NOW()
+             RETURNING candidate_ids`,
+            [confirmationToken, actorId],
+        );
+        const candidates = new Set((preview.rows[0]?.candidate_ids ?? []).map(Number));
+        if (!preview.rows[0] || selected.some((id) => !candidates.has(id))) throw new Error("AUTO_ARCHIVE_PREVIEW_INVALID");
+        const archived: number[] = [];
+        for (const id of selected) {
+            const updated = await client.query(
+                `UPDATE contexts SET visibility = 'archived', updated_at = NOW(), lifecycle_updated_at = NOW()
+                 WHERE id = $1 AND visibility = 'whiteboard' AND lifecycle_state = 'archive_candidate'
+                 RETURNING id`,
+                [id],
+            );
+            if (!updated.rows[0]) throw new Error("AUTO_ARCHIVE_CANDIDATE_CHANGED");
+            await client.query(
+                `INSERT INTO context_archives (context_id, reason, archived_by_actor_id)
+                 VALUES ($1, $2, $3)`,
+                [id, `Reviewed auto-archive preview ${confirmationToken}`, actorId],
+            );
+            archived.push(id);
+        }
+        await client.query("COMMIT");
+        return { archived_context_ids: archived };
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+const AUTHORIZED_CONTEXT_PREDICATE = `(
+    contexts.visibility = 'whiteboard'
+    OR contexts.visibility = 'archived'
+    OR (contexts.visibility = 'personal' AND contexts.actor_id = $1)
+    OR (contexts.visibility = 'channel' AND EXISTS (
+        SELECT 1 FROM channel_memberships
+        WHERE channel_memberships.channel_id = contexts.channel_id
+          AND channel_memberships.actor_id = $1
+          AND channel_memberships.removed_at IS NULL
+          AND channel_memberships.can_read
+    ))
+    OR (contexts.visibility = 'group' AND EXISTS (
+        SELECT 1 FROM access_group_memberships
+        WHERE access_group_memberships.group_id = contexts.group_id
+          AND access_group_memberships.actor_id = $1
+          AND access_group_memberships.removed_at IS NULL
+          AND access_group_memberships.can_read
+    ))
+)`;
+
+export async function assembleContext(
+    actorId: number,
+    query: string,
+    options: { limit?: number; hydrateLimit?: number; maxContentChars?: number } = {},
+) {
+    await initializeDatabase();
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) throw new Error("CONTEXT_ASSEMBLY_QUERY_REQUIRED");
+    const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 8), 20));
+    const hydrateLimit = Math.max(0, Math.min(Math.trunc(options.hydrateLimit ?? 2), 5, limit));
+    const maxContentChars = Math.max(1000, Math.min(Math.trunc(options.maxContentChars ?? 24_000), 48_000));
+
+    const seeds = await db.query<ContextRow>(
+        `SELECT ${CONTEXT_PROJECTION}
+         FROM contexts
+         LEFT JOIN actors ON actors.id = contexts.actor_id
+         WHERE ${AUTHORIZED_CONTEXT_PREDICATE}
+           AND contexts.visibility <> 'archived'
+           AND (
+                contexts.content ILIKE $2 OR contexts.source ILIKE $2 OR contexts.tags::text ILIKE $2
+                OR EXISTS (SELECT 1 FROM subjects WHERE subjects.id = contexts.subject_id
+                    AND (subjects.external_id ILIKE $2 OR subjects.name ILIKE $2
+                         OR subjects.kind ILIKE $2 OR subjects.aliases::text ILIKE $2))
+           )
+         ORDER BY contexts.importance DESC,
+                  CASE contexts.lifecycle_state WHEN 'active' THEN 0 WHEN 'warm' THEN 1 WHEN 'cold' THEN 2 ELSE 3 END,
+                  contexts.updated_at DESC, contexts.id DESC
+         LIMIT $3`,
+        [actorId, `%${normalizedQuery}%`, limit],
+    );
+    const seedRecords = seeds.rows.map(mapContextRow);
+    const seedIds = seedRecords.map((record) => record.id);
+    const expanded = seedIds.length === 0
+        ? { rows: [] as Array<ContextRow & { via_context_id: number | string; via_connection_id: number | string }> }
+        : await db.query<ContextRow & { via_context_id: number | string; via_connection_id: number | string }>(
+            `SELECT ${CONTEXT_PROJECTION}, edge.via_context_id, edge.via_connection_id
+             FROM contexts
+             INNER JOIN (
+                SELECT source_context_id AS via_context_id, target_context_id AS other_context_id, id AS via_connection_id
+                FROM context_connections WHERE source_context_id = ANY($2::bigint[])
+                UNION ALL
+                SELECT target_context_id AS via_context_id, source_context_id AS other_context_id, id AS via_connection_id
+                FROM context_connections WHERE target_context_id = ANY($2::bigint[])
+             ) edge ON edge.other_context_id = contexts.id
+             LEFT JOIN actors ON actors.id = contexts.actor_id
+             WHERE ${AUTHORIZED_CONTEXT_PREDICATE}
+             ORDER BY contexts.importance DESC, contexts.updated_at DESC, contexts.id DESC
+             LIMIT $3`,
+            [actorId, seedIds, limit * 3],
+        );
+
+    const ranked = new Map<number, { context: ContextRecord; via: { kind: "seed" | "connection"; from_context_id?: number; connection_id?: number }; score: number }>();
+    for (const context of seedRecords) {
+        ranked.set(context.id, { context, via: { kind: "seed" }, score: 100 + context.lifecycle.importance });
+    }
+    for (const row of expanded.rows) {
+        const context = mapContextRow(row);
+        if (!ranked.has(context.id)) {
+            ranked.set(context.id, {
+                context,
+                via: { kind: "connection", from_context_id: Number(row.via_context_id), connection_id: Number(row.via_connection_id) },
+                score: 50 + context.lifecycle.importance,
+            });
+        }
+    }
+    const selected = [...ranked.values()].sort((a, b) => b.score - a.score || b.context.updated_at.localeCompare(a.context.updated_at)).slice(0, limit);
+    let usedChars = 0;
+    let truncated = ranked.size > selected.length;
+    const items = [];
+    for (let index = 0; index < selected.length; index += 1) {
+        const entry = selected[index];
+        const hydrated = index < hydrateLimit;
+        const allowed = Math.max(0, maxContentChars - usedChars);
+        const desired = hydrated ? entry.context.content : entry.context.content.slice(0, 500);
+        const content = desired.slice(0, allowed);
+        if (content.length < desired.length) truncated = true;
+        usedChars += content.length;
+        items.push({
+            context: { ...entry.context, content },
+            hydrated,
+            content_truncated: content.length < entry.context.content.length,
+            via: entry.via,
+            score: entry.score,
+        });
+        if (usedChars >= maxContentChars) break;
+    }
+    const retrievedIds = items.map((item) => item.context.id);
+    if (retrievedIds.length > 0) {
+        await db.query(
+            `UPDATE contexts SET retrieval_count = retrieval_count + 1, last_retrieved_at = NOW()
+             WHERE id = ANY($1::bigint[])`,
+            [retrievedIds],
+        );
+    }
+    return {
+        query: normalizedQuery,
+        items,
+        returned_count: items.length,
+        hydrated_count: items.filter((item) => item.hydrated).length,
+        content_chars: usedChars,
+        response_truncated: truncated,
+    };
+}
+
 export async function deleteContext(id: number) {
     await initializeDatabase();
 
@@ -1049,7 +1921,9 @@ export async function deleteContext(id: number) {
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -1067,6 +1941,7 @@ export async function updateContext(
     tags?: string[],
     source?: string,
     visibility?: WritableContextVisibility,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
 
@@ -1074,9 +1949,10 @@ export async function updateContext(
     const hasTags = tags !== undefined;
     const hasSource = source !== undefined;
     const hasVisibility = visibility !== undefined;
+    const hasSubject = subject !== undefined;
 
-    if (!hasText && !hasTags && !hasSource && !hasVisibility) {
-        throw new Error("At least one of text, tags, source, or visibility must be provided.");
+    if (!hasText && !hasTags && !hasSource && !hasVisibility && !hasSubject) {
+        throw new Error("At least one of text, tags, source, visibility, or subject must be provided.");
     }
 
     const tagValue = hasTags
@@ -1085,7 +1961,12 @@ export async function updateContext(
             : JSON.stringify(tags)
         : null;
 
-    const result = await db.query<ContextRow>(
+    const client = await db.connect();
+    let result;
+    try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
+        result = await client.query<ContextRow>(
         `
             WITH updated AS (
                 UPDATE contexts
@@ -1094,7 +1975,8 @@ export async function updateContext(
                     tags = CASE WHEN $4 THEN $5 ELSE tags END,
                     source = CASE WHEN $6 THEN $7 ELSE source END,
                     visibility = CASE WHEN $8 THEN $9 ELSE visibility END,
-                    updated_at = $10
+                    subject_id = CASE WHEN $10 THEN $11 ELSE subject_id END,
+                    updated_at = $12
                 WHERE id = $1
                   AND visibility = 'whiteboard'
                 RETURNING *
@@ -1114,9 +1996,17 @@ export async function updateContext(
             source ?? null,
             hasVisibility,
             visibility ?? null,
+            hasSubject,
+            identifiedSubject?.subject.id ?? null,
             new Date().toISOString(),
-        ]
-    );
+        ]);
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
 
     const updatedContext = result.rows[0];
 
@@ -1124,7 +2014,7 @@ export async function updateContext(
         return null;
     }
 
-    const context = mapContextRow(updatedContext);
+    const context = mapContextRow(await loadCurrentPayloadReference(updatedContext));
 
     if (hasText) {
         await maybeSaveContextEmbedding(context);
@@ -1504,6 +2394,7 @@ export async function saveChannelContext(
     text: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const channel = await requireChannelMembership(actorId, slug, "write");
@@ -1511,6 +2402,8 @@ export async function saveChannelContext(
     let context: ContextRecord;
 
     try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -1519,7 +2412,13 @@ export async function saveChannelContext(
             actorId,
             "channel",
             channel.id,
+            null,
+            identifiedSubject?.subject.id ?? null,
         );
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
     } finally {
         client.release();
     }
@@ -1546,6 +2445,11 @@ async function searchChannelContextByText(
                     contexts.content ILIKE $2
                  OR contexts.source ILIKE $2
                  OR contexts.tags::text ILIKE $2
+                 OR EXISTS (
+                        SELECT 1 FROM subjects
+                        WHERE subjects.id = contexts.subject_id
+                          AND (subjects.external_id ILIKE $2 OR subjects.name ILIKE $2 OR subjects.kind ILIKE $2 OR subjects.aliases::text ILIKE $2)
+                    )
               )
             ORDER BY contexts.created_at DESC, contexts.id DESC
             LIMIT $3
@@ -1709,7 +2613,9 @@ export async function updateChannelContext(
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("updated")},
+                ${payloadProjection("updated")}
             FROM updated
             LEFT JOIN actors ON actors.id = updated.actor_id
         `,
@@ -1725,7 +2631,7 @@ export async function updateChannelContext(
             new Date().toISOString(),
         ],
     );
-    const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    const context = result.rows[0] ? await loadContextEnvelope(result.rows[0].id) : null;
 
     if (context && hasText) {
         await maybeSaveContextEmbedding(context);
@@ -1769,7 +2675,9 @@ export async function deleteChannelContext(actorId: number, id: number) {
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -2092,6 +3000,7 @@ export async function saveGroupContext(
     text: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const group = await requireAccessGroupMembership(actorId, slug, "write");
@@ -2099,6 +3008,8 @@ export async function saveGroupContext(
     let context: ContextRecord;
 
     try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -2108,7 +3019,12 @@ export async function saveGroupContext(
             "group",
             null,
             group.id,
+            identifiedSubject?.subject.id ?? null,
         );
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
     } finally {
         client.release();
     }
@@ -2135,6 +3051,11 @@ async function searchGroupContextByText(
                     contexts.content ILIKE $2
                  OR contexts.source ILIKE $2
                  OR contexts.tags::text ILIKE $2
+                 OR EXISTS (
+                        SELECT 1 FROM subjects
+                        WHERE subjects.id = contexts.subject_id
+                          AND (subjects.external_id ILIKE $2 OR subjects.name ILIKE $2 OR subjects.kind ILIKE $2 OR subjects.aliases::text ILIKE $2)
+                    )
               )
             ORDER BY contexts.created_at DESC, contexts.id DESC
             LIMIT $3
@@ -2287,7 +3208,9 @@ export async function updateGroupContext(
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("updated")},
+                ${payloadProjection("updated")}
             FROM updated
             LEFT JOIN actors ON actors.id = updated.actor_id
         `,
@@ -2303,7 +3226,7 @@ export async function updateGroupContext(
             new Date().toISOString(),
         ],
     );
-    const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    const context = result.rows[0] ? await loadContextEnvelope(result.rows[0].id) : null;
 
     if (context && hasText) {
         await maybeSaveContextEmbedding(context);
@@ -2343,7 +3266,9 @@ export async function deleteGroupContext(actorId: number, id: number) {
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -2358,12 +3283,15 @@ export async function savePersonalContext(
     text: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const client = await db.connect();
     let context: ContextRecord;
 
     try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
         context = await insertContext(
             client,
             text,
@@ -2371,7 +3299,14 @@ export async function savePersonalContext(
             source,
             actorId,
             "personal",
+            null,
+            null,
+            identifiedSubject?.subject.id ?? null,
         );
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
     } finally {
         client.release();
     }
@@ -2396,6 +3331,16 @@ async function searchPersonalContextByText(
                     contexts.content ILIKE $2
                  OR contexts.source ILIKE $2
                  OR contexts.tags::text ILIKE $2
+                 OR EXISTS (
+                        SELECT 1 FROM subjects
+                        WHERE subjects.id = contexts.subject_id
+                          AND (
+                              subjects.external_id ILIKE $2
+                              OR subjects.name ILIKE $2
+                              OR subjects.kind ILIKE $2
+                              OR subjects.aliases::text ILIKE $2
+                          )
+                    )
               )
             ORDER BY contexts.created_at DESC, contexts.id DESC
             LIMIT $3
@@ -2497,14 +3442,16 @@ export async function updatePersonalContext(
     text?: string,
     tags?: string[],
     source?: string,
+    subject?: SubjectIdentity,
 ) {
     await initializeDatabase();
     const hasText = text !== undefined;
     const hasTags = tags !== undefined;
     const hasSource = source !== undefined;
+    const hasSubject = subject !== undefined;
 
-    if (!hasText && !hasTags && !hasSource) {
-        throw new Error("At least one of text, tags, or source must be provided.");
+    if (!hasText && !hasTags && !hasSource && !hasSubject) {
+        throw new Error("At least one of text, tags, source, or subject must be provided.");
     }
 
     const tagValue = hasTags
@@ -2512,7 +3459,12 @@ export async function updatePersonalContext(
             ? tags
             : JSON.stringify(tags)
         : null;
-    const result = await db.query<ContextRow>(
+    const client = await db.connect();
+    let result;
+    try {
+        await client.query("BEGIN");
+        const identifiedSubject = subject ? await resolveSubject(subject, client) : null;
+        result = await client.query<ContextRow>(
         `
             WITH updated AS (
                 UPDATE contexts
@@ -2520,7 +3472,8 @@ export async function updatePersonalContext(
                     content = CASE WHEN $3 THEN $4 ELSE content END,
                     tags = CASE WHEN $5 THEN $6 ELSE tags END,
                     source = CASE WHEN $7 THEN $8 ELSE source END,
-                    updated_at = $9
+                    subject_id = CASE WHEN $9 THEN $10 ELSE subject_id END,
+                    updated_at = $11
                 WHERE contexts.id = $1
                   AND contexts.visibility = 'personal'
                   AND contexts.actor_id = $2
@@ -2542,7 +3495,9 @@ export async function updatePersonalContext(
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("updated")},
+                ${payloadProjection("updated")}
             FROM updated
             LEFT JOIN actors ON actors.id = updated.actor_id
         `,
@@ -2555,10 +3510,18 @@ export async function updatePersonalContext(
             tagValue,
             hasSource,
             source ?? null,
+            hasSubject,
+            identifiedSubject?.subject.id ?? null,
             new Date().toISOString(),
-        ],
-    );
-    const context = result.rows[0] ? mapContextRow(result.rows[0]) : null;
+        ]);
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+    const context = result.rows[0] ? await loadContextEnvelope(result.rows[0].id) : null;
 
     if (context && hasText) {
         await maybeSaveContextEmbedding(context);
@@ -2594,7 +3557,9 @@ export async function deletePersonalContext(actorId: number, id: number) {
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,
@@ -2796,7 +3761,9 @@ export async function contextPurgeConfirm(
                 actors.name AS actor_name,
                 actors.kind AS actor_kind,
                 actors.created_at AS actor_created_at,
-                actors.last_seen_at AS actor_last_seen_at
+                actors.last_seen_at AS actor_last_seen_at,
+                ${subjectProjection("deleted")},
+                ${payloadProjection("deleted")}
             FROM deleted
             LEFT JOIN actors ON actors.id = deleted.actor_id
         `,

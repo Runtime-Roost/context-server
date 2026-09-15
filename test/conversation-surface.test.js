@@ -18,8 +18,8 @@ test("conversation surface advertises only the bounded conversational contract",
         const serialized = JSON.stringify(response);
 
         assert.deepEqual(names, [
-            "acknowledge_context",
             "acknowledge_direct_context",
+            "assemble_context",
             "bind_sso_session",
             "get_actor_session_request_status",
             "get_channel_context",
@@ -36,6 +36,11 @@ test("conversation surface advertises only the bounded conversational contract",
             "send_direct_context",
         ]);
         assert.ok(serialized.length < 25_000, `conversation schema was ${serialized.length} characters`);
+        for (const name of ["save_personal_context", "search_personal_context", "get_personal_context"]) {
+            const tool = response.tools.find((candidate) => candidate.name === name);
+            assert.ok(tool);
+            assert.deepEqual(tool.inputSchema.properties.auth.not, {});
+        }
     } finally {
         await client.close();
         await server.close();
@@ -51,8 +56,21 @@ test("full surface remains available for local administration", async () => {
 
     try {
         const response = await client.listTools();
-        assert.equal(response.tools.length, 62);
+        assert.equal(response.tools.length, 72);
         assert.ok(response.tools.some(({ name }) => name === "vacuum_database"));
+        assert.ok(response.tools.some(({ name }) => name === "connect_contexts"));
+        assert.ok(response.tools.some(({ name }) => name === "disconnect_contexts"));
+        assert.ok(response.tools.some(({ name }) => name === "update_context_lifecycle"));
+        assert.ok(response.tools.some(({ name }) => name === "preview_auto_archive"));
+        assert.ok(response.tools.some(({ name }) => name === "confirm_auto_archive"));
+        assert.ok(response.tools.some(({ name }) => name === "assemble_context"));
+        for (const name of ["begin_payload_upload", "append_payload_chunk", "finalize_payload_upload", "attach_payload_to_context"]) {
+            assert.ok(response.tools.some((tool) => tool.name === name));
+        }
+        for (const name of ["save_personal_context", "search_personal_context", "get_personal_context"]) {
+            const tool = response.tools.find((candidate) => candidate.name === name);
+            assert.ok(tool?.inputSchema.properties.auth.anyOf);
+        }
     } finally {
         await client.close();
         await server.close();

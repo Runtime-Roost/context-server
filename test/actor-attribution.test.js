@@ -4,6 +4,7 @@ import pg from "pg";
 
 process.env.PGDATABASE ??= "personal_context";
 process.env.EMBEDDINGS_ENABLED = "false";
+process.env.REQUIRE_CONTEXT_AUTHENTICATION = "false";
 
 const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
@@ -17,16 +18,23 @@ const {
     acknowledgeContextWithActor,
     actorPurgeConfirm,
     actorPurgePreview,
+    assembleContext,
+    connectContexts,
+    confirmAutoArchive,
+    disconnectContexts,
     identifyActor,
     deleteContext,
     getContext,
     getDatabaseMetadata,
     getUserProfile,
     listRecentContext,
+    previewAutoArchive,
     saveContext,
+    savePersonalContext,
     searchContext,
     searchContextByVector,
     updateContext,
+    updateContextLifecycle,
 } = await import("../dist/mcp/tools.js");
 
 function uniqueValue(prefix) {
@@ -86,13 +94,20 @@ test("versioned migrations upgrade a legacy schema without attributing existing 
 
         await runDatabaseMigrations(isolatedPool);
 
-        const legacy = await isolatedPool.query("SELECT actor_id, visibility, channel_id, group_id FROM contexts");
+        const legacy = await isolatedPool.query("SELECT actor_id, subject_id, visibility, channel_id, group_id FROM contexts");
         const applied = await isolatedPool.query("SELECT version FROM schema_migrations ORDER BY version");
+        const payload = await isolatedPool.query("SELECT context_id, version, kind, media_type, text_content FROM context_payloads");
         assert.equal(legacy.rows[0].actor_id, null);
+        assert.equal(legacy.rows[0].subject_id, null);
         assert.equal(legacy.rows[0].visibility, "whiteboard");
         assert.equal(legacy.rows[0].channel_id, null);
         assert.equal(legacy.rows[0].group_id, null);
-        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+        assert.deepEqual(applied.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+        assert.equal(payload.rows.length, 1);
+        assert.equal(payload.rows[0].version, 1);
+        assert.equal(payload.rows[0].kind, "text");
+        assert.equal(payload.rows[0].media_type, "text/plain; charset=utf-8");
+        assert.equal(payload.rows[0].text_content, "legacy actor migration row");
     } finally {
         await isolatedPool.end();
         await adminPool.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -717,10 +732,12 @@ test("built MCP schemas expose actor identification and stable actor filters", a
             idempotentHint: true,
             openWorldHint: false,
         });
-        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "tags", "text", "visibility"]);
+        assert.deepEqual(Object.keys(saveSchema.properties).sort(), ["actor", "source", "subject", "tags", "text", "visibility"]);
         assert.deepEqual(saveSchema.properties.visibility.enum, ["whiteboard"]);
         assert.deepEqual(saveSchema.properties.actor.required, ["external_id", "name"]);
         assert.ok(saveSchema.properties.actor.properties.external_id);
+        assert.deepEqual(saveSchema.properties.subject.required, ["external_id", "name"]);
+        assert.match(saveSchema.properties.subject.properties.external_id.pattern, /^\^subject:/);
         assert.deepEqual(updateSchema.properties.visibility.enum, ["whiteboard"]);
         for (const toolName of [
             "create_channel",
@@ -783,6 +800,146 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         assert.ok(byName.get("actor_purge_confirm"));
     } finally {
         await connection.close();
+    }
+});
+
+test("context connections preserve directed rationale without crossing visibility scopes", async () => {
+    await initializeDatabase();
+    const creator = (await identifyActor({
+        external_id: uniqueValue("actor:test:connection-creator"),
+        name: "Connection Creator",
+        kind: "ai",
+    })).actor;
+    const outsider = (await identifyActor({
+        external_id: uniqueValue("actor:test:connection-outsider"),
+        name: "Connection Outsider",
+        kind: "ai",
+    })).actor;
+    const source = await saveContext(uniqueValue("connection-source"), [], "connection test", creator.id);
+    const target = await saveContext(uniqueValue("connection-target"), [], "connection test", creator.id);
+    const privateSource = await savePersonalContext(creator.id, uniqueValue("private-source"));
+    const privateTarget = await savePersonalContext(outsider.id, uniqueValue("private-target"));
+
+    try {
+        const connected = await connectContexts(
+            creator.id,
+            source.id,
+            target.id,
+            "led_to",
+            "This intermediate idea explains why the next note followed.",
+        );
+        assert.equal(connected.connections.length, 1);
+        assert.deepEqual(connected.connections[0], {
+            id: connected.connections[0].id,
+            direction: "outgoing",
+            relationship: "led_to",
+            rationale: "This intermediate idea explains why the next note followed.",
+            other_context_id: target.id,
+            created_by: creator,
+            created_at: connected.connections[0].created_at,
+        });
+
+        const incoming = await getContext(target.id);
+        assert.equal(incoming.connections.length, 1);
+        assert.equal(incoming.connections[0].direction, "incoming");
+        assert.equal(incoming.connections[0].other_context_id, source.id);
+
+        const duplicate = await connectContexts(creator.id, source.id, target.id, "led_to", "ignored duplicate");
+        assert.equal(duplicate.connections.length, 1);
+        assert.equal(duplicate.connections[0].rationale, connected.connections[0].rationale);
+
+        await assert.rejects(
+            connectContexts(creator.id, privateSource.id, privateTarget.id, "related"),
+            /CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED/,
+        );
+
+        const disconnected = await disconnectContexts(creator.id, connected.connections[0].id);
+        assert.deepEqual(disconnected.connections, []);
+        assert.deepEqual((await getContext(target.id)).connections, []);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[source.id, target.id, privateSource.id, privateTarget.id]]);
+        await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[creator.id, outsider.id]]);
+    }
+});
+
+test("context lifecycle metadata is explicit, bounded, and same-scope", async () => {
+    await initializeDatabase();
+    const owner = (await identifyActor({ external_id: uniqueValue("actor:test:lifecycle-owner"), name: "Lifecycle Owner" })).actor;
+    const outsider = (await identifyActor({ external_id: uniqueValue("actor:test:lifecycle-outsider"), name: "Lifecycle Outsider" })).actor;
+    const current = await savePersonalContext(owner.id, uniqueValue("lifecycle-current"));
+    const successor = await savePersonalContext(owner.id, uniqueValue("lifecycle-successor"));
+    const hidden = await savePersonalContext(outsider.id, uniqueValue("lifecycle-hidden"));
+    try {
+        assert.equal(current.lifecycle.state, "active");
+        assert.equal(current.lifecycle.importance, 50);
+        const updated = await updateContextLifecycle(owner.id, current.id, {
+            state: "cold", importance: 15, completed: true, supersededByContextId: successor.id,
+        });
+        assert.equal(updated.lifecycle.state, "cold");
+        assert.equal(updated.lifecycle.importance, 15);
+        assert.ok(updated.lifecycle.completed_at);
+        assert.equal(updated.lifecycle.superseded_by_context_id, successor.id);
+        await assert.rejects(
+            updateContextLifecycle(owner.id, current.id, { supersededByContextId: hidden.id }),
+            /CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED/,
+        );
+        await assert.rejects(updateContextLifecycle(outsider.id, current.id, { state: "warm" }), /CONTEXT_NOT_FOUND_OR_NOT_AUTHORIZED/);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[current.id, successor.id, hidden.id]]);
+        await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[owner.id, outsider.id]]);
+    }
+});
+
+test("auto-archive requires a reviewed preview and protects tagged or connected landmarks", async () => {
+    await initializeDatabase();
+    const reviewer = (await identifyActor({ external_id: uniqueValue("actor:test:archive-reviewer"), name: "Archive Reviewer" })).actor;
+    const candidate = await saveContext(uniqueValue("archive-candidate"), [], "archive test", reviewer.id);
+    const protectedContext = await saveContext(uniqueValue("archive-protected"), ["canonical"], "archive test", reviewer.id);
+    try {
+        for (const context of [candidate, protectedContext]) {
+            await updateContextLifecycle(reviewer.id, context.id, { state: "archive_candidate", importance: 5, completed: true });
+        }
+        await db.query("UPDATE contexts SET created_at = NOW() - INTERVAL '90 days' WHERE id = ANY($1::bigint[])", [[candidate.id, protectedContext.id]]);
+        const preview = await previewAutoArchive(reviewer.id, 100, 30);
+        const eligible = preview.evaluations.find((item) => item.context_id === candidate.id);
+        const blocked = preview.evaluations.find((item) => item.context_id === protectedContext.id);
+        assert.equal(eligible.eligible, true);
+        assert.equal(blocked.eligible, false);
+        assert.deepEqual(blocked.protected_tags, ["canonical"]);
+        await assert.rejects(confirmAutoArchive(reviewer.id, preview.confirmation_token, [protectedContext.id]), /AUTO_ARCHIVE_PREVIEW_INVALID/);
+        const confirmed = await confirmAutoArchive(reviewer.id, preview.confirmation_token, [candidate.id]);
+        assert.deepEqual(confirmed.archived_context_ids, [candidate.id]);
+        assert.equal((await db.query("SELECT visibility FROM contexts WHERE id = $1", [candidate.id])).rows[0].visibility, "archived");
+        await assert.rejects(confirmAutoArchive(reviewer.id, preview.confirmation_token, [candidate.id]), /AUTO_ARCHIVE_PREVIEW_INVALID/);
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[candidate.id, protectedContext.id]]);
+        await db.query("DELETE FROM actors WHERE id = $1", [reviewer.id]);
+    }
+});
+
+test("context assembly is actor-bounded, graph-aware, lazily hydrated, and metered", async () => {
+    await initializeDatabase();
+    const owner = (await identifyActor({ external_id: uniqueValue("actor:test:assembly-owner"), name: "Assembly Owner" })).actor;
+    const outsider = (await identifyActor({ external_id: uniqueValue("actor:test:assembly-outsider"), name: "Assembly Outsider" })).actor;
+    const marker = uniqueValue("assembly-marker");
+    const source = await savePersonalContext(owner.id, `${marker} ${"x".repeat(900)}`);
+    const neighbor = await savePersonalContext(owner.id, `graph neighbor ${"y".repeat(900)}`);
+    const hidden = await savePersonalContext(outsider.id, `${marker} hidden outsider`);
+    try {
+        await connectContexts(owner.id, source.id, neighbor.id, "led_to", "assembly graph expansion");
+        const assembly = await assembleContext(owner.id, marker, { limit: 5, hydrateLimit: 1, maxContentChars: 3000 });
+        assert.deepEqual(assembly.items.map((item) => item.context.id), [source.id, neighbor.id]);
+        assert.equal(assembly.items[0].hydrated, true);
+        assert.equal(assembly.items[1].hydrated, false);
+        assert.equal(assembly.items[1].context.content.length, 500);
+        assert.equal(assembly.items[1].via.kind, "connection");
+        assert.ok(!assembly.items.some((item) => item.context.id === hidden.id));
+        const telemetry = await db.query("SELECT retrieval_count, last_retrieved_at FROM contexts WHERE id = ANY($1::bigint[]) ORDER BY id", [[source.id, neighbor.id]]);
+        assert.deepEqual(telemetry.rows.map((row) => Number(row.retrieval_count)), [1, 1]);
+        assert.ok(telemetry.rows.every((row) => row.last_retrieved_at));
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [[source.id, neighbor.id, hidden.id]]);
+        await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[owner.id, outsider.id]]);
     }
 });
 

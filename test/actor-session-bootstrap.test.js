@@ -489,6 +489,7 @@ test("local approval binds the exact requesting OpenAI conversation", async () =
     const connection = await connectTestClient();
     const requestIds = [];
     const sessionIds = [];
+    let whiteboardContextId;
     const firstMeta = openAITunnelMeta("same-account", "first-conversation");
     const secondMeta = openAITunnelMeta("same-account", "second-conversation");
 
@@ -525,6 +526,21 @@ test("local approval binds the exact requesting OpenAI conversation", async () =
         });
         assert.notEqual(automatic.isError, true);
 
+        const saved = textResult(await connection.client.callTool({
+            name: "save_context",
+            arguments: {
+                text: uniqueValue("actor-only-whiteboard"),
+                actor: { external_id: "actor:spoofed:identity", name: "Spoofed" },
+            },
+            _meta: firstMeta,
+        })).saved;
+        whiteboardContextId = saved.id;
+        assert.equal(saved.actor.external_id, actorExternalId);
+        const exact = textResult(await connection.client.callTool({
+            name: "get_context", arguments: { id: whiteboardContextId }, _meta: firstMeta,
+        }));
+        assert.equal(exact.context.id, whiteboardContextId);
+
         const otherConversation = await connection.client.callTool({
             name: "list_channels",
             arguments: {},
@@ -532,6 +548,11 @@ test("local approval binds the exact requesting OpenAI conversation", async () =
         });
         assert.equal(otherConversation.isError, true);
         assert.equal(textResult(otherConversation).error.code, "AUTHENTICATION_REQUIRED");
+        const unauthenticatedRead = await connection.client.callTool({
+            name: "get_context", arguments: { id: whiteboardContextId }, _meta: secondMeta,
+        });
+        assert.equal(unauthenticatedRead.isError, true);
+        assert.equal(textResult(unauthenticatedRead).error.code, "AUTHENTICATION_REQUIRED");
         assert.match(
             textResult(otherConversation).error.message,
             /approve that exact request in Agent Companion/,
@@ -579,6 +600,7 @@ test("local approval binds the exact requesting OpenAI conversation", async () =
         });
         assert.notEqual(current.isError, true);
     } finally {
+        if (whiteboardContextId) await db.query("DELETE FROM contexts WHERE id = $1", [whiteboardContextId]);
         await db.query(
             "DELETE FROM actor_session_requests WHERE request_id = ANY($1::text[])",
             [requestIds],
