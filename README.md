@@ -348,9 +348,13 @@ existing response-size limits.
 Legacy `{ "id": 123 }` calls retain their exact Whiteboard response shape.
 Calling `get_context` without an ID lists the selected authorized relation in
 `newest` or `oldest` order. Existing specialized read tools remain available as
-compatibility surfaces while equivalence and catalog-hydration behavior are
-measured. Semantic predicates and Fenic execution are deliberately deferred
-until this deterministic authorization boundary is proven.
+compatibility surfaces. Their deterministic exact/list implementations now
+delegate to the same query engine, while preserving legacy membership errors,
+result shapes, and limits. Semantic search and Direct inbox envelope metadata
+remain on their specialized paths until their equivalence contracts can be
+represented without losing ranking, delivery sequence, or acknowledgement
+state. Semantic predicates and Fenic execution are deliberately deferred until
+this deterministic authorization boundary is proven.
 
 ### Whiteboard visibility
 

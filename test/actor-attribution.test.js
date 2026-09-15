@@ -25,9 +25,12 @@ const {
     identifyActor,
     deleteContext,
     getContext,
+    getPersonalContext,
     getDatabaseMetadata,
     getUserProfile,
     listRecentContext,
+    listDirectInbox,
+    listPersonalContext,
     previewAutoArchive,
     queryContext,
     saveContext,
@@ -445,6 +448,13 @@ test("unified context predicates query only the selected actor-authorized relati
             none: [{ field: "kind", operator: "eq", value: "missing-kind" }],
         }, "newest", 10);
         assert.deepEqual(selectedWhiteboard.map(({ id }) => id), [whiteboard.id]);
+        assert.deepEqual(
+            (await listRecentContext(10, ownerExternalId)).map(({ id }) => id),
+            (await queryContext(owner.actor.id, "whiteboard", {
+                all: [{ field: "actor_external_id", operator: "eq", value: ownerExternalId }],
+            }, "newest", 10)).map(({ id }) => id),
+        );
+        assert.deepEqual(await getContext(whiteboard.id), whiteboard);
 
         const unifiedResponse = textResult(await connectionForUnifiedQuery());
         assert.equal(unifiedResponse.class, "whiteboard");
@@ -455,6 +465,12 @@ test("unified context predicates query only the selected actor-authorized relati
         }, "oldest", 10);
         assert.ok(selectedPersonal.some(({ id }) => id === ownerPersonal.id));
         assert.ok(selectedPersonal.every(({ id }) => id !== otherPersonal.id));
+        assert.deepEqual(
+            (await listPersonalContext(owner.actor.id, 10)).map(({ id }) => id),
+            (await queryContext(owner.actor.id, "personal", undefined, "newest", 10)).map(({ id }) => id),
+        );
+        assert.deepEqual(await getPersonalContext(owner.actor.id, ownerPersonal.id), ownerPersonal);
+        assert.equal(await getPersonalContext(other.actor.id, ownerPersonal.id), null);
 
         const selectedDirect = await queryContext(owner.actor.id, "direct", {
             all: [
@@ -463,6 +479,12 @@ test("unified context predicates query only the selected actor-authorized relati
             ],
         });
         assert.deepEqual(selectedDirect.map(({ id }) => id), [direct.context.id]);
+        assert.deepEqual(
+            (await listDirectInbox(owner.actor.id, { unreadOnly: true, limit: 10 })).map(({ context }) => context.id),
+            (await queryContext(owner.actor.id, "direct", {
+                all: [{ field: "unread", operator: "eq", value: true }],
+            }, "newest", 10)).map(({ id }) => id),
+        );
         assert.deepEqual(await queryContext(other.actor.id, "direct", {
             all: [{ field: "id", operator: "eq", value: direct.context.id }],
         }), []);

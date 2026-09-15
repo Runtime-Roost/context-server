@@ -1585,41 +1585,21 @@ export async function listContextByTag(tag: string, limit?: number) {
 }
 
 export async function listRecentContext(limit?: number, actorExternalId?: string) {
-    await initializeDatabase();
-
-    const result = await db.query<ContextRow>(
-        `
-            SELECT ${CONTEXT_PROJECTION}
-            FROM contexts
-            LEFT JOIN actors ON actors.id = contexts.actor_id
-            WHERE ${WHITEBOARD_READ_PREDICATE}
-              AND ($1::text IS NULL OR actors.external_id = $1)
-            ORDER BY contexts.created_at DESC, contexts.id DESC
-            LIMIT $2
-        `,
-        [actorExternalId ?? null, normalizeLimit(limit)]
+    return queryContext(
+        0,
+        "whiteboard",
+        actorExternalId
+            ? { all: [{ field: "actor_external_id", operator: "eq", value: actorExternalId }] }
+            : undefined,
+        "newest",
+        limit,
     );
-
-    return result.rows.map(mapContextRow);
 }
 
 export async function getContext(id: number) {
-    await initializeDatabase();
-
-    const result = await db.query<ContextRow>(
-        `
-            SELECT ${CONTEXT_PROJECTION}
-            FROM contexts
-            LEFT JOIN actors ON actors.id = contexts.actor_id
-            WHERE contexts.id = $1
-              AND ${WHITEBOARD_READ_PREDICATE}
-        `,
-        [id]
-    );
-
-    const context = result.rows[0];
-
-    return context ? mapContextRow(context) : null;
+    return (await queryContext(0, "whiteboard", {
+        all: [{ field: "id", operator: "eq", value: id }],
+    }, "newest", 1))[0] ?? null;
 }
 
 type ConnectionEndpointRow = {
@@ -2707,46 +2687,19 @@ export async function listChannelContext(
     slug: string,
     limit?: number,
 ) {
-    await initializeDatabase();
-    const channel = await requireChannelMembership(actorId, slug, "read");
-    const result = await db.query<ContextRow>(
-        `
-            SELECT ${CONTEXT_PROJECTION}
-            FROM contexts
-            LEFT JOIN actors ON actors.id = contexts.actor_id
-            WHERE contexts.visibility = 'channel'
-              AND contexts.channel_id = $1
-            ORDER BY contexts.created_at DESC, contexts.id DESC
-            LIMIT $2
-        `,
-        [channel.id, normalizeLimit(limit)],
-    );
-
-    return result.rows.map(mapContextRow);
+    await requireChannelMembership(actorId, slug, "read");
+    return queryContext(actorId, "channel", {
+        all: [{ field: "channel", operator: "eq", value: normalizeChannelSlug(slug) }],
+    }, "newest", limit);
 }
 
 export async function getChannelContext(
     actorId: number,
     id: number,
 ) {
-    await initializeDatabase();
-    const result = await db.query<ContextRow>(
-        `
-            SELECT ${CONTEXT_PROJECTION}
-            FROM contexts
-            LEFT JOIN actors ON actors.id = contexts.actor_id
-            INNER JOIN channel_memberships
-                ON channel_memberships.channel_id = contexts.channel_id
-            WHERE contexts.id = $1
-              AND contexts.visibility = 'channel'
-              AND channel_memberships.actor_id = $2
-              AND channel_memberships.removed_at IS NULL
-              AND channel_memberships.can_read
-        `,
-        [id, actorId],
-    );
-
-    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    return (await queryContext(actorId, "channel", {
+        all: [{ field: "id", operator: "eq", value: id }],
+    }, "newest", 1))[0] ?? null;
 }
 
 export async function updateChannelContext(
@@ -3309,43 +3262,16 @@ export async function searchGroupContext(
 }
 
 export async function listGroupContext(actorId: number, slug: string, limit?: number) {
-    await initializeDatabase();
-    const group = await requireAccessGroupMembership(actorId, slug, "read");
-    const result = await db.query<ContextRow>(
-        `
-            SELECT ${CONTEXT_PROJECTION}
-            FROM contexts
-            LEFT JOIN actors ON actors.id = contexts.actor_id
-            WHERE contexts.visibility = 'group'
-              AND contexts.group_id = $1
-            ORDER BY contexts.created_at DESC, contexts.id DESC
-            LIMIT $2
-        `,
-        [group.id, normalizeLimit(limit)],
-    );
-
-    return result.rows.map(mapContextRow);
+    await requireAccessGroupMembership(actorId, slug, "read");
+    return queryContext(actorId, "group", {
+        all: [{ field: "group", operator: "eq", value: normalizeAccessGroupSlug(slug) }],
+    }, "newest", limit);
 }
 
 export async function getGroupContext(actorId: number, id: number) {
-    await initializeDatabase();
-    const result = await db.query<ContextRow>(
-        `
-            SELECT ${CONTEXT_PROJECTION}
-            FROM contexts
-            LEFT JOIN actors ON actors.id = contexts.actor_id
-            INNER JOIN access_group_memberships
-                ON access_group_memberships.group_id = contexts.group_id
-            WHERE contexts.id = $1
-              AND contexts.visibility = 'group'
-              AND access_group_memberships.actor_id = $2
-              AND access_group_memberships.removed_at IS NULL
-              AND access_group_memberships.can_read
-        `,
-        [id, actorId],
-    );
-
-    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    return (await queryContext(actorId, "group", {
+        all: [{ field: "id", operator: "eq", value: id }],
+    }, "newest", 1))[0] ?? null;
 }
 
 export async function updateGroupContext(
@@ -3597,38 +3523,13 @@ export async function searchPersonalContext(
 }
 
 export async function listPersonalContext(actorId: number, limit?: number) {
-    await initializeDatabase();
-    const result = await db.query<ContextRow>(
-        `
-            SELECT ${CONTEXT_PROJECTION}
-            FROM contexts
-            LEFT JOIN actors ON actors.id = contexts.actor_id
-            WHERE contexts.visibility = 'personal'
-              AND contexts.actor_id = $1
-            ORDER BY contexts.created_at DESC, contexts.id DESC
-            LIMIT $2
-        `,
-        [actorId, normalizeLimit(limit)],
-    );
-
-    return result.rows.map(mapContextRow);
+    return queryContext(actorId, "personal", undefined, "newest", limit);
 }
 
 export async function getPersonalContext(actorId: number, id: number) {
-    await initializeDatabase();
-    const result = await db.query<ContextRow>(
-        `
-            SELECT ${CONTEXT_PROJECTION}
-            FROM contexts
-            LEFT JOIN actors ON actors.id = contexts.actor_id
-            WHERE contexts.id = $1
-              AND contexts.visibility = 'personal'
-              AND contexts.actor_id = $2
-        `,
-        [id, actorId],
-    );
-
-    return result.rows[0] ? mapContextRow(result.rows[0]) : null;
+    return (await queryContext(actorId, "personal", {
+        all: [{ field: "id", operator: "eq", value: id }],
+    }, "newest", 1))[0] ?? null;
 }
 
 export async function updatePersonalContext(
