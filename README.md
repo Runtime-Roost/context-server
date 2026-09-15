@@ -329,6 +329,29 @@ fixtures and should not be set in deployed services. Subjects, mentions,
 connections, lifecycle fields, payload references, and tags remain inert
 metadata: none can authenticate, grant membership, or widen visibility.
 
+### Unified deterministic context query
+
+`get_context` accepts a bounded lambda-shaped predicate AST over an
+actor-authorized relation. `class` selects `whiteboard`, `personal`, `channel`,
+`group`, or recipient-owned `direct` context. Context Server applies the class's
+ownership or membership predicate before caller filters, sorting, or limiting.
+A predicate therefore cannot observe, count, or test unauthorized rows.
+
+The `where` object supports `all`, `any`, and `none` groups with at most 24
+predicates total. Fields and operators are allowlisted, and values are bound SQL
+parameters. No JavaScript, Python, SQL fragments, callbacks, filesystem access,
+or network activity can be supplied through the query. Scope-specific fields
+(`channel`, `group`, `unread`, and `sequence`) are accepted only for their
+matching class. Results are bounded to 50 records and projected through the
+existing response-size limits.
+
+Legacy `{ "id": 123 }` calls retain their exact Whiteboard response shape.
+Calling `get_context` without an ID lists the selected authorized relation in
+`newest` or `oldest` order. Existing specialized read tools remain available as
+compatibility surfaces while equivalence and catalog-hydration behavior are
+measured. Semantic predicates and Fenic execution are deliberately deferred
+until this deterministic authorization boundary is proven.
+
 ### Whiteboard visibility
 
 Every context now has a first-class `visibility` classification. Existing rows
@@ -336,10 +359,9 @@ are migrated to `whiteboard`, and new saves default to `whiteboard`. Whiteboard
 records are shared context discoverable through `search_context`,
 `list_recent_context`, `get_context`, and `get_user_profile`.
 
-The general context tools intentionally accept only `whiteboard`.
-Non-whiteboard rows fail closed: current whiteboard reads, updates, deletes,
-and context purges do not expose or mutate them. This avoids presenting
-self-asserted actor identity as real access control.
+Whiteboard write, update, delete, and purge tools remain scoped to
+`whiteboard`. The unified `get_context` read may select another class only after
+authentication and applies that class's server-owned authorization predicate.
 
 ### Private notebook
 

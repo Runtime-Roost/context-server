@@ -18,6 +18,9 @@ import {
     ACCESS_GROUP_ROLE_VALUES,
     CHANNEL_ROLE_VALUES,
     CONTEXT_LIFECYCLE_STATE_VALUES,
+    CONTEXT_QUERY_CLASS_VALUES,
+    CONTEXT_QUERY_FIELD_VALUES,
+    CONTEXT_QUERY_OPERATOR_VALUES,
     SEARCH_SENSITIVITY_VALUES,
     type ContextRecord,
     WRITABLE_CONTEXT_VISIBILITY_VALUES,
@@ -55,6 +58,7 @@ import {
     listActorAccessGroups,
     listGroupContext,
     previewAutoArchive,
+    queryContext,
     removeAccessGroupMember,
     removeChannelMember,
     saveContextWithActor,
@@ -220,6 +224,8 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "PAYLOAD_DERIVATION_SOURCE_REQUIRED",
         "PAYLOAD_DERIVATION_SOURCE_INVALID",
         "PAYLOAD_NOT_FOUND_OR_NOT_AUTHORIZED",
+        "CONTEXT_QUERY_PREDICATE_INVALID",
+        "CONTEXT_QUERY_TOO_COMPLEX",
     ]);
     const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
@@ -1934,7 +1940,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
     server.registerTool(
         "get_context",
         {
-            description: "Read one local shared Whiteboard note by its exact ID. Non-Whiteboard records are not accessible. This does not modify data or contact external services.",
+            description: "Read actor-authorized context through one bounded deterministic query. Legacy {id} reads remain supported. Use class plus all/any/none predicate groups for lambda-shaped metadata filtering; predicates are data, never executable code.",
             annotations: {
                 title: "Read Shared Whiteboard Note",
                 readOnlyHint: true,
@@ -1943,28 +1949,78 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 openWorldHint: false,
             },
             inputSchema: {
-                id: z.number().int().positive().describe("The id of the context item to retrieve."),
+                id: z.number().int().positive().optional().describe("Legacy exact Whiteboard ID. Equivalent to class=whiteboard with an id equality predicate."),
+                class: z.enum(CONTEXT_QUERY_CLASS_VALUES).optional().describe("Authorized context relation to query. Defaults to whiteboard."),
+                where: z.object({
+                    all: z.array(z.object({
+                        field: z.enum(CONTEXT_QUERY_FIELD_VALUES),
+                        operator: z.enum(CONTEXT_QUERY_OPERATOR_VALUES),
+                        value: z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]).optional(),
+                    })).max(24).optional().describe("Every predicate must match."),
+                    any: z.array(z.object({
+                        field: z.enum(CONTEXT_QUERY_FIELD_VALUES),
+                        operator: z.enum(CONTEXT_QUERY_OPERATOR_VALUES),
+                        value: z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]).optional(),
+                    })).max(24).optional().describe("At least one predicate must match."),
+                    none: z.array(z.object({
+                        field: z.enum(CONTEXT_QUERY_FIELD_VALUES),
+                        operator: z.enum(CONTEXT_QUERY_OPERATOR_VALUES),
+                        value: z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]).optional(),
+                    })).max(24).optional().describe("No predicate may match."),
+                }).strict().optional().describe("Bounded lambda-shaped predicate AST. At most 24 predicates total."),
+                order: z.enum(["newest", "oldest"]).optional().describe("Deterministic chronological order. Defaults to newest."),
+                limit: z.number().int().min(1).max(50).optional().describe("Maximum results. Defaults to five."),
             },
         },
-        async ({ id }, extra) => {
+        async ({ id, class: contextClass, where, order, limit }, extra) => {
+            const selectedClass = contextClass ?? "whiteboard";
+            const legacyExactRead = id !== undefined
+                && contextClass === undefined
+                && where === undefined
+                && order === undefined
+                && limit === undefined;
+            const selectedWhere = id === undefined
+                ? where
+                : {
+                    ...where,
+                    all: [
+                        ...(where?.all ?? []),
+                        { field: "id" as const, operator: "eq" as const, value: id },
+                    ],
+                };
             try {
-                await authenticateContextTool("get_context", { id }, extra);
+                const payload = { id, class: contextClass, where, order, limit };
+                const authenticated = await authenticateContextTool("get_context", payload, extra);
+                if (!authenticated && selectedClass !== "whiteboard") {
+                    throw new Error("AUTHENTICATION_REQUIRED");
+                }
+                const results = await queryContext(
+                    authenticated?.actor_id ?? 0,
+                    selectedClass,
+                    selectedWhere,
+                    order,
+                    id === undefined ? limit : 1,
+                );
+                if (legacyExactRead) {
+                    return {
+                        content: [{ type: "text", text: JSON.stringify({ id, context: results[0] ?? null }) }],
+                    };
+                }
+                const projected = projectContextResults(results, "list");
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            class: selectedClass,
+                            order: order ?? "newest",
+                            limit: id === undefined ? (limit ?? DEFAULT_CONTEXT_RESULT_LIMIT) : 1,
+                            ...projected,
+                        }),
+                    }],
+                };
             } catch (error) {
                 return authenticationError(error);
             }
-            const context = await getContext(id);
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify({
-                            id,
-                            context,
-                        }),
-                    },
-                ],
-            };
         }
     );
 

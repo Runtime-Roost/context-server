@@ -29,7 +29,9 @@ const {
     getUserProfile,
     listRecentContext,
     previewAutoArchive,
+    queryContext,
     saveContext,
+    saveDirectContext,
     savePersonalContext,
     searchContext,
     searchContextByVector,
@@ -422,6 +424,90 @@ test("get_context returns an exact record or null", async () => {
     }
 });
 
+test("unified context predicates query only the selected actor-authorized relation", async () => {
+    const ownerExternalId = uniqueValue("actor:test:unified-owner");
+    const otherExternalId = uniqueValue("actor:test:unified-other");
+    const owner = await identifyActor({ external_id: ownerExternalId, name: "Unified Owner", kind: "ai" });
+    const other = await identifyActor({ external_id: otherExternalId, name: "Unified Other", kind: "ai" });
+    const marker = uniqueValue("unified-query");
+    const whiteboard = await saveContext(`${marker} whiteboard`, ["unified-query", "canonical"], marker, owner.actor.id);
+    const ownerPersonal = await savePersonalContext(owner.actor.id, `${marker} owner personal`, ["unified-query"], marker);
+    const otherPersonal = await savePersonalContext(other.actor.id, `${marker} other personal`, ["unified-query"], marker);
+    const direct = await saveDirectContext(other.actor.id, ownerExternalId, `${marker} direct`, ["unified-query"], marker);
+    const contextIds = [whiteboard.id, ownerPersonal.id, otherPersonal.id, direct.context.id];
+
+    try {
+        const selectedWhiteboard = await queryContext(owner.actor.id, "whiteboard", {
+            all: [
+                { field: "tags", operator: "contains", value: "unified-query" },
+                { field: "source", operator: "eq", value: marker },
+            ],
+            none: [{ field: "kind", operator: "eq", value: "missing-kind" }],
+        }, "newest", 10);
+        assert.deepEqual(selectedWhiteboard.map(({ id }) => id), [whiteboard.id]);
+
+        const unifiedResponse = textResult(await connectionForUnifiedQuery());
+        assert.equal(unifiedResponse.class, "whiteboard");
+        assert.ok(unifiedResponse.results.some(({ id }) => id === whiteboard.id));
+
+        const selectedPersonal = await queryContext(owner.actor.id, "personal", {
+            all: [{ field: "tags", operator: "contains_any", value: ["unified-query"] }],
+        }, "oldest", 10);
+        assert.ok(selectedPersonal.some(({ id }) => id === ownerPersonal.id));
+        assert.ok(selectedPersonal.every(({ id }) => id !== otherPersonal.id));
+
+        const selectedDirect = await queryContext(owner.actor.id, "direct", {
+            all: [
+                { field: "unread", operator: "eq", value: true },
+                { field: "id", operator: "eq", value: direct.context.id },
+            ],
+        });
+        assert.deepEqual(selectedDirect.map(({ id }) => id), [direct.context.id]);
+        assert.deepEqual(await queryContext(other.actor.id, "direct", {
+            all: [{ field: "id", operator: "eq", value: direct.context.id }],
+        }), []);
+
+        await assert.rejects(
+            queryContext(owner.actor.id, "whiteboard", {
+                all: [{ field: "importance", operator: "matches", value: "50" }],
+            }),
+            /CONTEXT_QUERY_PREDICATE_INVALID/,
+        );
+        await assert.rejects(
+            queryContext(owner.actor.id, "personal", {
+                all: [{ field: "unread", operator: "eq", value: true }],
+            }),
+            /CONTEXT_QUERY_PREDICATE_INVALID/,
+        );
+        await assert.rejects(
+            queryContext(owner.actor.id, "whiteboard", {
+                all: Array.from({ length: 25 }, () => ({ field: "id", operator: "gt", value: 0 })),
+            }),
+            /CONTEXT_QUERY_TOO_COMPLEX/,
+        );
+    } finally {
+        await db.query("DELETE FROM contexts WHERE id = ANY($1::bigint[])", [contextIds]);
+        await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[owner.actor.id, other.actor.id]]);
+    }
+
+    async function connectionForUnifiedQuery() {
+        const connection = await connectTestClient();
+        try {
+            return await connection.client.callTool({
+                name: "get_context",
+                arguments: {
+                    class: "whiteboard",
+                    where: { all: [{ field: "id", operator: "eq", value: whiteboard.id }] },
+                    order: "oldest",
+                    limit: 5,
+                },
+            });
+        } finally {
+            await connection.close();
+        }
+    }
+});
+
 test("context acknowledgements are actor-scoped, idempotent, ordered, and Whiteboard-only", async () => {
     const marker = uniqueValue("context-acknowledgement");
     const context = await saveContext(marker, ["acknowledgement"], "acknowledgement test");
@@ -721,8 +807,11 @@ test("built MCP schemas expose actor identification and stable actor filters", a
             idempotentHint: false,
             openWorldHint: false,
         });
-        assert.deepEqual(getContextSchema.required, ["id"]);
+        assert.equal(getContextSchema.required, undefined);
         assert.ok(getContextSchema.properties.id);
+        assert.deepEqual(getContextSchema.properties.class.enum, ["whiteboard", "personal", "channel", "group", "direct"]);
+        assert.ok(getContextSchema.properties.where);
+        assert.deepEqual(getContextSchema.properties.order.enum, ["newest", "oldest"]);
         assert.deepEqual(acknowledgeSchema.required, ["context_id"]);
         assert.deepEqual(acknowledgeSchema.properties.actor.required, ["external_id", "name"]);
         assert.deepEqual(acknowledgeTool.annotations, {

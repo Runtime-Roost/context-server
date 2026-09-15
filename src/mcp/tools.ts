@@ -122,6 +122,29 @@ export type DirectInboxEnvelope = {
 
 export const SEARCH_SENSITIVITY_VALUES = ["low", "medium", "high"] as const;
 export type SearchSensitivity = (typeof SEARCH_SENSITIVITY_VALUES)[number];
+export const CONTEXT_QUERY_CLASS_VALUES = ["whiteboard", "personal", "channel", "group", "direct"] as const;
+export type ContextQueryClass = (typeof CONTEXT_QUERY_CLASS_VALUES)[number];
+export const CONTEXT_QUERY_FIELD_VALUES = [
+    "id", "kind", "tags", "actor_external_id", "subject_external_id",
+    "lifecycle_state", "importance", "created_at", "updated_at", "source",
+    "channel", "group", "unread", "sequence",
+] as const;
+export type ContextQueryField = (typeof CONTEXT_QUERY_FIELD_VALUES)[number];
+export const CONTEXT_QUERY_OPERATOR_VALUES = [
+    "eq", "ne", "gt", "gte", "lt", "lte", "contains", "contains_any", "exists", "matches",
+] as const;
+export type ContextQueryOperator = (typeof CONTEXT_QUERY_OPERATOR_VALUES)[number];
+export type ContextQueryPredicate = {
+    field: ContextQueryField;
+    operator: ContextQueryOperator;
+    value?: string | number | boolean | string[];
+};
+export type ContextQueryWhere = {
+    all?: ContextQueryPredicate[];
+    any?: ContextQueryPredicate[];
+    none?: ContextQueryPredicate[];
+};
+export type ContextQueryOrder = "newest" | "oldest";
 export const CONTEXT_VISIBILITY_VALUES = [
     "whiteboard",
     "channel",
@@ -253,6 +276,178 @@ function normalizeLimit(limit?: number) {
     }
 
     return Math.min(Math.max(Math.trunc(limit), 1), MAX_CONTEXT_LIMIT);
+}
+
+const CONTEXT_QUERY_MAX_PREDICATES = 24;
+
+function compileContextQueryPredicate(
+    predicate: ContextQueryPredicate,
+    actorId: number,
+    parameters: unknown[],
+) {
+    const addParameter = (value: unknown) => {
+        parameters.push(value);
+        return `$${parameters.length}`;
+    };
+    const scalarExpressions: Partial<Record<ContextQueryField, string>> = {
+        id: "contexts.id",
+        kind: "contexts.kind",
+        actor_external_id: "actors.external_id",
+        subject_external_id: "(SELECT subjects.external_id FROM subjects WHERE subjects.id = contexts.subject_id)",
+        lifecycle_state: "contexts.lifecycle_state",
+        importance: "contexts.importance",
+        created_at: "contexts.created_at",
+        updated_at: "contexts.updated_at",
+        source: "contexts.source",
+        channel: "(SELECT channels.slug FROM channels WHERE channels.id = contexts.channel_id)",
+        group: "(SELECT access_groups.slug FROM access_groups WHERE access_groups.id = contexts.group_id)",
+        sequence: "(SELECT direct_context_envelopes.sequence FROM direct_context_envelopes WHERE direct_context_envelopes.context_id = contexts.id)",
+    };
+
+    if (predicate.field === "unread") {
+        if (predicate.operator !== "eq" || typeof predicate.value !== "boolean") {
+            throw new Error("CONTEXT_QUERY_PREDICATE_INVALID");
+        }
+        const unread = `NOT EXISTS (
+            SELECT 1 FROM context_acknowledgements
+            WHERE context_acknowledgements.context_id = contexts.id
+              AND context_acknowledgements.actor_id = ${addParameter(actorId)}
+        )`;
+        return predicate.value ? unread : `NOT (${unread})`;
+    }
+
+    if (predicate.field === "tags") {
+        if (predicate.operator === "contains" && typeof predicate.value === "string") {
+            return `${addParameter(predicate.value)} = ANY(contexts.tags)`;
+        }
+        if (predicate.operator === "contains_any"
+            && Array.isArray(predicate.value)
+            && predicate.value.length > 0
+            && predicate.value.length <= 50
+            && predicate.value.every((value) => typeof value === "string")) {
+            return `contexts.tags && ${addParameter(predicate.value)}::text[]`;
+        }
+        if (predicate.operator === "exists" && typeof predicate.value === "boolean") {
+            return predicate.value ? "cardinality(contexts.tags) > 0" : "cardinality(contexts.tags) = 0";
+        }
+        throw new Error("CONTEXT_QUERY_PREDICATE_INVALID");
+    }
+
+    const expression = scalarExpressions[predicate.field];
+    if (!expression) throw new Error("CONTEXT_QUERY_PREDICATE_INVALID");
+    if (predicate.operator === "exists" && typeof predicate.value === "boolean") {
+        return `${expression} IS ${predicate.value ? "NOT " : ""}NULL`;
+    }
+
+    const numericFields = new Set<ContextQueryField>(["id", "importance", "sequence"]);
+    const timestampFields = new Set<ContextQueryField>(["created_at", "updated_at"]);
+    if (numericFields.has(predicate.field) && typeof predicate.value !== "number") {
+        throw new Error("CONTEXT_QUERY_PREDICATE_INVALID");
+    }
+    if (timestampFields.has(predicate.field)) {
+        if (typeof predicate.value !== "string" || Number.isNaN(Date.parse(predicate.value))) {
+            throw new Error("CONTEXT_QUERY_PREDICATE_INVALID");
+        }
+    }
+    if (!numericFields.has(predicate.field)
+        && !timestampFields.has(predicate.field)
+        && typeof predicate.value !== "string") {
+        throw new Error("CONTEXT_QUERY_PREDICATE_INVALID");
+    }
+
+    if (predicate.operator === "matches") {
+        if (numericFields.has(predicate.field) || timestampFields.has(predicate.field)) {
+            throw new Error("CONTEXT_QUERY_PREDICATE_INVALID");
+        }
+        return `${expression} ILIKE ('%' || ${addParameter(predicate.value)} || '%')`;
+    }
+    const operators: Partial<Record<ContextQueryOperator, string>> = {
+        eq: "=", ne: "<>", gt: ">", gte: ">=", lt: "<", lte: "<=",
+    };
+    const sqlOperator = operators[predicate.operator];
+    if (!sqlOperator) throw new Error("CONTEXT_QUERY_PREDICATE_INVALID");
+    return `${expression} ${sqlOperator} ${addParameter(predicate.value)}`;
+}
+
+function compileContextQueryWhere(where: ContextQueryWhere | undefined, actorId: number, parameters: unknown[]) {
+    if (!where) return "TRUE";
+    const groups = [where.all ?? [], where.any ?? [], where.none ?? []];
+    const count = groups.reduce((total, predicates) => total + predicates.length, 0);
+    if (count > CONTEXT_QUERY_MAX_PREDICATES) throw new Error("CONTEXT_QUERY_TOO_COMPLEX");
+    const clauses: string[] = [];
+    if (groups[0].length > 0) {
+        clauses.push(`(${groups[0].map((item) => compileContextQueryPredicate(item, actorId, parameters)).join(" AND ")})`);
+    }
+    if (groups[1].length > 0) {
+        clauses.push(`(${groups[1].map((item) => compileContextQueryPredicate(item, actorId, parameters)).join(" OR ")})`);
+    }
+    if (groups[2].length > 0) {
+        clauses.push(`NOT (${groups[2].map((item) => compileContextQueryPredicate(item, actorId, parameters)).join(" OR ")})`);
+    }
+    return clauses.length > 0 ? clauses.join(" AND ") : "TRUE";
+}
+
+export async function queryContext(
+    actorId: number,
+    contextClass: ContextQueryClass,
+    where?: ContextQueryWhere,
+    order: ContextQueryOrder = "newest",
+    limit?: number,
+) {
+    await initializeDatabase();
+    const predicates = [
+        ...(where?.all ?? []),
+        ...(where?.any ?? []),
+        ...(where?.none ?? []),
+    ];
+    const scopedFields: Partial<Record<ContextQueryField, ContextQueryClass>> = {
+        channel: "channel",
+        group: "group",
+        unread: "direct",
+        sequence: "direct",
+    };
+    if (predicates.some(({ field }) => scopedFields[field] !== undefined && scopedFields[field] !== contextClass)) {
+        throw new Error("CONTEXT_QUERY_PREDICATE_INVALID");
+    }
+    const parameters: unknown[] = [actorId];
+    const authorizationByClass: Record<ContextQueryClass, string> = {
+        whiteboard: "contexts.visibility = 'whiteboard' AND $1::bigint IS NOT NULL",
+        personal: "contexts.visibility = 'personal' AND contexts.actor_id = $1",
+        channel: `contexts.visibility = 'channel' AND EXISTS (
+            SELECT 1 FROM channel_memberships
+            WHERE channel_memberships.channel_id = contexts.channel_id
+              AND channel_memberships.actor_id = $1
+              AND channel_memberships.removed_at IS NULL
+              AND channel_memberships.can_read
+        )`,
+        group: `contexts.visibility = 'group' AND EXISTS (
+            SELECT 1 FROM access_group_memberships
+            WHERE access_group_memberships.group_id = contexts.group_id
+              AND access_group_memberships.actor_id = $1
+              AND access_group_memberships.removed_at IS NULL
+              AND access_group_memberships.can_read
+        )`,
+        direct: `contexts.visibility = 'direct' AND EXISTS (
+            SELECT 1 FROM direct_context_envelopes
+            WHERE direct_context_envelopes.context_id = contexts.id
+              AND direct_context_envelopes.recipient_actor_id = $1
+        )`,
+    };
+    const predicate = compileContextQueryWhere(where, actorId, parameters);
+    parameters.push(Math.min(normalizeLimit(limit), 50));
+    const limitParameter = `$${parameters.length}`;
+    const direction = order === "oldest" ? "ASC" : "DESC";
+    const result = await db.query<ContextRow>(
+        `SELECT ${CONTEXT_PROJECTION}
+         FROM contexts
+         LEFT JOIN actors ON actors.id = contexts.actor_id
+         WHERE ${authorizationByClass[contextClass]}
+           AND (${predicate})
+         ORDER BY contexts.created_at ${direction}, contexts.id ${direction}
+         LIMIT ${limitParameter}`,
+        parameters,
+    );
+    return result.rows.map(mapContextRow);
 }
 
 export function similarityThresholdForSensitivity(sensitivity: SearchSensitivity) {
