@@ -15,6 +15,10 @@ import {
     requestActorSession,
 } from "../auth/actor-sessions.js";
 import {
+    configuredContextAuthority,
+    type ContextAuthority,
+} from "../auth/roost-sso-authority.js";
+import {
     ACCESS_GROUP_ROLE_VALUES,
     CHANNEL_ROLE_VALUES,
     CONTEXT_LIFECYCLE_STATE_VALUES,
@@ -270,28 +274,22 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
     };
 }
 
-async function authenticateTool(
+async function authenticateToolWithAuthority(
     tool: string,
     payload: Record<string, unknown>,
     auth: RequestAuthProof | undefined,
     extra?: { _meta?: Record<string, unknown> },
+    authority?: ContextAuthority,
 ) {
     if (auth) return authenticateRequest(tool, payload, auth);
-    return authenticateOpenAITunnelActorSession(openAITunnelIdentity(extra));
+    const identity = openAITunnelIdentity(extra);
+    return authority
+        ? authority.authorize(identity)
+        : authenticateOpenAITunnelActorSession(identity);
 }
 
 function requireContextAuthentication() {
     return process.env.REQUIRE_CONTEXT_AUTHENTICATION?.trim().toLowerCase() !== "false";
-}
-
-async function authenticateContextTool(
-    tool: string,
-    payload: Record<string, unknown>,
-    extra?: { _meta?: Record<string, unknown> },
-) {
-    return requireContextAuthentication()
-        ? authenticateTool(tool, payload, undefined, extra)
-        : null;
 }
 
 function openAITunnelIdentity(extra?: { _meta?: Record<string, unknown> }) {
@@ -335,9 +333,7 @@ export function requireActorIdentificationEnabled() {
 export type ContextServerSurface = "full" | "conversation";
 
 const CONVERSATION_TOOL_NAMES = new Set([
-    "request_actor_session",
     "bind_sso_session",
-    "get_actor_session_request_status",
     "save_context",
     "search_context",
     "assemble_context",
@@ -365,8 +361,25 @@ function applyToolSurface(server: McpServer, surface: ContextServerSurface) {
     }
 }
 
-export function createServer(options: { surface?: ContextServerSurface } = {}) {
+export function createServer(options: {
+    surface?: ContextServerSurface;
+    authority?: ContextAuthority;
+} = {}) {
     const actorSession = new ActiveActorSession();
+    const contextAuthority = options.authority ?? configuredContextAuthority();
+    const authenticateTool = (
+        tool: string,
+        payload: Record<string, unknown>,
+        auth: RequestAuthProof | undefined,
+        extra?: { _meta?: Record<string, unknown> },
+    ) => authenticateToolWithAuthority(tool, payload, auth, extra, contextAuthority);
+    const authenticateContextTool = (
+        tool: string,
+        payload: Record<string, unknown>,
+        extra?: { _meta?: Record<string, unknown> },
+    ) => requireContextAuthentication()
+        ? authenticateTool(tool, payload, undefined, extra)
+        : null;
     const personalAuthSchema = options.surface === "conversation"
         ? z.never().optional().describe("Authentication is supplied by the trusted conversation binding.")
         : requestAuthSchema.optional().describe(
@@ -507,7 +520,7 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
     server.registerTool(
         "bind_sso_session",
         {
-            description: "Consume a one-use, Context Server-specific handoff issued by Roost SSO after operator approval. The trusted tunnel supplies this server's actor-session binding; the model cannot select an actor or reuse the handoff.",
+            description: "Consume a one-use Context Server handoff issued by Roost SSO for this approved conversation. Roost supplies the actor identity; Context Server continues enforcing note ownership, membership, and recipient policy.",
             annotations: {
                 title: "Bind Approved Roost SSO Session",
                 readOnlyHint: false,
@@ -516,13 +529,14 @@ export function createServer(options: { surface?: ContextServerSurface } = {}) {
                 openWorldHint: false,
             },
             inputSchema: {
-                binding_handle: z.string().regex(/^asb_[0-9a-f-]{36}$/)
+                binding_handle: z.string().regex(/^rsb_[0-9a-f-]{36}$/)
                     .describe("One-use Context Server handoff returned by Roost SSO."),
             },
         },
         async ({ binding_handle }, extra) => {
             try {
-                const authenticated = await bindRoostSsoServiceSession(
+                if (!contextAuthority) throw new Error("AUTHORITY_NOT_CONFIGURED");
+                const authenticated = await contextAuthority.bind(
                     openAITunnelIdentity(extra), binding_handle,
                 );
                 actorSession.activate(authenticated.actor_id);

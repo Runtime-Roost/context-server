@@ -318,16 +318,26 @@ remains available on the full administrative surface.
 
 Context-bearing MCP operations now require an authenticated actor by default,
 including Whiteboard save/search/exact reads, recent/profile reads, database
-metadata, acknowledgement, update/delete, and purge operations. Authentication
-bootstrap (`request_actor_session`, status/claim/binding flows) remains separate
-and does not read protected context. The trusted OpenAI path derives the author
-from the bound local actor session; any caller-supplied `actor` object is ignored
-for authority and cannot replace the authenticated principal.
+metadata, acknowledgement, update/delete, and purge operations. On the
+conversational surface, Roost SSO owns actor approval and durable conversation
+sessions. Its `request_context_access` tool returns a one-use `rsb_*` handoff;
+Context Server's `bind_sso_session` consumes that handoff through the loopback
+Roost authority. Later protected calls revalidate the bound conversation with
+Roost. Context Server still applies record ownership, membership, visibility,
+and recipient rules after authentication. Native signed requests and the older
+Context actor-session tools remain available only on the full local surface for
+administration and rollback.
 
 `REQUIRE_CONTEXT_AUTHENTICATION=false` exists only for isolated legacy test
 fixtures and should not be set in deployed services. Subjects, mentions,
 connections, lifecycle fields, payload references, and tags remain inert
 metadata: none can authenticate, grant membership, or widen visibility.
+
+Authority-backed conversational deployment also sets
+`ROOST_SSO_AUTHORITY_URL=http://127.0.0.1:4310` and
+`ROOST_SSO_OPERATOR_KEY_PATH` to the mode-`0600` local operator-key file. The
+authority URL is rejected unless it is loopback HTTP, and the key is never
+accepted through an MCP argument.
 
 ### Unified deterministic context query
 
@@ -597,8 +607,9 @@ administrative access. Owners and admins manage membership; authors may modify
 their own messages, while owners/admins may moderate any channel record.
 Missing and unauthorized exact-ID channel records both return `null`.
 
-Remote connector clients that cannot hold or use an Ed25519 key can request an
-expiring operator-approved actor session:
+Remote connector clients authenticate through Roost SSO. The legacy Context
+actor-session flow below remains available only on the full local surface as a
+rollback mechanism:
 
 For ChatGPT clients routed exclusively through the trusted OpenAI tunnel, set
 `TRUST_OPENAI_TUNNEL_IDENTITY=true`. The recommended flow then keeps all bearer
