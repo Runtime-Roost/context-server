@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { open } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import { db, initializeDatabase } from "../storage/db.js";
 import type { AuthenticatedActor } from "./request-auth.js";
@@ -108,8 +110,15 @@ export class RoostContextAuthority implements ContextAuthority {
 }
 
 export function configuredContextAuthority() {
-    const keyPath = process.env.ROOST_SSO_OPERATOR_KEY_PATH?.trim();
-    if (!keyPath) return undefined;
+    const configuredKeyPath = process.env.ROOST_SSO_OPERATOR_KEY_PATH?.trim();
+    const trustedTunnelIdentity = process.env.TRUST_OPENAI_TUNNEL_IDENTITY === "true";
+    const defaultKeyPath = join(
+        process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"),
+        "roost-sso",
+        "operator.key",
+    );
+    if (!configuredKeyPath && (!trustedTunnelIdentity || !existsSync(defaultKeyPath))) return undefined;
+    const keyPath = configuredKeyPath || defaultKeyPath;
     return new RoostContextAuthority(
         process.env.ROOST_SSO_AUTHORITY_URL?.trim() || "http://127.0.0.1:4310",
         keyPath,

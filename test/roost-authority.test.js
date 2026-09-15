@@ -9,6 +9,7 @@ process.env.TRUST_OPENAI_TUNNEL_IDENTITY = "true";
 const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
 const { createServer } = await import("../dist/mcp/server.js");
+const { configuredContextAuthority } = await import("../dist/auth/roost-sso-authority.js");
 const { db } = await import("../dist/storage/db.js");
 const { identifyActor, savePersonalContext } = await import("../dist/mcp/tools.js");
 
@@ -16,6 +17,29 @@ const tunnelMeta = {
     "openai/subject": "v1/context-authority-subject",
     "openai/session": "v1/context-authority-session",
 };
+
+test("trusted tunnel identity enables the conventional local Roost authority", () => {
+    const previousTrust = process.env.TRUST_OPENAI_TUNNEL_IDENTITY;
+    const previousPath = process.env.ROOST_SSO_OPERATOR_KEY_PATH;
+    const previousConfigHome = process.env.XDG_CONFIG_HOME;
+    try {
+        delete process.env.ROOST_SSO_OPERATOR_KEY_PATH;
+        process.env.XDG_CONFIG_HOME = `/tmp/context-authority-missing-${process.pid}-${Date.now()}`;
+        process.env.TRUST_OPENAI_TUNNEL_IDENTITY = "false";
+        assert.equal(configuredContextAuthority(), undefined);
+        process.env.TRUST_OPENAI_TUNNEL_IDENTITY = "true";
+        assert.equal(configuredContextAuthority(), undefined);
+        process.env.ROOST_SSO_OPERATOR_KEY_PATH = "/tmp/explicit-roost-authority-key";
+        assert.ok(configuredContextAuthority());
+    } finally {
+        if (previousTrust === undefined) delete process.env.TRUST_OPENAI_TUNNEL_IDENTITY;
+        else process.env.TRUST_OPENAI_TUNNEL_IDENTITY = previousTrust;
+        if (previousPath === undefined) delete process.env.ROOST_SSO_OPERATOR_KEY_PATH;
+        else process.env.ROOST_SSO_OPERATOR_KEY_PATH = previousPath;
+        if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = previousConfigHome;
+    }
+});
 
 test("Roost authority binding authenticates later protected Context calls", async () => {
     const externalId = `actor:test:roost-authority-${process.pid}-${Date.now()}`;

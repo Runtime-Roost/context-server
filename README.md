@@ -335,7 +335,10 @@ metadata: none can authenticate, grant membership, or widen visibility.
 
 Authority-backed conversational deployment also sets
 `ROOST_SSO_AUTHORITY_URL=http://127.0.0.1:4310` and
-`ROOST_SSO_OPERATOR_KEY_PATH` to the mode-`0600` local operator-key file. The
+`ROOST_SSO_OPERATOR_KEY_PATH` to the mode-`0600` local operator-key file. When
+`TRUST_OPENAI_TUNNEL_IDENTITY=true`, the key path defaults to
+`${XDG_CONFIG_HOME:-~/.config}/roost-sso/operator.key` when that file exists;
+an explicit key path still takes precedence. The
 authority URL is rejected unless it is loopback HTTP, and the key is never
 accepted through an MCP argument.
 
