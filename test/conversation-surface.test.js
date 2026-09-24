@@ -21,10 +21,13 @@ test("conversation surface advertises only the bounded conversational contract",
             "acknowledge_direct_context",
             "activate_roost_session",
             "assemble_context",
+            "cancel_context_job",
             "get_channel_context",
             "get_context",
+            "get_context_job",
             "get_personal_context",
             "list_direct_inbox",
+            "read_payload",
             "save_channel_context",
             "save_context",
             "save_personal_context",
@@ -32,6 +35,7 @@ test("conversation surface advertises only the bounded conversational contract",
             "search_context",
             "search_personal_context",
             "send_direct_context",
+            "start_context_payload_job",
         ]);
         assert.ok(serialized.length < 25_000, `conversation schema was ${serialized.length} characters`);
         for (const name of ["save_personal_context", "search_personal_context", "get_personal_context"]) {
@@ -54,7 +58,7 @@ test("full surface remains available for local administration", async () => {
 
     try {
         const response = await client.listTools();
-        assert.equal(response.tools.length, 73);
+        assert.equal(response.tools.length, 77);
         assert.ok(response.tools.some(({ name }) => name === "vacuum_database"));
         assert.ok(response.tools.some(({ name }) => name === "connect_contexts"));
         assert.ok(response.tools.some(({ name }) => name === "disconnect_contexts"));

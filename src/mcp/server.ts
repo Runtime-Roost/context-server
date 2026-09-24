@@ -1,6 +1,6 @@
 import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { encode as encodeToon } from "@toon-format/toon";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
     authenticateRequest,
@@ -102,6 +102,13 @@ import {
     listContextAttachments,
     readAttachmentChunk,
 } from "../storage/attachments.js";
+import {
+    MAX_PAYLOAD_READ_BYTES,
+    cancelContextJob,
+    getContextJob,
+    readContextPayload,
+    startContextPayloadJob,
+} from "../storage/payload-sessions.js";
 
 const DEFAULT_CONTEXT_RESULT_LIMIT = 5;
 const MAX_CONTEXT_RESULT_CONTENT_CHARS = 500;
@@ -233,6 +240,9 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "PAYLOAD_DERIVATION_SOURCE_REQUIRED",
         "PAYLOAD_DERIVATION_SOURCE_INVALID",
         "PAYLOAD_NOT_FOUND_OR_NOT_AUTHORIZED",
+        "PAYLOAD_OFFSET_INVALID",
+        "PAYLOAD_READ_SIZE_INVALID",
+        "CONTEXT_JOB_ID_INVALID",
         "CONTEXT_QUERY_PREDICATE_INVALID",
         "CONTEXT_QUERY_TOO_COMPLEX",
         "FENIC_NOT_CONFIGURED",
@@ -326,6 +336,15 @@ function openAITunnelIdentity(extra?: { _meta?: Record<string, unknown> }) {
     return { subject, session };
 }
 
+function retrievalConversationBinding(actorId: number, extra?: { _meta?: Record<string, unknown> }) {
+    if (process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() !== "true") {
+        return `native:actor:${actorId}`;
+    }
+    const identity = openAITunnelIdentity(extra);
+    return createHash("sha256").update("context-server:retrieval-conversation:v1\0")
+        .update(identity.subject).update("\0").update(identity.session).digest("hex");
+}
+
 export class ActiveActorSession {
     #actorId: number | null = null;
 
@@ -359,6 +378,10 @@ const CONVERSATION_TOOL_NAMES = new Set([
     "send_direct_context",
     "list_direct_inbox",
     "acknowledge_direct_context",
+    "read_payload",
+    "start_context_payload_job",
+    "get_context_job",
+    "cancel_context_job",
 ]);
 
 function applyToolSurface(server: McpServer, surface: ContextServerSurface) {
@@ -601,6 +624,86 @@ export function createServer(options: {
             } catch (error) {
                 return authenticationError(error);
             }
+        },
+    );
+
+    server.registerTool(
+        "read_payload",
+        {
+            description: `Read an authorized immutable text payload in UTF-8-safe slices of at most ${MAX_PAYLOAD_READ_BYTES} bytes. A payload reference grants no access.`,
+            annotations: { title: "Read Bounded Payload Slice", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: {
+                payload_ref: z.string().regex(/^payload:context:[0-9]+:v[1-9][0-9]*$/),
+                offset: z.number().int().min(0).default(0),
+                max_bytes: z.number().int().min(4).max(MAX_PAYLOAD_READ_BYTES).default(8192),
+                expected_version: z.number().int().min(1).optional(),
+                expected_sha256: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+                auth: personalAuthSchema,
+            },
+        },
+        async ({ payload_ref, offset, max_bytes, expected_version, expected_sha256, auth }, extra) => {
+            const payload = { payload_ref, offset, max_bytes, expected_version, expected_sha256 };
+            try {
+                const actor = await authenticateTool("read_payload", payload, auth, extra);
+                const result = await readContextPayload(actor.actor_id, payload_ref, offset, max_bytes);
+                if (!result) return { content: [{ type: "text", text: JSON.stringify({ payload: null }) }] };
+                if ((expected_version !== undefined && result.payload_ref.version !== expected_version)
+                    || (expected_sha256 !== undefined && result.payload_ref.sha256 !== expected_sha256.toLowerCase())) {
+                    throw new Error("PAYLOAD_REFERENCE_INVALID");
+                }
+                return { content: [{ type: "text", text: JSON.stringify({ payload: result }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "start_context_payload_job",
+        {
+            description: "Start a durable, conversation-scoped payload job for an authorized context. Its job ID grants no access.",
+            annotations: { title: "Start Context Payload Job", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+            inputSchema: { context_id: z.number().int().positive(), auth: personalAuthSchema },
+        },
+        async ({ context_id, auth }, extra) => {
+            const payload = { context_id };
+            try {
+                const actor = await authenticateTool("start_context_payload_job", payload, auth, extra);
+                const job = await startContextPayloadJob(actor.actor_id, retrievalConversationBinding(actor.actor_id, extra), context_id);
+                return { content: [{ type: "text", text: JSON.stringify({ job }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "get_context_job",
+        {
+            description: "Get status for this actor and conversation's retrieval job. Complete jobs return a payload reference.",
+            annotations: { title: "Get Context Job Status", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: { job_id: z.string().regex(/^job_[0-9a-f-]{36}$/i), auth: personalAuthSchema },
+        },
+        async ({ job_id, auth }, extra) => {
+            const payload = { job_id };
+            try {
+                const actor = await authenticateTool("get_context_job", payload, auth, extra);
+                const job = await getContextJob(actor.actor_id, retrievalConversationBinding(actor.actor_id, extra), job_id);
+                return { content: [{ type: "text", text: JSON.stringify({ job }) }] };
+            } catch (error) { return authenticationError(error); }
+        },
+    );
+
+    server.registerTool(
+        "cancel_context_job",
+        {
+            description: "Cancel this actor and conversation's queued or running retrieval job.",
+            annotations: { title: "Cancel Context Job", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            inputSchema: { job_id: z.string().regex(/^job_[0-9a-f-]{36}$/i), auth: personalAuthSchema },
+        },
+        async ({ job_id, auth }, extra) => {
+            const payload = { job_id };
+            try {
+                const actor = await authenticateTool("cancel_context_job", payload, auth, extra);
+                const job = await cancelContextJob(actor.actor_id, retrievalConversationBinding(actor.actor_id, extra), job_id);
+                return { content: [{ type: "text", text: JSON.stringify({ job }) }] };
+            } catch (error) { return authenticationError(error); }
         },
     );
 

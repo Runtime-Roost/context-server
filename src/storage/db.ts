@@ -1031,6 +1031,33 @@ const migrations: Migration[] = [
                     REFERENCES attachments(id) ON DELETE RESTRICT;
         `,
     },
+    {
+        version: 25,
+        name: "bounded_context_retrieval_jobs",
+        sql: `
+            CREATE TABLE IF NOT EXISTS context_retrieval_jobs (
+                id UUID PRIMARY KEY,
+                actor_id BIGINT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+                conversation_binding TEXT NOT NULL,
+                context_id BIGINT NOT NULL REFERENCES contexts(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('QUEUED','RUNNING','COMPLETE','FAILED','CANCELLED')),
+                payload_ref JSONB,
+                error_code TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                started_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ NOT NULL,
+                cancelled_at TIMESTAMPTZ
+            );
+            CREATE INDEX IF NOT EXISTS context_retrieval_jobs_owner_idx
+                ON context_retrieval_jobs(actor_id, conversation_binding, created_at DESC);
+            CREATE INDEX IF NOT EXISTS context_retrieval_jobs_expiry_idx
+                ON context_retrieval_jobs(expires_at);
+            UPDATE context_retrieval_jobs
+            SET status = 'FAILED', error_code = 'SERVER_RESTARTED', completed_at = NOW()
+            WHERE status IN ('QUEUED','RUNNING');
+        `,
+    },
 ];
 
 let initializationPromise: Promise<void> | undefined;

@@ -314,6 +314,26 @@ the conversation catalog below 25,000 serialized characters, this tool replaces
 ordinary Whiteboard acknowledgement on that surface; `acknowledge_context`
 remains available on the full administrative surface.
 
+### Bounded payload hydration and retrieval jobs
+
+`read_payload` admits immutable context text into model context explicitly and
+incrementally. Callers pass a `payload:context:<id>:v<version>` reference plus
+`offset` and `max_bytes`; the server enforces the record's current actor,
+recipient, channel, or group policy on every read. Results include the actual
+UTF-8-safe byte range, total size, SHA-256, version, `has_more`, and
+`next_offset`. Chunks never exceed 32 KiB. Optional expected version/hash fields
+fail closed if a caller accidentally mixes payload versions.
+
+For recoverable orchestration, `start_context_payload_job` creates a durable
+30-minute job and returns immediately. `get_context_job` exposes only bounded
+`QUEUED`, `RUNNING`, `COMPLETE`, `FAILED`, or `CANCELLED` state; a completed job
+returns the immutable payload reference for `read_payload`.
+`cancel_context_job` stops queued/running work. Jobs are scoped to both the
+authenticated actor and exact trusted conversation, so their opaque IDs are
+identifiers rather than bearer credentials. Jobs interrupted by server restart
+become deterministically `FAILED` with `SERVER_RESTARTED` instead of remaining
+permanently ambiguous.
+
 ### Actor-only context boundary
 
 Context-bearing MCP operations now require an authenticated actor by default,
