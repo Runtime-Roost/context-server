@@ -825,6 +825,8 @@ test("built MCP schemas expose actor identification and stable actor filters", a
         assert.deepEqual(identifySchema.required, ["name"]);
         assert.ok(identifySchema.properties.external_id);
         assert.ok(searchSchema.properties.actor_external_id);
+        assert.equal(searchSchema.properties.max_content_bytes.minimum, 0);
+        assert.equal(searchSchema.properties.max_content_bytes.maximum, 32_768);
         assert.ok(recentSchema.properties.actor_external_id);
         for (const toolName of [
             "search_context",
@@ -910,6 +912,15 @@ test("built MCP schemas expose actor identification and stable actor filters", a
             assert.ok(schema, `${toolName} must be registered`);
             assert.ok(schema.properties.auth, `${toolName} must expose explicit cryptographic auth`);
             assert.ok(!schema.required?.includes("auth"), `${toolName} must allow trusted tunnel-bound auth`);
+        }
+        for (const toolName of [
+            "search_channel_context",
+            "search_group_context",
+            "search_personal_context",
+        ]) {
+            const budget = byName.get(toolName)?.inputSchema.properties.max_content_bytes;
+            assert.equal(budget.minimum, 0);
+            assert.equal(budget.maximum, 32_768);
         }
         for (const toolName of [
             "list_channels",

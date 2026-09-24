@@ -130,36 +130,62 @@ function emitPrivateReadReceipt(
     }));
 }
 
-type ProjectedContextRecord = ContextRecord & {
+type ProjectedContextRecord = Omit<ContextRecord, "content"> & {
+    content?: string;
     content_length?: number;
+    content_bytes?: number;
     content_truncated?: boolean;
+    content_omitted?: boolean;
 };
+
+function utf8Prefix(text: string, maxBytes: number) {
+    const encoded = Buffer.from(text, "utf8");
+    if (encoded.length <= maxBytes) return text;
+
+    let end = Math.max(0, maxBytes);
+    while (end > 0 && (encoded[end] & 0xc0) === 0x80) end -= 1;
+    return encoded.subarray(0, end).toString("utf8");
+}
 
 export function projectContextResults(
     records: ContextRecord[],
     mode: "search" | "list",
+    maxContentBytes = mode === "search" ? 0 : Number.POSITIVE_INFINITY,
 ) {
     const projected: ProjectedContextRecord[] = [];
     let payloadChars = 0;
+    let contentBytesReturned = 0;
     let responseTruncated = false;
 
     for (const record of records) {
+        const { content, ...envelope } = record;
+        const contentBytes = Buffer.byteLength(content, "utf8");
         const contentLimit = mode === "list"
             ? LIST_CONTEXT_EXCERPT_CHARS
             : MAX_CONTEXT_RESULT_CONTENT_CHARS;
-        const contentTruncated = record.content.length > contentLimit;
-        const candidate: ProjectedContextRecord = {
-            ...record,
-            content: contentTruncated
-                ? record.content.slice(0, contentLimit)
-                : record.content,
-            ...(contentTruncated
-                ? {
-                    content_length: record.content.length,
-                    content_truncated: true,
-                }
-                : {}),
-        };
+        const characterBounded = content.slice(0, contentLimit);
+        const remainingContentBytes = Math.max(0, maxContentBytes - contentBytesReturned);
+        const projectedContent = mode === "search"
+            ? utf8Prefix(characterBounded, remainingContentBytes)
+            : characterBounded;
+        const projectedContentBytes = Buffer.byteLength(projectedContent, "utf8");
+        const contentTruncated = projectedContentBytes < contentBytes;
+        const candidate: ProjectedContextRecord = mode === "search"
+            ? {
+                ...envelope,
+                ...(projectedContentBytes > 0 ? { content: projectedContent } : {}),
+                content_length: content.length,
+                content_bytes: contentBytes,
+                ...(contentTruncated ? { content_truncated: true } : {}),
+                ...(projectedContentBytes === 0 ? { content_omitted: true } : {}),
+            }
+            : {
+                ...record,
+                content: projectedContent,
+                ...(contentTruncated
+                    ? { content_length: content.length, content_truncated: true }
+                    : {}),
+            };
         const candidateChars = JSON.stringify(candidate).length;
 
         if (payloadChars + candidateChars > MAX_CONTEXT_RESULT_PAYLOAD_CHARS) {
@@ -169,12 +195,19 @@ export function projectContextResults(
 
         projected.push(candidate);
         payloadChars += candidateChars;
+        contentBytesReturned += projectedContentBytes;
     }
 
     return {
         results: projected,
         response_truncated: responseTruncated || projected.length < records.length,
         returned_count: projected.length,
+        ...(mode === "search"
+            ? {
+                content_budget_bytes: maxContentBytes,
+                content_bytes_returned: contentBytesReturned,
+            }
+            : {}),
     };
 }
 
@@ -904,7 +937,7 @@ export function createServer(options: {
     server.registerTool(
         "search_context",
         {
-            description: "Read semantically matching notes from the local shared Whiteboard. Defaults to high sensitivity and five results to avoid injecting unrelated history. Use low or medium only when the user explicitly asks for a broader search.",
+            description: "Find shared notes as metadata-only envelopes. Hydrate payload references with read_payload; max_content_bytes is an optional total compatibility budget.",
             annotations: {
                 title: "Search Shared Whiteboard",
                 readOnlyHint: true,
@@ -917,17 +950,18 @@ export function createServer(options: {
                 limit: z.number().int().positive().optional().describe("Maximum number of context items to return."),
                 sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness. High is the safe default and may return no results; medium and low progressively broaden retrieval."),
                 actor_external_id: z.string().min(1).optional().describe("Optional stable external actor identifier used to filter results."),
+                max_content_bytes: z.number().int().min(0).max(MAX_PAYLOAD_READ_BYTES).optional(),
             },
         },
-        async ({ query, limit, sensitivity, actor_external_id }, extra) => {
+        async ({ query, limit, sensitivity, actor_external_id, max_content_bytes }, extra) => {
             try {
-                await authenticateContextTool("search_context", { query, limit, sensitivity, actor_external_id }, extra);
+                await authenticateContextTool("search_context", { query, limit, sensitivity, actor_external_id, max_content_bytes }, extra);
             } catch (error) {
                 return authenticationError(error);
             }
             const selectedSensitivity = sensitivity ?? "high";
             const results = await searchContext(query, limit, selectedSensitivity, actor_external_id);
-            const projected = projectContextResults(results, "search");
+            const projected = projectContextResults(results, "search", max_content_bytes ?? 0);
 
             return {
                 content: [
@@ -1217,7 +1251,7 @@ export function createServer(options: {
     server.registerTool(
         "search_channel_context",
         {
-            description: "Search one channel's history after authenticating current read membership. Defaults to high sensitivity and five results to avoid injecting unrelated history.",
+            description: "Find authorized channel records as metadata-only envelopes. Hydrate with read_payload.",
             annotations: {
                 title: "Search Channel History",
                 readOnlyHint: true,
@@ -1230,11 +1264,12 @@ export function createServer(options: {
                 query: z.string().min(1).describe("Search query."),
                 limit: z.number().int().positive().optional().describe("Maximum result count."),
                 sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness."),
+                max_content_bytes: z.number().int().min(0).max(MAX_PAYLOAD_READ_BYTES).optional(),
                 auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
             },
         },
-        async ({ channel, query, limit, sensitivity, auth }, extra) => {
-            const payload = { channel, query, limit, sensitivity };
+        async ({ channel, query, limit, sensitivity, max_content_bytes, auth }, extra) => {
+            const payload = { channel, query, limit, sensitivity, max_content_bytes };
 
             try {
                 const authenticated = await authenticateTool("search_channel_context", payload, auth, extra);
@@ -1246,7 +1281,7 @@ export function createServer(options: {
                     limit,
                     selectedSensitivity,
                 );
-                const projected = projectContextResults(results, "search");
+                const projected = projectContextResults(results, "search", max_content_bytes ?? 0);
                 return {
                     content: [{
                         type: "text",
@@ -1640,7 +1675,7 @@ export function createServer(options: {
     server.registerTool(
         "search_group_context",
         {
-            description: "Search one access group's records after authenticating current read membership. Defaults to high sensitivity and five results.",
+            description: "Find authorized group records as metadata-only envelopes. Hydrate with read_payload.",
             annotations: {
                 title: "Search Group Context",
                 readOnlyHint: true,
@@ -1653,11 +1688,12 @@ export function createServer(options: {
                 query: z.string().min(1).describe("Search query."),
                 limit: z.number().int().positive().optional().describe("Maximum result count."),
                 sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness."),
+                max_content_bytes: z.number().int().min(0).max(MAX_PAYLOAD_READ_BYTES).optional(),
                 auth: requestAuthSchema.optional().describe("Authentication using either an enrolled-key signature or an operator-approved actor session."),
             },
         },
-        async ({ group, query, limit, sensitivity, auth }, extra) => {
-            const payload = { group, query, limit, sensitivity };
+        async ({ group, query, limit, sensitivity, max_content_bytes, auth }, extra) => {
+            const payload = { group, query, limit, sensitivity, max_content_bytes };
 
             try {
                 const authenticated = await authenticateTool("search_group_context", payload, auth, extra);
@@ -1669,7 +1705,7 @@ export function createServer(options: {
                     limit,
                     selectedSensitivity,
                 );
-                const projected = projectContextResults(results, "search");
+                const projected = projectContextResults(results, "search", max_content_bytes ?? 0);
                 return {
                     content: [{
                         type: "text",
@@ -1848,7 +1884,7 @@ export function createServer(options: {
     server.registerTool(
         "search_personal_context",
         {
-            description: "Search only the authenticated actor's private notebook. Actor ownership is enforced before semantic ranking; retrieval defaults to high sensitivity and five results.",
+            description: "Find actor-owned private records as metadata-only envelopes. Hydrate with read_payload.",
             annotations: {
                 title: "Search Private Notebook",
                 readOnlyHint: true,
@@ -1860,11 +1896,12 @@ export function createServer(options: {
                 query: z.string().min(1).describe("Search query."),
                 limit: z.number().int().positive().optional().describe("Maximum result count."),
                 sensitivity: z.enum(SEARCH_SENSITIVITY_VALUES).optional().describe("Semantic filtering strictness."),
+                max_content_bytes: z.number().int().min(0).max(MAX_PAYLOAD_READ_BYTES).optional(),
                 auth: personalAuthSchema,
             },
         },
-        async ({ query, limit, sensitivity, auth }, extra) => {
-            const payload = { query, limit, sensitivity };
+        async ({ query, limit, sensitivity, max_content_bytes, auth }, extra) => {
+            const payload = { query, limit, sensitivity, max_content_bytes };
             const receiptId = randomUUID();
             emitPrivateReadReceipt(receiptId, "search_personal_context", "received", {
                 limit: limit ?? DEFAULT_CONTEXT_RESULT_LIMIT,
@@ -1883,7 +1920,7 @@ export function createServer(options: {
                     limit,
                     selectedSensitivity,
                 );
-                const projected = projectContextResults(results, "search");
+                const projected = projectContextResults(results, "search", max_content_bytes ?? 0);
                 emitPrivateReadReceipt(receiptId, "search_personal_context", "completed", {
                     actor_id: authenticated.actor_id,
                     result_count: projected.results.length,
@@ -2181,7 +2218,7 @@ export function createServer(options: {
                 const selectedEngine = engine ?? "native";
                 const selectedFormat = output_format ?? "json";
                 const projectedResults = selectedEngine === "fenic"
-                    ? await projectWithFenic(projected.results, select)
+                    ? await projectWithFenic(projected.results as ContextRecord[], select)
                     : projected.results;
                 const response = {
                     class: selectedClass,

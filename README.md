@@ -830,7 +830,7 @@ This project is licensed under the [MIT License](LICENSE).
 | `ping` | Health check for the MCP server. Takes no arguments. | Text response: `Pong!` |
 | `identify_actor` | Resolve or create the active actor for this MCP session. Arguments: `name` (required), `external_id` (optional stable ID), `kind` (optional), and `metadata` (optional object). | JSON text containing `{ "identified": { "actor": actor, "created": boolean } }`. Metadata is stored but not returned. |
 | `save_context` | Save a context note. Arguments are `text`, `tags?`, `source?`, `visibility?`, and `actor?`; visibility currently accepts only `whiteboard` and defaults to it. `actor?` requires `external_id` and `name`, with optional `kind` and `metadata`. Include `actor` whenever session continuity is uncertain. Explicit actor identity takes precedence over session state. | JSON text containing `{ "saved": context, "actor_resolution"?: { "created": boolean } }`. The returned context includes `visibility`. Compatibility mode adds actionable guidance when attribution is absent; strict mode rejects before writing and tells the model to retry with `actor`. |
-| `search_context` | Search saved context semantically when embeddings are usable, falling back to text only when semantic search is unavailable. Arguments: `query`, `limit?`, `sensitivity?`, and `actor_external_id?`. Actor filtering is applied inside both search paths. | JSON text containing `{ "query", "limit", "sensitivity", "actor_external_id"?, "results" }`. |
+| `search_context` | Search saved context semantically when embeddings are usable, falling back to text only when semantic search is unavailable. Arguments: `query`, `limit?`, `sensitivity?`, `actor_external_id?`, and `max_content_bytes?`. Actor filtering is applied inside both search paths. Results are metadata-only by default; use `read_payload` for bounded hydration. | JSON text containing bounded envelopes and payload references plus `{ "content_budget_bytes", "content_bytes_returned" }`. Setting `max_content_bytes` opts into a total UTF-8-safe compatibility budget up to 32 KiB. |
 | `get_user_profile` | Fetch the curated profile view. Takes no arguments and returns contexts explicitly tagged `profile`; no semantic or text fallback search is used. | JSON text containing `{ "profile": { "username": string, "tag": "profile", "results": context[] } }`. The username is the active OS account. |
 | `list_recent_context` | Fetch recent context notes. Arguments: `limit?` and `actor_external_id?`. | JSON text containing `{ "limit", "actor_external_id"?, "results" }`, ordered newest first. |
 | `get_context` | Fetch one context note by exact ID. Argument: `id` (required positive integer). | JSON text containing `{ "id": number, "context": context \| null }`, where `context` is the exact stored record or `null` if no record matched. |
@@ -844,7 +844,7 @@ This project is licensed under the [MIT License](LICENSE).
 | `remove_channel_member` | Remove a non-owner actor. Requires an authenticated channel owner/admin. | `{ "membership": { "removed": boolean, ... } }` |
 | `list_channels` | List current memberships for the authenticated actor. | `{ "channels": channel[] }` |
 | `save_channel_context` | Save channel history using the authenticated actor as attribution. | `{ "saved": context }` |
-| `search_channel_context` | Search an authenticated channel membership using the normal sensitivity contract. | `{ "channel", "query", "limit", "sensitivity", "results" }` |
+| `search_channel_context` | Search an authenticated channel membership using the normal sensitivity contract. Matching content is omitted by default; `max_content_bytes` provides a bounded compatibility budget. | Metadata envelopes and payload references suitable for `read_payload`. |
 | `list_channel_context` | List recent history from an authenticated channel membership. | `{ "channel", "limit", "results" }` |
 | `get_channel_context` | Fetch an exact channel record for an authenticated current member. | `{ "id", "context": context \| null }` |
 | `update_channel_context` | Update a channel record as its authenticated author or a channel owner/admin. | `{ "id", "updated": context \| null }` |
@@ -854,13 +854,13 @@ This project is licensed under the [MIT License](LICENSE).
 | `remove_access_group_member` | Remove a non-owner actor. Requires an authenticated group owner/admin. | `{ "membership": { "removed": boolean, ... } }` |
 | `list_access_groups` | List current access-group memberships for the authenticated actor. | `{ "groups": group[] }` |
 | `save_group_context` | Save a group-owned record while retaining the authenticated actor as author. | `{ "saved": context }` |
-| `search_group_context` | Search an authenticated access group's records using the normal sensitivity contract. | `{ "group", "query", "limit", "sensitivity", "results" }` |
+| `search_group_context` | Search an authenticated access group's records using the normal sensitivity contract. Matching content is omitted by default; `max_content_bytes` provides a bounded compatibility budget. | Metadata envelopes and payload references suitable for `read_payload`. |
 | `list_group_context` | List recent records from an authenticated access group. | `{ "group", "limit", "results" }` |
 | `get_group_context` | Fetch an exact group-owned record for a current readable member. | `{ "id", "context": context \| null }` |
 | `update_group_context` | Update a group-owned record as a current writable member. | `{ "id", "updated": context \| null }` |
 | `delete_group_context` | Delete a group-owned record as a current writable member. | `{ "id", "deleted": context \| null }` |
 | `save_personal_context` | Save a private notebook record owned by the authenticated actor. | `{ "saved": context }` |
-| `search_personal_context` | Search only the authenticated actor's private notebook using the normal sensitivity contract. | `{ "query", "limit", "sensitivity", "results" }` |
+| `search_personal_context` | Search only the authenticated actor's private notebook using the normal sensitivity contract. Matching content is omitted by default; `max_content_bytes` provides a bounded compatibility budget. | Metadata envelopes and payload references suitable for `read_payload`. |
 | `list_personal_context` | List recent private notebook records owned by the authenticated actor. | `{ "limit", "results" }` |
 | `get_personal_context` | Fetch an exact private notebook record owned by the authenticated actor. Missing and unauthorized records both return `null`. | `{ "id", "context": context \| null }` |
 | `update_personal_context` | Update a private notebook record owned by the authenticated actor. | `{ "id", "updated": context \| null }` |
