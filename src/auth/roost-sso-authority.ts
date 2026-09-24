@@ -34,6 +34,7 @@ async function readPrivateKey(path: string) {
 
 export interface ContextAuthority {
     bind(identity: OpenAITunnelIdentity, bindingId: string): Promise<AuthenticatedActor>;
+    activate(identity: OpenAITunnelIdentity): Promise<AuthenticatedActor>;
     authorize(identity: OpenAITunnelIdentity): Promise<AuthenticatedActor>;
 }
 
@@ -91,6 +92,15 @@ export class RoostContextAuthority implements ContextAuthority {
     async bind(identity: OpenAITunnelIdentity, bindingId: string) {
         if (!/^rsb_[0-9a-f-]{36}$/.test(bindingId)) throw new Error("SSO_BINDING_INVALID");
         const result = await this.#call(`/v1/internal/service-bindings/${bindingId}/consume`, {
+            target_conversation_id: conversation(identity),
+            audience: "context-server",
+        });
+        const binding = result.binding as AuthorityResponse | undefined;
+        return this.#actor(binding?.actor_id);
+    }
+
+    async activate(identity: OpenAITunnelIdentity) {
+        const result = await this.#call("/v1/internal/service-bindings/consume-pending", {
             target_conversation_id: conversation(identity),
             audience: "context-server",
         });

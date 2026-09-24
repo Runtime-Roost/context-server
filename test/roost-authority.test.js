@@ -54,6 +54,10 @@ test("Roost authority binding authenticates later protected Context calls", asyn
         key_id: "roost-sso-authority",
     };
     const authority = {
+        async activate(identity) {
+            calls.push({ operation: "activate", identity });
+            return authenticated;
+        },
         async bind(identity, bindingId) {
             calls.push({ operation: "bind", identity, bindingId });
             return authenticated;
@@ -69,8 +73,8 @@ test("Roost authority binding authenticates later protected Context calls", asyn
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
         const bound = await client.callTool({
-            name: "bind_sso_session",
-            arguments: { binding_handle: "rsb_00000000-0000-4000-8000-000000000001" },
+            name: "activate_roost_session",
+            arguments: {},
             _meta: tunnelMeta,
         });
         assert.notEqual(bound.isError, true);
@@ -83,7 +87,7 @@ test("Roost authority binding authenticates later protected Context calls", asyn
         assert.notEqual(searched.isError, true);
         const body = JSON.parse(searched.content.find(({ type }) => type === "text").text);
         assert.ok(body.results.some(({ id }) => id === saved.id));
-        assert.deepEqual(calls.map(({ operation }) => operation), ["bind", "authorize"]);
+        assert.deepEqual(calls.map(({ operation }) => operation), ["activate", "authorize"]);
         assert.ok(calls.every(({ identity }) => identity.subject === tunnelMeta["openai/subject"]
             && identity.session === tunnelMeta["openai/session"]));
     } finally {

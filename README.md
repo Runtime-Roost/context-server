@@ -320,10 +320,12 @@ Context-bearing MCP operations now require an authenticated actor by default,
 including Whiteboard save/search/exact reads, recent/profile reads, database
 metadata, acknowledgement, update/delete, and purge operations. On the
 conversational surface, Roost SSO owns actor approval and durable conversation
-sessions. Its `request_context_access` tool returns a one-use `rsb_*` handoff;
-Context Server's `bind_sso_session` consumes that handoff through the loopback
-Roost authority. Later protected calls revalidate the bound conversation with
-Roost. Context Server still applies record ownership, membership, visibility,
+sessions. Its `request_context_access` tool creates a one-use server-side
+handoff. Context Server's zero-argument `activate_roost_session` asks the
+loopback Roost authority to select and consume the eligible handoff for the
+current trusted conversation; no handle or credential crosses the model tool
+boundary. Later protected calls revalidate the bound conversation with Roost.
+Context Server still applies record ownership, membership, visibility,
 and recipient rules after authentication. Native signed requests and the older
 Context actor-session tools remain available only on the full local surface for
 administration and rollback.

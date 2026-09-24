@@ -260,7 +260,7 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
                             ? "The signed request could not be authenticated."
                             : code === "AUTHENTICATION_REQUIRED"
                                 ? process.env.TRUST_OPENAI_TUNNEL_IDENTITY?.trim().toLowerCase() === "true"
-                                    ? "This OpenAI conversation does not have an active local actor-session approval. Call request_actor_session once, ask the operator to approve that exact request in Agent Companion, and wait for approval to activate automatically. Do not use a PIN, call claim_actor_session, or retry protected tools before approval."
+                                    ? "This OpenAI conversation is not connected to an approved Roost identity. Request Context Server access through Roost SSO, then call activate_roost_session once. No handle, PIN, claim code, or auth object is required."
                                     : "Provide explicit cryptographic authentication or request and claim an operator-approved native actor session."
                             : code === "SESSION_REVOKED"
                                 ? "This actor session was revoked because a newer session became the actor's current timeline."
@@ -345,7 +345,7 @@ export function requireActorIdentificationEnabled() {
 export type ContextServerSurface = "full" | "conversation";
 
 const CONVERSATION_TOOL_NAMES = new Set([
-    "bind_sso_session",
+    "activate_roost_session",
     "save_context",
     "search_context",
     "assemble_context",
@@ -525,6 +525,41 @@ export function createServer(options: {
                 };
             } catch (error) {
                 return authenticationError(error, { actor_external_id });
+            }
+        },
+    );
+
+    server.registerTool(
+        "activate_roost_session",
+        {
+            description: "Connect this exact trusted OpenAI conversation to the eligible pending Context Server handoff created by Roost SSO. The servers select and consume the handoff; no credential, handle, actor identity, PIN, or auth object is accepted from the model.",
+            annotations: {
+                title: "Activate Approved Roost Session",
+                readOnlyHint: false,
+                destructiveHint: false,
+                idempotentHint: false,
+                openWorldHint: false,
+            },
+            inputSchema: {},
+        },
+        async (_input, extra) => {
+            try {
+                if (!contextAuthority) throw new Error("AUTHORITY_NOT_CONFIGURED");
+                const authenticated = await contextAuthority.activate(openAITunnelIdentity(extra));
+                actorSession.activate(authenticated.actor_id);
+                return {
+                    content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            activated: true,
+                            actor_external_id: authenticated.actor_external_id,
+                            actor_name: authenticated.actor_name,
+                            next_action: "The current Context Server conversation is authenticated. Call the intended protected tool without an auth object.",
+                        }),
+                    }],
+                };
+            } catch (error) {
+                return authenticationError(error);
             }
         },
     );
