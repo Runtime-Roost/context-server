@@ -42,7 +42,12 @@ test("search projections are metadata-only by default", () => {
     assert.ok(projected.results.every((result) => result.content === undefined));
     assert.ok(projected.results.every((result) => result.content_omitted === true));
     assert.ok(projected.results.every((result) => result.content_bytes === 20_000));
-    assert.ok(JSON.stringify(projected.results).length <= 24_000);
+    assert.ok(projected.results.every((result) => result.lifecycle === undefined));
+    assert.ok(projected.results.every((result) => result.connections === undefined));
+    assert.ok(projected.results.every((result) => result.acknowledged_by === undefined));
+    assert.ok(projected.envelope_bytes <= 7_000);
+    assert.equal(projected.envelope_byte_limit, 7_000);
+    assert.ok(Buffer.byteLength(JSON.stringify(projected.results), "utf8") <= 7_100);
 });
 
 test("search projections honor one total UTF-8-safe content byte budget", () => {

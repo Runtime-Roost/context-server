@@ -113,6 +113,7 @@ import {
 const DEFAULT_CONTEXT_RESULT_LIMIT = 5;
 const MAX_CONTEXT_RESULT_CONTENT_CHARS = 500;
 const MAX_CONTEXT_RESULT_PAYLOAD_CHARS = 24_000;
+const MAX_SEARCH_RESULT_ENVELOPE_BYTES = 7_000;
 const LIST_CONTEXT_EXCERPT_CHARS = 500;
 
 function emitPrivateReadReceipt(
@@ -130,14 +131,6 @@ function emitPrivateReadReceipt(
     }));
 }
 
-type ProjectedContextRecord = Omit<ContextRecord, "content"> & {
-    content?: string;
-    content_length?: number;
-    content_bytes?: number;
-    content_truncated?: boolean;
-    content_omitted?: boolean;
-};
-
 function utf8Prefix(text: string, maxBytes: number) {
     const encoded = Buffer.from(text, "utf8");
     if (encoded.length <= maxBytes) return text;
@@ -152,13 +145,13 @@ export function projectContextResults(
     mode: "search" | "list",
     maxContentBytes = mode === "search" ? 0 : Number.POSITIVE_INFINITY,
 ) {
-    const projected: ProjectedContextRecord[] = [];
-    let payloadChars = 0;
+    const projected: Record<string, unknown>[] = [];
+    let payloadSize = 0;
     let contentBytesReturned = 0;
     let responseTruncated = false;
 
     for (const record of records) {
-        const { content, ...envelope } = record;
+        const { content } = record;
         const contentBytes = Buffer.byteLength(content, "utf8");
         const contentLimit = mode === "list"
             ? LIST_CONTEXT_EXCERPT_CHARS
@@ -170,9 +163,30 @@ export function projectContextResults(
             : characterBounded;
         const projectedContentBytes = Buffer.byteLength(projectedContent, "utf8");
         const contentTruncated = projectedContentBytes < contentBytes;
-        const candidate: ProjectedContextRecord = mode === "search"
+        const candidate: Record<string, unknown> = mode === "search"
             ? {
-                ...envelope,
+                id: record.id,
+                kind: record.kind,
+                visibility: record.visibility,
+                channel_id: record.channel_id,
+                group_id: record.group_id,
+                source: record.source === null ? null : record.source.slice(0, 160),
+                ...(record.source !== null && record.source.length > 160 ? { source_truncated: true } : {}),
+                tags: record.tags.slice(0, 12).map((tag) => tag.slice(0, 80)),
+                ...(record.tags.length > 12 ? { tag_count: record.tags.length } : {}),
+                actor: record.actor == null ? null : {
+                    external_id: record.actor.external_id,
+                    name: record.actor.name.slice(0, 160),
+                    kind: record.actor.kind,
+                },
+                subject: record.subject == null ? null : {
+                    external_id: record.subject.external_id,
+                    name: record.subject.name.slice(0, 160),
+                    kind: record.subject.kind,
+                },
+                payload_ref: record.payload_ref,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
                 ...(projectedContentBytes > 0 ? { content: projectedContent } : {}),
                 content_length: content.length,
                 content_bytes: contentBytes,
@@ -186,15 +200,21 @@ export function projectContextResults(
                     ? { content_length: content.length, content_truncated: true }
                     : {}),
             };
-        const candidateChars = JSON.stringify(candidate).length;
+        const candidateJson = JSON.stringify(candidate);
+        const candidateSize = mode === "search"
+            ? Buffer.byteLength(candidateJson, "utf8")
+            : candidateJson.length;
+        const payloadLimit = mode === "search"
+            ? MAX_SEARCH_RESULT_ENVELOPE_BYTES
+            : MAX_CONTEXT_RESULT_PAYLOAD_CHARS;
 
-        if (payloadChars + candidateChars > MAX_CONTEXT_RESULT_PAYLOAD_CHARS) {
+        if (payloadSize + candidateSize > payloadLimit) {
             responseTruncated = true;
             break;
         }
 
         projected.push(candidate);
-        payloadChars += candidateChars;
+        payloadSize += candidateSize;
         contentBytesReturned += projectedContentBytes;
     }
 
@@ -206,6 +226,8 @@ export function projectContextResults(
             ? {
                 content_budget_bytes: maxContentBytes,
                 content_bytes_returned: contentBytesReturned,
+                envelope_bytes: payloadSize,
+                envelope_byte_limit: MAX_SEARCH_RESULT_ENVELOPE_BYTES,
             }
             : {}),
     };
@@ -2218,7 +2240,7 @@ export function createServer(options: {
                 const selectedEngine = engine ?? "native";
                 const selectedFormat = output_format ?? "json";
                 const projectedResults = selectedEngine === "fenic"
-                    ? await projectWithFenic(projected.results as ContextRecord[], select)
+                    ? await projectWithFenic(projected.results as unknown as ContextRecord[], select)
                     : projected.results;
                 const response = {
                     class: selectedClass,
