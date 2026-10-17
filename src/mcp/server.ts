@@ -307,8 +307,15 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
         "FENIC_OUTPUT_INVALID",
         "FENIC_OUTPUT_TOO_LARGE",
         "FENIC_SELECT_REQUIRES_ENGINE",
+        "CAPABILITY_REQUIRED",
+        "EXPLICIT_AUTH_NOT_ALLOWED",
+        "AUTHORITY_NOT_CONFIGURED",
     ]);
-    const code = exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
+    // Roost's consume-pending endpoint uses this internal code when no usable
+    // one-use handoff exists. Do not turn a missing handoff into an opaque error.
+    const code = candidate === "SERVICE_BINDING_INVALID"
+        ? "SSO_BINDING_INVALID"
+        : exposedCodes.has(candidate) ? candidate : "REQUEST_REJECTED";
 
     return {
         isError: true,
@@ -330,7 +337,13 @@ function authenticationError(error: unknown, safeDetails?: { actor_external_id?:
                             : code === "SESSION_REVOKED"
                                 ? "This actor session was revoked because a newer session became the actor's current timeline."
                             : code === "SSO_BINDING_INVALID"
-                                ? "The Roost SSO handoff is invalid, expired, already consumed, or its approved source session is no longer active."
+                                ? "No unambiguous eligible Roost SSO handoff was found. In the approved source conversation, call Roost SSO request_context_access, then call activate_roost_session here within two minutes. An expired or consumed handoff requires a new request_context_access call, not a new approval."
+                            : code === "CAPABILITY_REQUIRED"
+                                ? "The authenticated Roost role does not grant this Context operation."
+                            : code === "EXPLICIT_AUTH_NOT_ALLOWED"
+                                ? "The trusted conversation uses its approved Roost binding; explicit actor credentials are not accepted on this surface."
+                            : code === "AUTHORITY_NOT_CONFIGURED"
+                                ? "The trusted conversation authority is not configured; this operation is unavailable."
                             : code === "CHANNEL_NOT_FOUND_OR_NOT_AUTHORIZED"
                                 ? "The channel was not found or the authenticated actor is not authorized."
                                 : code === "ACCESS_GROUP_NOT_FOUND_OR_NOT_AUTHORIZED"
@@ -361,7 +374,7 @@ async function authenticateToolWithAuthority(
     if (auth) return authenticateRequest(tool, payload, auth);
     const identity = openAITunnelIdentity(extra);
     return authority
-        ? authority.authorize(identity)
+        ? authority.authorize(identity, tool, payload)
         : authenticateOpenAITunnelActorSession(identity);
 }
 
@@ -462,12 +475,18 @@ export function createServer(options: {
         payload: Record<string, unknown>,
         auth: RequestAuthProof | undefined,
         extra?: { _meta?: Record<string, unknown> },
-    ) => authenticateToolWithAuthority(tool, payload, auth, extra, contextAuthority);
+    ) => {
+        if (options.surface === "conversation") {
+            if (auth !== undefined) throw new Error("EXPLICIT_AUTH_NOT_ALLOWED");
+            if (!contextAuthority) throw new Error("AUTHORITY_NOT_CONFIGURED");
+        }
+        return authenticateToolWithAuthority(tool, payload, auth, extra, contextAuthority);
+    };
     const authenticateContextTool = (
         tool: string,
         payload: Record<string, unknown>,
         extra?: { _meta?: Record<string, unknown> },
-    ) => requireContextAuthentication()
+    ) => options.surface === "conversation" || requireContextAuthentication()
         ? authenticateTool(tool, payload, undefined, extra)
         : null;
     const personalAuthSchema = options.surface === "conversation"
@@ -2614,9 +2633,15 @@ export function createServer(options: {
             description: "Preview deletion of old anonymous actors that have no external ID and are not referenced by any context. Durable actors are never matched. Run this before actor_purge_confirm.",
             inputSchema: {
                 before: z.string().min(1).describe("Last-seen cutoff. Only anonymous, unreferenced actors last seen before this date or timestamp are counted."),
+                auth: requestAuthSchema.optional(),
             },
         },
-        async ({ before }) => {
+        async ({ before, auth }, extra) => {
+            try {
+                await authenticateTool("actor_purge_preview", { before }, auth, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const preview = await actorPurgePreview(before);
 
             return {
@@ -2638,9 +2663,15 @@ export function createServer(options: {
                 before: z.string().min(1).describe("The exact cutoff used for actor_purge_preview."),
                 confirmation_token: z.string().min(1).describe("Confirmation token returned by actor_purge_preview."),
                 expected_count: z.number().int().nonnegative().describe("Matched count returned by actor_purge_preview."),
+                auth: requestAuthSchema.optional(),
             },
         },
-        async ({ before, confirmation_token, expected_count }) => {
+        async ({ before, confirmation_token, expected_count, auth }, extra) => {
+            try {
+                await authenticateTool("actor_purge_confirm", { before, confirmation_token, expected_count }, auth, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const purge = await actorPurgeConfirm(before, confirmation_token, expected_count);
 
             return {
@@ -2963,8 +2994,16 @@ export function createServer(options: {
         "vacuum_database",
         {
             description: "Run database maintenance for the managed context tables and return metadata before and after vacuuming.",
+            inputSchema: {
+                auth: requestAuthSchema.optional(),
+            },
         },
-        async () => {
+        async ({ auth }, extra) => {
+            try {
+                await authenticateTool("vacuum_database", {}, auth, extra);
+            } catch (error) {
+                return authenticationError(error);
+            }
             const vacuum = await vacuumDatabase();
 
             return {

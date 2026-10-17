@@ -42,6 +42,18 @@ export async function resolveAuthorizedContextPayload(actorId: number, payloadId
     return result.rows[0] ?? null;
 }
 
+export async function resolveAuthorizedPayloadContextClass(actorId: number, payloadId: string) {
+    await initializeDatabase();
+    const result = await db.query<{ visibility: string }>(
+        `SELECT contexts.visibility
+         FROM context_payloads
+         INNER JOIN contexts ON contexts.id = context_payloads.context_id
+         WHERE context_payloads.id = $1 AND ${contextReadPredicate}`,
+        [payloadId, actorId],
+    );
+    return result.rows[0]?.visibility ?? null;
+}
+
 export async function payloadReferenceForContext(actorId: number, contextId: number) {
     await initializeDatabase();
     const result = await db.query<PayloadRow>(

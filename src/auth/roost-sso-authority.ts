@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { db, initializeDatabase } from "../storage/db.js";
+import { resolveAuthorizedPayloadContextClass } from "../storage/payload-sessions.js";
 import type { AuthenticatedActor } from "./request-auth.js";
 import type { OpenAITunnelIdentity } from "./actor-sessions.js";
 
@@ -35,7 +36,132 @@ async function readPrivateKey(path: string) {
 export interface ContextAuthority {
     bind(identity: OpenAITunnelIdentity, bindingId: string): Promise<AuthenticatedActor>;
     activate(identity: OpenAITunnelIdentity): Promise<AuthenticatedActor>;
-    authorize(identity: OpenAITunnelIdentity): Promise<AuthenticatedActor>;
+    authorize(identity: OpenAITunnelIdentity, tool: string, payload?: Record<string, unknown>): Promise<AuthenticatedActor>;
+}
+
+const SUPERVISOR_CAPABILITY = "context.supervisor.read";
+const WHITEBOARD_READ_CAPABILITIES = ["context.whiteboard.read", SUPERVISOR_CAPABILITY];
+const WHITEBOARD_WRITE_CAPABILITIES = ["context.whiteboard.write"];
+const CHANNEL_READ_CAPABILITIES = ["context.channel.read", SUPERVISOR_CAPABILITY];
+const CHANNEL_WRITE_CAPABILITIES = ["context.channel.write"];
+const PERSONAL_READ_CAPABILITIES = ["context.personal.read", SUPERVISOR_CAPABILITY];
+const GROUP_READ_CAPABILITIES = ["context.group.read", SUPERVISOR_CAPABILITY];
+const DIRECT_READ_CAPABILITIES = ["messaging.direct.read", SUPERVISOR_CAPABILITY];
+
+// This map is the Roost boundary for every authenticated data operation. Keep
+// broad/authenticated identity separate from each operation's resource scope.
+// Unknown tools fail closed below rather than inheriting an accidental allow.
+const TOOL_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
+    search_context: WHITEBOARD_READ_CAPABILITIES,
+    assemble_context: WHITEBOARD_READ_CAPABILITIES,
+    get_user_profile: ["context.admin.read", SUPERVISOR_CAPABILITY],
+    list_recent_context: WHITEBOARD_READ_CAPABILITIES,
+    save_context: WHITEBOARD_WRITE_CAPABILITIES,
+    update_context: WHITEBOARD_WRITE_CAPABILITIES,
+    delete_context: WHITEBOARD_WRITE_CAPABILITIES,
+    connect_contexts: WHITEBOARD_WRITE_CAPABILITIES,
+    disconnect_contexts: WHITEBOARD_WRITE_CAPABILITIES,
+    update_context_lifecycle: WHITEBOARD_WRITE_CAPABILITIES,
+    acknowledge_context: WHITEBOARD_WRITE_CAPABILITIES,
+    preview_auto_archive: WHITEBOARD_READ_CAPABILITIES,
+    confirm_auto_archive: WHITEBOARD_WRITE_CAPABILITIES,
+    context_purge_preview: ["context.whiteboard.purge"],
+    context_purge_confirm: ["context.whiteboard.purge"],
+
+    create_channel: ["context.channel.manage"],
+    add_channel_member: ["context.channel.manage"],
+    remove_channel_member: ["context.channel.manage"],
+    list_channels: CHANNEL_READ_CAPABILITIES,
+    search_channel_context: CHANNEL_READ_CAPABILITIES,
+    list_channel_context: CHANNEL_READ_CAPABILITIES,
+    get_channel_context: CHANNEL_READ_CAPABILITIES,
+    save_channel_context: CHANNEL_WRITE_CAPABILITIES,
+    update_channel_context: CHANNEL_WRITE_CAPABILITIES,
+    delete_channel_context: CHANNEL_WRITE_CAPABILITIES,
+
+    create_access_group: ["context.access_group.manage"],
+    add_access_group_member: ["context.access_group.manage"],
+    remove_access_group_member: ["context.access_group.manage"],
+    list_access_groups: ["context.access_group.read", SUPERVISOR_CAPABILITY],
+    search_group_context: GROUP_READ_CAPABILITIES,
+    list_group_context: GROUP_READ_CAPABILITIES,
+    get_group_context: GROUP_READ_CAPABILITIES,
+    save_group_context: ["context.group.write"],
+    update_group_context: ["context.group.write"],
+    delete_group_context: ["context.group.write"],
+
+    send_direct_context: ["messaging.direct.send"],
+    list_direct_inbox: DIRECT_READ_CAPABILITIES,
+    get_direct_context: DIRECT_READ_CAPABILITIES,
+    acknowledge_direct_context: ["messaging.direct.acknowledge"],
+
+    save_personal_context: ["context.personal.write"],
+    search_personal_context: PERSONAL_READ_CAPABILITIES,
+    list_personal_context: PERSONAL_READ_CAPABILITIES,
+    get_personal_context: PERSONAL_READ_CAPABILITIES,
+    update_personal_context: ["context.personal.write"],
+    delete_personal_context: ["context.personal.write"],
+    get_write_receipt: ["context.write_receipt.read", SUPERVISOR_CAPABILITY],
+
+    start_context_payload_job: ["context.payload.job.start"],
+    get_context_job: ["context.payload.job.read", SUPERVISOR_CAPABILITY],
+    cancel_context_job: ["context.payload.job.cancel"],
+    begin_payload_upload: ["context.payload.write"],
+    append_payload_chunk: ["context.payload.write"],
+    finalize_payload_upload: ["context.payload.write"],
+    attach_payload_to_context: ["context.payload.attach"],
+
+    database_metadata: ["context.admin.read", SUPERVISOR_CAPABILITY],
+    actor_purge_preview: ["context.admin.purge"],
+    actor_purge_confirm: ["context.admin.purge"],
+    vacuum_database: ["context.admin.maintenance"],
+
+    begin_attachment_upload: ["context.attachment.write"],
+    append_attachment_chunk: ["context.attachment.write"],
+    cancel_attachment_upload: ["context.attachment.write"],
+    finalize_attachment_upload: ["context.attachment.write"],
+    link_attachment_to_context: ["context.attachment.write"],
+    delete_attachment: ["context.attachment.write"],
+    get_attachment_quota: ["context.attachment.read", SUPERVISOR_CAPABILITY],
+    get_attachment: ["context.attachment.read", SUPERVISOR_CAPABILITY],
+    list_attachments: ["context.attachment.read", SUPERVISOR_CAPABILITY],
+    read_attachment_chunk: ["context.attachment.read", SUPERVISOR_CAPABILITY],
+    list_context_attachments: ["context.attachment.read", SUPERVISOR_CAPABILITY],
+};
+
+function readCapabilitiesForClass(contextClass: unknown): readonly string[] | undefined {
+    switch (contextClass) {
+        case "whiteboard": return WHITEBOARD_READ_CAPABILITIES;
+        case "channel": return CHANNEL_READ_CAPABILITIES;
+        case "personal": return PERSONAL_READ_CAPABILITIES;
+        case "group": return GROUP_READ_CAPABILITIES;
+        case "direct": return DIRECT_READ_CAPABILITIES;
+        default: return undefined;
+    }
+}
+
+function requiredCapabilitiesForTool(tool: string, payload: Record<string, unknown>) {
+    if (tool === "get_context") return readCapabilitiesForClass(payload.class ?? "whiteboard");
+    if (tool === "read_payload") return readCapabilitiesForClass(payload.class);
+    return TOOL_CAPABILITIES[tool];
+}
+
+export function enforceRoostToolCapability(
+    capabilities: unknown,
+    tool: string,
+    payload: Record<string, unknown> = {},
+) {
+    if (!Array.isArray(capabilities) || !capabilities.every((value) => typeof value === "string")) {
+        throw new Error("AUTHORITY_CAPABILITIES_INVALID");
+    }
+
+    const requiredCapabilities = requiredCapabilitiesForTool(tool, payload);
+    if (!requiredCapabilities) throw new Error("CAPABILITY_REQUIRED");
+
+    const granted = new Set(capabilities);
+    if (!requiredCapabilities.some((capability) => granted.has(capability))) {
+        throw new Error("CAPABILITY_REQUIRED");
+    }
 }
 
 export class RoostContextAuthority implements ContextAuthority {
@@ -108,14 +234,24 @@ export class RoostContextAuthority implements ContextAuthority {
         return this.#actor(binding?.actor_id);
     }
 
-    async authorize(identity: OpenAITunnelIdentity) {
+    async authorize(identity: OpenAITunnelIdentity, tool: string, payload: Record<string, unknown> = {}) {
         const result = await this.#call("/v1/internal/authorize", {
             target_conversation_id: conversation(identity),
             audience: "context-server",
             required_capabilities: [],
         });
         const authorization = result.authorization as AuthorityResponse | undefined;
-        return this.#actor(authorization?.actor_id);
+        const actor = await this.#actor(authorization?.actor_id);
+        let scopedPayload = payload;
+        if (tool === "read_payload") {
+            const payloadRef = payload.payload_ref;
+            if (typeof payloadRef !== "string") throw new Error("CAPABILITY_REQUIRED");
+            const contextClass = await resolveAuthorizedPayloadContextClass(actor.actor_id, payloadRef);
+            if (!contextClass) throw new Error("CAPABILITY_REQUIRED");
+            scopedPayload = { ...payload, class: contextClass };
+        }
+        enforceRoostToolCapability(authorization?.capabilities, tool, scopedPayload);
+        return actor;
     }
 }
 
