@@ -62,8 +62,16 @@ test("Roost capabilities limit shared Whiteboard and channel tools to their gran
     assert.throws(() => enforceRoostToolCapability(["context.read"], "search_context"), /CAPABILITY_REQUIRED/);
     assert.throws(() => enforceRoostToolCapability(["context.write"], "save_context"), /CAPABILITY_REQUIRED/);
 
-    const directMessenger = ["messaging.direct.send"];
-    assert.doesNotThrow(() => enforceRoostToolCapability(directMessenger, "send_direct_context"));
+    const directMessenger = ["messaging.direct.send:actor:openai:codex"];
+    assert.doesNotThrow(() => enforceRoostToolCapability(directMessenger, "send_direct_context", {
+        recipient_external_id: "actor:openai:codex",
+    }));
+    assert.throws(() => enforceRoostToolCapability(directMessenger, "send_direct_context", {
+        recipient_external_id: "actor:openai:other",
+    }), /CAPABILITY_REQUIRED/);
+    assert.throws(() => enforceRoostToolCapability(directMessenger, "send_direct_context", {
+        recipient_external_id: "actor:openai:codex" + "x".repeat(260),
+    }), /CAPABILITY_REQUIRED/);
     assert.throws(() => enforceRoostToolCapability(directMessenger, "save_context"), /CAPABILITY_REQUIRED/);
     assert.throws(() => enforceRoostToolCapability(directMessenger, "list_direct_inbox"), /CAPABILITY_REQUIRED/);
 

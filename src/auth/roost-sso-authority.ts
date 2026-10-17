@@ -90,7 +90,6 @@ const TOOL_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
     update_group_context: ["context.group.write"],
     delete_group_context: ["context.group.write"],
 
-    send_direct_context: ["messaging.direct.send"],
     list_direct_inbox: DIRECT_READ_CAPABILITIES,
     get_direct_context: DIRECT_READ_CAPABILITIES,
     acknowledge_direct_context: ["messaging.direct.acknowledge"],
@@ -143,6 +142,12 @@ function readCapabilitiesForClass(contextClass: unknown): readonly string[] | un
 function requiredCapabilitiesForTool(tool: string, payload: Record<string, unknown>) {
     if (tool === "get_context") return readCapabilitiesForClass(payload.class ?? "whiteboard");
     if (tool === "read_payload") return readCapabilitiesForClass(payload.class);
+    if (tool === "send_direct_context") {
+        const recipient = payload.recipient_external_id;
+        if (typeof recipient !== "string" || !recipient.startsWith("actor:")) return undefined;
+        const scopedCapability = `messaging.direct.send:${recipient}`;
+        return scopedCapability.length <= 256 ? [scopedCapability] : undefined;
+    }
     return TOOL_CAPABILITIES[tool];
 }
 
