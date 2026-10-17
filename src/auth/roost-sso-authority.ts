@@ -94,6 +94,11 @@ const TOOL_CAPABILITIES: Readonly<Record<string, readonly string[]>> = {
     get_direct_context: DIRECT_READ_CAPABILITIES,
     acknowledge_direct_context: ["messaging.direct.acknowledge"],
 
+    workshop_list_drafts: ["workshop.drafts.read"],
+    workshop_get_draft: ["workshop.drafts.read"],
+    workshop_create_draft: ["workshop.drafts.create"],
+    workshop_update_draft: ["workshop.drafts.update"],
+
     save_personal_context: ["context.personal.write"],
     search_personal_context: PERSONAL_READ_CAPABILITIES,
     list_personal_context: PERSONAL_READ_CAPABILITIES,

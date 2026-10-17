@@ -2,6 +2,7 @@ import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server
 import { encode as encodeToon } from "@toon-format/toon";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
+import { WorkshopDraftsClient, registerWorkshopDraftTools } from "./workshop-drafts.js";
 import {
     authenticateRequest,
     type RequestAuthProof,
@@ -446,6 +447,10 @@ const CONVERSATION_TOOL_NAMES = new Set([
     "send_direct_context",
     "list_direct_inbox",
     "acknowledge_direct_context",
+    "workshop_list_drafts",
+    "workshop_get_draft",
+    "workshop_create_draft",
+    "workshop_update_draft",
     "read_payload",
     "start_context_payload_job",
     "get_context_job",
@@ -467,6 +472,7 @@ function applyToolSurface(server: McpServer, surface: ContextServerSurface) {
 export function createServer(options: {
     surface?: ContextServerSurface;
     authority?: ContextAuthority;
+    workshopDraftsClient?: WorkshopDraftsClient;
 } = {}) {
     const actorSession = new ActiveActorSession();
     const contextAuthority = options.authority ?? configuredContextAuthority();
@@ -498,6 +504,7 @@ export function createServer(options: {
         name: "personal-context-server",
         version: "0.1.0",
     });
+    const workshopDraftsClient = options.workshopDraftsClient ?? WorkshopDraftsClient.fromEnvironment();
 
     server.registerTool(
         "ping",
@@ -3016,6 +3023,14 @@ export function createServer(options: {
             };
         }
     );
+
+    if (workshopDraftsClient) {
+        registerWorkshopDraftTools(server, {
+            client: workshopDraftsClient,
+            authorize: async (tool, payload, extra) => authenticateContextTool(tool, payload, extra),
+            renderAuthError: (error) => authenticationError(error),
+        });
+    }
 
     applyToolSurface(server, options.surface ?? "full");
     return server;
