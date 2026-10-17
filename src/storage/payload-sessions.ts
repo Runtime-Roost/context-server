@@ -20,6 +20,7 @@ const contextReadPredicate = `(
         SELECT 1 FROM channel_memberships
         WHERE channel_memberships.channel_id = contexts.channel_id
           AND channel_memberships.actor_id = $2 AND channel_memberships.removed_at IS NULL
+          AND channel_memberships.can_read
     ))
     OR (contexts.visibility = 'group' AND EXISTS (
         SELECT 1 FROM access_group_memberships

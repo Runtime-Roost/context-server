@@ -4,10 +4,14 @@ import test from "node:test";
 process.env.PGDATABASE ??= "personal_context";
 process.env.EMBEDDINGS_ENABLED = "false";
 
-const { identifyActor, savePersonalContext } = await import("../dist/mcp/tools.js");
+const {
+  addChannelMember, createChannel, getChannelContext, identifyActor,
+  saveChannelContext, savePersonalContext,
+} = await import("../dist/mcp/tools.js");
 const { db } = await import("../dist/storage/db.js");
 const {
-  cancelContextJob, getContextJob, readContextPayload, startContextPayloadJob,
+  cancelContextJob, getContextJob, payloadReferenceForContext,
+  readContextPayload, startContextPayloadJob,
 } = await import("../dist/storage/payload-sessions.js");
 
 test("payload reads are authorized, version-pinned, bounded, and UTF-8 safe", async () => {
@@ -27,6 +31,32 @@ test("payload reads are authorized, version-pinned, bounded, and UTF-8 safe", as
     assert.match(first.payload_ref.sha256, /^[0-9a-f]{64}$/);
   } finally {
     await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[owner.actor.id, outsider.actor.id]]);
+  }
+});
+
+test("channel payload reads honor an active membership with can_read disabled", async () => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const owner = await identifyActor({ external_id: `actor:test:payload-channel-owner-${suffix}`, name: "Payload channel owner" });
+  const member = await identifyActor({ external_id: `actor:test:payload-channel-member-${suffix}`, name: "Payload channel member" });
+  const slug = `payload-acl-${suffix}`;
+  const channel = await createChannel(owner.actor.id, slug, "Payload ACL test channel");
+  let contextId;
+
+  try {
+    const membership = await addChannelMember(owner.actor.id, slug, member.actor.external_id, "member", false, false);
+    assert.equal(membership.can_read, false);
+
+    const saved = await saveChannelContext(owner.actor.id, slug, "channel payload must remain unreadable", ["payload-acl"], "test");
+    contextId = saved.id;
+    assert.ok(saved.payload_ref?.id);
+    assert.equal(await getChannelContext(member.actor.id, saved.id), null);
+    assert.equal(await payloadReferenceForContext(member.actor.id, saved.id), null);
+    assert.equal(await readContextPayload(member.actor.id, saved.payload_ref.id, 0, 128), null);
+    assert.equal((await readContextPayload(owner.actor.id, saved.payload_ref.id, 0, 128)).text, "channel payload must remain unreadable");
+  } finally {
+    if (contextId !== undefined) await db.query("DELETE FROM contexts WHERE id = $1", [contextId]);
+    await db.query("DELETE FROM channels WHERE id = $1", [channel.id]);
+    await db.query("DELETE FROM actors WHERE id = ANY($1::bigint[])", [[owner.actor.id, member.actor.id]]);
   }
 });
 
