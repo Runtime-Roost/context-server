@@ -555,9 +555,12 @@ test("local approval binds the exact requesting OpenAI conversation", async () =
         assert.equal(textResult(unauthenticatedRead).error.code, "AUTHENTICATION_REQUIRED");
         assert.match(
             textResult(otherConversation).error.message,
-            /approve that exact request in Agent Companion/,
+            /Request Context Server access through Roost SSO, then call activate_roost_session once/,
         );
-        assert.match(textResult(otherConversation).error.message, /Do not use a PIN/);
+        assert.match(
+            textResult(otherConversation).error.message,
+            /No handle, PIN, claim code, or auth object is required/,
+        );
 
         const otherSubject = await connection.client.callTool({
             name: "list_channels",
