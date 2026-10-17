@@ -456,7 +456,12 @@ test("unified context predicates query only the selected actor-authorized relati
                 all: [{ field: "actor_external_id", operator: "eq", value: ownerExternalId }],
             }, "newest", 10)).map(({ id }) => id),
         );
-        assert.deepEqual(await getContext(whiteboard.id), whiteboard);
+        const reloadedWhiteboard = await getContext(whiteboard.id);
+        // Saving later records can refresh the joined actor profile timestamp;
+        // it must not make the immutable context snapshot appear different.
+        const reloadedActor = { ...reloadedWhiteboard.actor };
+        delete reloadedActor.updated_at;
+        assert.deepEqual({ ...reloadedWhiteboard, actor: reloadedActor }, whiteboard);
 
         const unifiedResponse = textResult(await connectionForUnifiedQuery());
         assert.equal(unifiedResponse.class, "whiteboard");
